@@ -638,11 +638,13 @@ def test_main_once_cycle_offline():
     p = tempfile.mktemp(suffix=".yaml")
     state = tempfile.mktemp(suffix=".json"); db = tempfile.mktemp(suffix=".db")
     aud = tempfile.mktemp(suffix=".log"); logf = tempfile.mktemp(suffix=".log")
+    esf = tempfile.mktemp(suffix=".json")
     cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
            "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
            "precipitation": {"lookback_hours": 24},
            "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
            "state_file": state, "audit_file": aud, "log_file": logf,
+           "engine_state_file": esf,
            "history": {"enabled": True, "file": db, "retention_days": 14},
            "rules": [{"name": "rainflag", "topic": "facility/rain", "on_match": "ON",
                       "on_clear": "OFF",
@@ -679,7 +681,7 @@ def test_main_once_cycle_offline():
         assert "temperature" in w.read_history(db, hours=24)        # history recorded
     finally:
         w.resolve_location, w.fetch_conditions, w.make_mqtt_client, sys.argv = orig
-        for f in (p, state, db, aud, logf):
+        for f in (p, state, db, aud, logf, esf):
             for s in ("", ".bak", ".tmp"):
                 try: os.unlink(f + s)
                 except OSError: pass
@@ -1511,7 +1513,8 @@ def test_validate_config_slack_defaults_and_clamp():
     assert cfg["slack"]["broker_unreachable_minutes"] == 1   # clamped up from 0
     cfg2 = w.validate_config(_min_cfg())
     assert cfg2["slack"] == {"enabled": False, "bot_token": "", "channel": "",
-                             "broker_unreachable_minutes": 60}
+                             "broker_unreachable_minutes": 60,
+                             "stale_weather_minutes": 0}
 
 
 def test_validate_config_status_push_defaults():
@@ -1906,6 +1909,421 @@ def test_webui_builder_advanced_constructs():
             raise AssertionError(f"expected rejection containing {needle!r}")
         except ValueError as e:
             assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+
+
+def test_computed_pow_dos_guard():
+    # `9**9**9` (all-integer) never raises OverflowError and would otherwise hang
+    # the single-threaded control loop forever. It must return None ~instantly.
+    import time
+    t0 = time.monotonic()
+    assert w.compute_metrics({"boom": {"expr": "9**9**9"}}, {}) == {"boom": None}
+    assert time.monotonic() - t0 < 1.0
+    assert w.compute_metrics({"p": {"expr": "2**10"}}, {})["p"] == 1024
+    assert w.compute_metrics({"p": {"expr": "10**400"}}, {})["p"] is None   # overflow
+    assert w.compute_metrics({"p": {"expr": "metric**2"}},
+                             {"metric": 4})["p"] == 16
+    # A negative base with a fractional exponent is complex, not a real number:
+    # must be None so a downstream comparison can't TypeError and freeze the rule.
+    assert w.compute_metrics({"p": {"expr": "(0-2)**0.5"}}, {})["p"] is None
+
+
+def test_numeric_value_coerced_at_validation():
+    # A quoted YAML number ("5") must be normalized to a real number so the engine
+    # never does `current < "5"` (a TypeError that would freeze the rule).
+    cfg = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "ON",
+        "when": {"metric": "temperature", "operator": "<", "value": "5"}}]))
+    cond = cfg["rules"][0]["when"]
+    assert cond["value"] == 5 and not isinstance(cond["value"], str)
+    assert w.evaluate_rule(cfg["rules"][0], {"temperature": 3.0}) is True
+    assert w.evaluate_rule(cfg["rules"][0], {"temperature": 9.0}) is False
+    # between bounds and `in` items coerce too
+    cfg2 = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "ON",
+        "when": {"metric": "temperature", "operator": "between",
+                 "value": ["40", "80"]}}]))
+    assert cfg2["rules"][0]["when"]["value"] == [40, 80]
+
+
+def test_engine_state_save_load_roundtrip():
+    import tempfile, os
+    from datetime import datetime, timezone
+    esf = tempfile.mktemp(suffix=".json")
+    es = w.EngineState()
+    key = "rule|is_raining|==|True|10m"
+    es.cond_since[key] = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    es.prev_metrics = {"temperature": 60.0, "is_raining": True, "active_alerts": []}
+    try:
+        w.save_engine_state(esf, {"r": True, "skip": None},
+                            {"r": "2026-06-28T11:00:00+00:00"}, es)
+        ls, lc, es2 = w.load_engine_state(esf)
+        assert ls == {"r": True}                                  # None dropped
+        assert lc == {"r": "2026-06-28T11:00:00+00:00"}
+        assert es2.prev_metrics["temperature"] == 60.0
+        assert es2.cond_since[key] == datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+        # corrupt + missing files both yield a clean cold start (never raise)
+        open(esf, "w").write("{ broken")
+        ls3, lc3, es3 = w.load_engine_state(esf)
+        assert ls3 == {} and lc3 == {} and es3.cond_since == {}
+        assert w.load_engine_state(tempfile.mktemp())[0] == {}
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(esf + s)
+            except OSError: pass
+
+
+def test_engine_state_persists_and_republishes_across_restart():
+    # End-to-end: state survives a restart (no spurious re-publish when unchanged),
+    # and a (re)connect's republish flag re-asserts the retained directive.
+    import tempfile, os, sys, threading, json, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    state = tempfile.mktemp(suffix=".json"); aud = tempfile.mktemp(suffix=".log")
+    logf = tempfile.mktemp(suffix=".log"); esf = tempfile.mktemp(suffix=".json")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True,
+                    "availability_topic": ""},
+           "state_file": state, "audit_file": aud, "log_file": logf,
+           "engine_state_file": esf, "history": {"enabled": False},
+           "rules": [{"name": "rainflag", "topic": "facility/rain",
+                      "on_match": "ON", "on_clear": "OFF",
+                      "when": {"metric": "is_raining", "operator": "==",
+                               "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    orig = (w.resolve_location, w.fetch_conditions, w.make_mqtt_client, sys.argv)
+    pubs = []
+
+    class _Info: rc = 0
+    class _Fake:
+        republish = False
+        def __init__(self):
+            self.in_lock = threading.Lock()
+            self.republish_event = threading.Event()
+            if _Fake.republish:
+                self.republish_event.set()
+        def publish(self, topic, payload, **k): pubs.append((topic, payload)); return _Info()
+        def is_connected(self): return True
+        def connect_async(self, *a, **k): pass
+        def loop_start(self): pass
+        def loop_stop(self): pass
+        def disconnect(self): pass
+    try:
+        w.resolve_location = lambda *a, **k: {"office": "x"}
+        w.fetch_conditions = lambda *a, **k: {
+            "temperature": 60.0, "humidity": 80.0, "wind_speed_mph": 5.0,
+            "is_raining": True, "precip_accum_in": 0.3,
+            "precipitation_probability": 90.0, "short_forecast": "Rain",
+            "active_alerts": []}
+        w.make_mqtt_client = lambda *a, **k: _Fake()
+        sys.argv = ["weather_mqtt", "--config", p, "--once"]
+        w.main()                                          # cold start -> ON
+        assert ("facility/rain", "ON") in pubs
+        assert json.loads(open(esf).read())["last_state"]["rainflag"] is True
+        pubs.clear(); w.main()                            # restart, unchanged -> silent
+        assert ("facility/rain", "ON") not in pubs
+        pubs.clear(); _Fake.republish = True; w.main()    # reconnect -> re-assert
+        assert ("facility/rain", "ON") in pubs
+    finally:
+        w.resolve_location, w.fetch_conditions, w.make_mqtt_client, sys.argv = orig
+        for f in (p, state, aud, logf, esf):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
+def test_webui_request_size_cap_configured():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_request_size_cap_configured ({e})")
+        return
+    # A request-body cap must be set so an oversized POST can't OOM the dashboard.
+    assert webui.app.config.get("MAX_CONTENT_LENGTH") == 1024 * 1024
+    # save_config routes through the core atomic+fsync writer.
+    assert hasattr(webui.core, "_atomic_write")
+
+
+def test_engine_state_resets_sustain_timers_after_long_gap():
+    import tempfile, os, json
+    from datetime import datetime, timezone, timedelta
+    from pathlib import Path
+    esf = tempfile.mktemp(suffix=".json")
+    now = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    key = "rule|is_raining|==|True|10m"
+    base = {"last_state": {"r": True},
+            "last_change": {"r": "2026-06-28T11:00:00+00:00"},
+            "cond_since": {key: "2026-06-28T10:00:00+00:00"}, "prev_metrics": {}}
+    try:
+        # Saved an hour ago: beyond the grace window -> `for:` sustain timers
+        # re-accrue (can't prove continuity across the gap), but last_state /
+        # last_change ARE restored (those are genuine wall-clock).
+        Path(esf).write_text(json.dumps(
+            {**base, "saved_at": (now - timedelta(hours=1)).isoformat()}))
+        ls, lc, es = w.load_engine_state(esf, now=now)
+        assert es.cond_since == {}
+        assert ls == {"r": True} and lc == {"r": "2026-06-28T11:00:00+00:00"}
+        # Saved 30s ago: a quick restart keeps the sustain timers.
+        Path(esf).write_text(json.dumps(
+            {**base, "saved_at": (now - timedelta(seconds=30)).isoformat()}))
+        _, _, es2 = w.load_engine_state(esf, now=now)
+        assert key in es2.cond_since
+        # Legacy file with no saved_at: conservatively don't trust sustain timers.
+        Path(esf).write_text(json.dumps(base))
+        _, _, es3 = w.load_engine_state(esf, now=now)
+        assert es3.cond_since == {}
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(esf + s)
+            except OSError: pass
+
+
+def test_coerce_payload_bool_holds_on_unknown():
+    assert w.coerce_payload(b"on", "bool") is True
+    assert w.coerce_payload(b"off", "bool") is False
+    # An unrecognized payload holds (None) rather than fabricating a real "off".
+    assert w.coerce_payload(b"maybe", "bool") is None
+    store, tmap = {}, {"t": {"topic": "t", "metric": "m", "parse": "bool"}}
+    assert w.handle_mqtt_input(store, tmap, "t", b"maybe") is False
+    assert store == {}
+
+
+class _Resp:
+    def __init__(self, status, body=None, retry_after=None, bad_json=False):
+        self.status_code = status
+        self._body = {"ok": True} if body is None else body
+        self._bad = bad_json
+        self.headers = {}
+        if retry_after is not None:
+            self.headers["Retry-After"] = retry_after
+    def json(self):
+        if self._bad:
+            raise ValueError("not json")
+        return self._body
+
+
+class _Sess:
+    def __init__(self, seq): self.seq = list(seq); self.calls = 0
+    def get(self, url, headers=None, timeout=None):
+        self.calls += 1
+        r = self.seq.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def test_nws_get_retries_failfast_and_retry_after():
+    real = w._SESSION
+    try:
+        # 503 (Retry-After: 0 -> no real sleep) then 200 -> returns after one retry
+        s = _Sess([_Resp(503, retry_after="0"), _Resp(200, {"v": 1})])
+        w._SESSION = s
+        assert w.nws_get("http://x", "ua", retries=3) == {"v": 1}
+        assert s.calls == 2
+        # 404 is non-retryable: fail fast, exactly one call
+        s2 = _Sess([_Resp(404)])
+        w._SESSION = s2
+        try:
+            w.nws_get("http://x", "ua", retries=3); assert False, "should raise"
+        except RuntimeError:
+            pass
+        assert s2.calls == 1
+        # 200 but non-JSON body -> RuntimeError, no retry
+        s3 = _Sess([_Resp(200, bad_json=True)])
+        w._SESSION = s3
+        try:
+            w.nws_get("http://x", "ua", retries=3); assert False, "should raise"
+        except RuntimeError:
+            pass
+        assert s3.calls == 1
+    finally:
+        w._SESSION = real
+
+
+def test_retry_after_seconds_parsing():
+    class _R:
+        def __init__(self, h): self.headers = h
+    assert w._retry_after_seconds(_R({"Retry-After": "5"}), 2) == 5
+    assert w._retry_after_seconds(_R({}), 2) == 2
+    assert w._retry_after_seconds(_R({"Retry-After": "99999"}), 2) == 300   # capped
+    # HTTP-date form is unparsed here -> fall back to our own backoff default
+    assert w._retry_after_seconds(
+        _R({"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}), 2) == 2
+
+
+def test_location_cache_validation_reresolves_on_partial():
+    import tempfile, os, json
+    from pathlib import Path
+    real_cache, real_get = w.CACHE_FILE, w.nws_get
+    cf = Path(tempfile.mktemp(suffix=".json"))
+    calls = {"n": 0}
+
+    def fake_get(url, ua, **k):
+        calls["n"] += 1
+        if "/points/" in url:
+            return {"properties": {"forecastHourly": "https://f",
+                                   "observationStations": "https://s", "gridId": "X"}}
+        return {"features": [{"properties": {"stationIdentifier": "KXYZ"}}]}
+    try:
+        w.CACHE_FILE = cf
+        w.nws_get = fake_get
+        # A partial cache (matches location but missing the URLs) must NOT be
+        # trusted -- re-resolve instead of feeding dead URLs to every cycle.
+        cf.write_text(json.dumps({"lat": 1, "lon": 2, "station_override": None}))
+        info = w.resolve_location(1, 2, "ua")
+        assert info["station_id"] == "KXYZ" and calls["n"] >= 1
+        # A complete cache (written atomically by resolve_location) is trusted.
+        calls["n"] = 0
+        info2 = w.resolve_location(1, 2, "ua")
+        assert calls["n"] == 0 and info2["forecast_hourly"] == "https://f"
+    finally:
+        w.CACHE_FILE, w.nws_get = real_cache, real_get
+        for s in ("", ".tmp"):
+            try: os.unlink(str(cf) + s)
+            except OSError: pass
+
+
+def test_coerce_value_bool_holds_on_unknown():
+    assert w.coerce_value("off", "bool") is False
+    assert w.coerce_value("on", "bool") is True
+    assert w.coerce_value(0, "bool") is False
+    # an unexpected present value must hold (None), not fabricate a real "off"
+    assert w.coerce_value("weird", "bool") is None
+    assert w.coerce_value({"x": 1}, "bool") is None
+
+
+def test_atomic_write_roundtrip():
+    import tempfile, os
+    from pathlib import Path
+    p = Path(tempfile.mktemp(suffix=".txt"))
+    try:
+        w._atomic_write(p, "hello", fsync=True)
+        assert p.read_text() == "hello"
+        assert not Path(str(p) + ".tmp").exists()
+        w._atomic_write(p, "world", fsync=False)       # overwrite
+        assert p.read_text() == "world"
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(str(p) + s)
+            except OSError: pass
+
+
+def test_history_uses_wal_mode():
+    import tempfile, os
+    db = tempfile.mktemp(suffix=".db")
+    try:
+        w.record_history(db, {"temperature": 60.0})
+        con = w._history_connect(db)
+        mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+        con.close()
+        assert mode.lower() == "wal"
+    finally:
+        for s in ("", "-wal", "-shm"):
+            try: os.unlink(db + s)
+            except OSError: pass
+
+
+class _FakeInfo:
+    def __init__(self, rc=0): self.rc = rc
+    def wait_for_publish(self, timeout=None): return True
+
+
+class _FakePahoClient:
+    """Records will/tls/subscribe/publish so make_mqtt_client wiring is testable
+    without a broker."""
+    def __init__(self, **kwargs):
+        self.subs, self.pubs = [], []
+        self.will = None
+        self.tls = None
+        self.tls_insecure = None
+        self.on_connect = self.on_disconnect = self.on_message = None
+    def username_pw_set(self, *a, **k): pass
+    def will_set(self, topic, payload=None, qos=0, retain=False):
+        self.will = (topic, payload, qos, retain)
+    def tls_set(self, **k): self.tls = k
+    def tls_insecure_set(self, v): self.tls_insecure = v
+    def subscribe(self, t): self.subs.append(t)
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.pubs.append((topic, payload, qos, retain)); return _FakeInfo()
+    def reconnect_delay_set(self, **k): pass
+
+
+class _FakeMqttModule:
+    Client = _FakePahoClient
+    MQTT_ERR_SUCCESS = 0
+    class CallbackAPIVersion:
+        VERSION2 = 2
+
+
+def _with_fake_mqtt(fn):
+    real = w.mqtt
+    w.mqtt = _FakeMqttModule
+    try:
+        return fn()
+    finally:
+        w.mqtt = real
+
+
+def test_mqtt_last_will_birth_and_republish():
+    # An availability topic must arm an LWT ("offline", retained) and, on a
+    # successful connect, publish the "online" birth message, (re)subscribe, set
+    # the republish flag and wake the loop.
+    def body():
+        woke = []
+        mq = {"client_id": "c", "host": "h", "port": 1883,
+              "availability_topic": "av/status"}
+        client = w.make_mqtt_client(
+            mq, [{"topic": "s/tank", "metric": "tank", "parse": "number"}],
+            {}, on_input=lambda: None, on_reconnect=lambda: woke.append(1))
+        assert client.will == ("av/status", "offline", 1, True)
+        assert hasattr(client, "in_lock")          # cross-thread lock present
+        assert not client.republish_event.is_set()
+
+        class _RC: is_failure = False
+        client.on_connect(client, None, None, _RC(), None)
+        assert ("av/status", "online", 1, True) in client.pubs   # birth message
+        assert "s/tank" in client.subs                           # resubscribed
+        assert client.republish_event.is_set()                   # re-assert asked
+        assert woke == [1]                                        # loop woken
+    _with_fake_mqtt(body)
+
+
+def test_mqtt_no_availability_no_will():
+    # With availability disabled (""), no LWT is armed and no birth/offline noise.
+    def body():
+        mq = {"client_id": "c", "host": "h", "port": 1883, "availability_topic": ""}
+        client = w.make_mqtt_client(mq, [], {})
+        assert client.will is None
+
+        class _RC: is_failure = False
+        client.on_connect(client, None, None, _RC(), None)
+        assert client.pubs == []
+    _with_fake_mqtt(body)
+
+
+def test_mqtt_tls_applied_when_enabled():
+    def body():
+        mq = {"client_id": "c", "host": "h", "port": 8883,
+              "availability_topic": "",
+              "tls": {"enabled": True, "ca_certs": "/x/ca.pem", "insecure": True}}
+        client = w.make_mqtt_client(mq, [], {})
+        assert client.tls is not None                 # tls_set was called
+        assert client.tls.get("ca_certs") == "/x/ca.pem"
+        assert client.tls_insecure is True
+        # ...and disabled/absent TLS leaves the socket plaintext.
+        plain = w.make_mqtt_client({"client_id": "c2", "host": "h", "port": 1883,
+                                    "availability_topic": ""}, [], {})
+        assert plain.tls is None
+    _with_fake_mqtt(body)
+
+
+def test_mqtt_config_defaults_availability_and_tls():
+    cfg = w.validate_config(_min_cfg())
+    assert cfg["mqtt"]["availability_topic"] == "weather-mqtt/status"
+    # tls is opt-in: absent unless configured, and normalized when present.
+    assert "tls" not in cfg["mqtt"] or cfg["mqtt"]["tls"]["enabled"] is False
+    cfg2 = w.validate_config(_min_cfg(mqtt={"tls": {"enabled": "yes"}}))
+    assert cfg2["mqtt"]["tls"]["enabled"] is True
 
 
 def run():

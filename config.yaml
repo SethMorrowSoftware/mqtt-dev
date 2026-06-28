@@ -104,6 +104,18 @@ mqtt:
   # Optional: publish a JSON snapshot of all conditions here each cycle
   # (handy for dashboards / SCADA debugging). Leave "" to disable.
   status_topic: "irrigation/weather/status"
+  # Retained online/offline availability topic + MQTT Last Will. The controller
+  # publishes "online" on connect and (via the LWT) "offline" if it dies
+  # unexpectedly, so subscribers can tell "controller alive" from "controller
+  # gone" instead of trusting a stale retained directive forever. "" disables it.
+  availability_topic: "weather-mqtt/status"
+  # Optional TLS for the broker connection. Omit/disable for plaintext (default).
+  # tls:
+  #   enabled: true
+  #   ca_certs: "/etc/ssl/certs/ca.pem"   # verify the broker against this CA
+  #   certfile: ""                        # optional client cert (mutual TLS)
+  #   keyfile: ""
+  #   insecure: false                     # true skips verification (testing only)
 
 # --- Slack alerts (optional) -----------------------------------------------
 # Post to Slack if the MQTT broker stays unreachable past the threshold (and an
@@ -115,6 +127,7 @@ slack:
   channel: ""                       # "#alerts" or a channel ID like "C0123456"
   bot_token: ""                     # or set SLACK_BOT_TOKEN in the environment
   broker_unreachable_minutes: 60    # alert after the broker is down this long
+  stale_weather_minutes: 0          # alert after NWS weather is unusable this long (0 = off)
 
 # --- Remote status page (optional, read-only) ------------------------------
 # Push a copy of the status snapshot to an external dashboard each cycle. This
