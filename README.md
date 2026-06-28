@@ -1,6 +1,6 @@
 # Precipitation → MQTT Controller
 
-[![tests](https://github.com/SethMorrowSoftware/weather/actions/workflows/tests.yml/badge.svg)](https://github.com/SethMorrowSoftware/weather/actions/workflows/tests.yml)
+[![tests](https://github.com/SethMorrowSoftware/mqtt-dev/actions/workflows/tests.yml/badge.svg)](https://github.com/SethMorrowSoftware/mqtt-dev/actions/workflows/tests.yml)
 
 Watches rainfall from the **National Weather Service** (`api.weather.gov`) and
 publishes **MQTT** messages so irrigation PLCs know when **not** to water.
@@ -12,8 +12,28 @@ until conditions clear.
 
 No API key is required. The NWS API is free and US-only.
 
-This repo is the **server side only** — weather monitoring and MQTT publishing.
-The PLC logic that consumes the messages is out of scope.
+This repo is the **server side only** — monitoring and MQTT publishing. The PLC
+logic that consumes the messages is out of scope.
+
+### More than weather
+
+Irrigation is the **default preset**, but the controller has grown into a
+general **conditions → actions** engine. A rule combines any of these inputs and
+publishes on/off MQTT directives, all editable from the web UI:
+
+- **Inputs:** NWS weather, a [schedule / clock](#available-metrics) (incl.
+  sunrise/sunset), [operator variables](#operator-variables-optional) you toggle
+  in the UI, [MQTT sensor topics](#mqtt-sensor-inputs-optional), and
+  [HTTP JSON endpoints](#http-json-inputs-optional).
+- **Rules:** nested `any`/`all`/`not`, comparison + `between`/`in`/`changed`
+  operators, a `for:` sustain, per-rule `enable`, **time windows**, and
+  **hysteresis** (anti-short-cycle for real loads).
+- **Control:** opt-in, audited [manual Auto/On/Off](#manual-control-opt-in) of
+  any device from the dashboard; an outbound-only
+  [remote status page](#remote-status-page-read-only).
+
+Everything below applies whether you use it for irrigation or anything else
+on/off.
 
 ## How it works
 
@@ -47,8 +67,8 @@ On a fresh **Debian/Ubuntu** server, this installs Mosquitto and the controller,
 runs a short setup wizard, and starts everything as systemd services:
 
 ```bash
-git clone https://github.com/SethMorrowSoftware/weather.git
-cd weather
+git clone https://github.com/SethMorrowSoftware/mqtt-dev.git
+cd mqtt-dev
 sudo ./install.sh
 ```
 
@@ -369,7 +389,7 @@ journalctl -u weather-mqtt -f                       # live logs
 ## Updating
 
 ```bash
-cd weather && git pull
+cd mqtt-dev && git pull
 sudo ./install.sh        # idempotent: refreshes code + deps, keeps your config
 ```
 
@@ -497,8 +517,8 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 
 | Path | What it is |
 |---|---|
-| `weather_mqtt.py` | The monitor: polls NWS, evaluates rules, publishes MQTT, writes `weather_state.json`. |
-| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules), `/api/state`, `/healthz`. |
+| `weather_mqtt.py` | The monitor: gathers inputs (weather, schedule, variables, mqtt_in, http_poll), evaluates rules, publishes MQTT, writes `weather_state.json`. |
+| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules), `/api/state`, `/api/control`, `/api/variable`, `/healthz`. |
 | `setup_wizard.py` | Interactive first-run config generator (`weather-mqtt-setup`). |
 | `install.sh` | One-command Debian/Ubuntu installer (Mosquitto + venv + services). |
 | `config.yaml` | Example/active configuration (the installer writes a real one from the wizard). |
@@ -506,6 +526,12 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 | `weather-mqtt.service`, `weather-webui.service` | systemd unit templates. |
 | `pyproject.toml` | Packaging + the `weather-mqtt` / `weather-webui` / `weather-mqtt-setup` commands. |
 | `demo/` | Standalone static copy of the UI for cPanel/static hosting (see `demo/README.md`). |
+| `cloud-status/` | Outbound read-only status mirror for PHP/cPanel hosting. |
+
+Runtime files the monitor/UI create next to the install (git-ignored): the
+`weather_state.json` snapshot, `nws_location_cache.json`, `overrides.json`
+(manual device overrides), `variables.json` (operator variables), and
+`audit.log` (manual + automatic state-change trail).
 
 ## Development & tests
 
