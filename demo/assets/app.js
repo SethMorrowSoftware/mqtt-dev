@@ -442,9 +442,14 @@ function agoText(iso) {
       wrap.innerHTML = '<input class="a-text" placeholder="Slack message (supports {{metric}})" style="flex:1;min-width:200px">';
       wrap.querySelector(".a-text").value = a.text || "";
     } else {
-      wrap.innerHTML = '<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:150px">' +
-        '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:150px">';
+      wrap.innerHTML = '<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:140px">' +
+        '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:140px">' +
+        '<select class="a-qos" title="QoS" style="flex:0 0 70px"></select>' +
+        '<label class="muted" style="margin:0;display:flex;align-items:center;gap:5px;font-weight:500;white-space:nowrap">' +
+        '<input type="checkbox" class="a-retain" style="width:auto;margin:0"> retain</label>';
       wrap.querySelector(".a-topic").value = a.topic || ""; wrap.querySelector(".a-payload").value = a.payload || "";
+      ["", "0", "1", "2"].forEach(x => wrap.querySelector(".a-qos").appendChild(opt(x, x === "" ? "qos —" : "qos " + x, String(a.qos == null ? "" : a.qos) === x)));
+      wrap.querySelector(".a-retain").checked = a.retain === true;
     }
     return wrap;
   }
@@ -531,7 +536,9 @@ function agoText(iso) {
         const on = row.querySelector(".a-on").value;
         if (kind === "webhook") return { kind, on, url: (row.querySelector(".a-url").value || "").trim(), method: row.querySelector(".a-method").value, body: row.querySelector(".a-body").value };
         if (kind === "notify") return { kind, on, text: (row.querySelector(".a-text").value || "").trim() };
-        return { kind, on, topic: (row.querySelector(".a-topic").value || "").trim(), payload: row.querySelector(".a-payload").value };
+        const qsel = row.querySelector(".a-qos");
+        return { kind, on, topic: (row.querySelector(".a-topic").value || "").trim(), payload: row.querySelector(".a-payload").value,
+          qos: (qsel && qsel.value !== "") ? Number(qsel.value) : null, retain: row.querySelector(".a-retain").checked };
       });
       return {
         name: card.querySelector(".f-name").value.trim(),
@@ -1098,8 +1105,10 @@ function agoText(iso) {
   function render() {
     const hours = Number(win.value);
     charts.innerHTML = "";
+    LAST = {};
     for (const m of METRICS) {
       const pts = series(m, hours); const vals = pts.map(p => p[1]);
+      LAST[m.name] = pts;
       const last = vals[vals.length - 1], lo = Math.min(...vals), hi = Math.max(...vals);
       const card = document.createElement("div"); card.className = "card"; card.style.margin = "0";
       card.innerHTML = '<div class="toprow" style="align-items:baseline">' +
@@ -1112,6 +1121,22 @@ function agoText(iso) {
       charts.appendChild(card);
     }
   }
+  let LAST = {};
+  function exportCsv() {
+    const names = Object.keys(LAST).sort();
+    if (!names.length) return;
+    const rows = {};
+    for (const name of names) { for (const [ts, v] of LAST[name]) { (rows[ts] = rows[ts] || {})[name] = v; } }
+    const tss = Object.keys(rows).sort();
+    const e2 = s => { s = String(s); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    let csv = "ts," + names.map(e2).join(",") + "\n";
+    for (const ts of tss) { csv += e2(ts) + "," + names.map(n => rows[ts][n] == null ? "" : rows[ts][n]).join(",") + "\n"; }
+    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = "history-" + win.value + "h.csv"; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    toast("Exported " + tss.length + " rows (demo data).");
+  }
+  document.getElementById("export").addEventListener("click", exportCsv);
   win.addEventListener("change", render);
   render();
   setInterval(() => { if (document.getElementById("follow").checked) render(); }, 5000);

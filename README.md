@@ -209,9 +209,10 @@ Run the offline logic tests (no network needed):
   fired** (webhook / notify / extra publish, with an ok/failed indicator),
   newest first, in plain language.
 - **History** — **trend sparklines** for every numeric metric, over a selectable
-  window (6h / 24h / 3d / 7d / 30d). The monitor records each cycle's numeric
-  metrics to a small SQLite file (`history.db`) and prunes to the retention
-  window; turn it off or set retention under **Settings → Metric history**.
+  window (6h / 24h / 3d / 7d / 30d), with one-click **CSV export** of the window.
+  The monitor records each cycle's numeric metrics to a small SQLite file
+  (`history.db`) and prunes to the retention window; turn it off or set retention
+  under **Settings → Metric history**.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
   config valid, time since last poll), a configuration summary (rule/metric/
   input counts and the files in use), and a **live runtime log viewer** that
@@ -584,7 +585,8 @@ values:
 Use **`trigger`**, not `on` (`on` is a YAML boolean and would be misread). All
 actions are **best-effort** — a failed action is logged and never blocks the
 cycle or changes the committed state. Edit them in the form builder's **Extra
-actions** section per rule, or in the YAML tab.
+actions** section per rule (including per-publish **QoS/retain**), or in the YAML
+tab (where webhook `headers` also live).
 
 ### Time windows & hysteresis (anti-short-cycle)
 

@@ -998,6 +998,18 @@ def test_webui_rule_actions_roundtrip():
                             {"kind": "mqtt", "on": "match", "topic": ""}]}]  # empty topic -> skipped, ok
         r = c.post("/rules", data={"mode": "form", "rules_json": json.dumps(bad)})
         assert b"Rules saved" in r.data or b"saved" in r.data
+        # per-action QoS/retain from the form builder persist (and omit when unset)
+        q = [{"name": "q", "topic": "t", "on_match": "1", "enabled": True, "combine": "any",
+              "conditions": [{"metric": "is_raining", "operator": "==", "value": "true"}],
+              "actions": [{"kind": "mqtt", "on": "match", "topic": "a/cmd", "payload": "GO", "qos": 2, "retain": True},
+                          {"kind": "mqtt", "on": "clear", "topic": "b/cmd", "payload": "OFF", "qos": None, "retain": False}]}]
+        c.post("/rules", data={"mode": "form", "rules_json": json.dumps(q)})
+        qa = yaml.safe_load(open(p))["rules"][0]["actions"]
+        assert qa[0]["mqtt"]["qos"] == 2 and qa[0]["mqtt"]["retain"] is True
+        assert "qos" not in qa[1]["mqtt"] and "retain" not in qa[1]["mqtt"]   # unset -> omitted
+        w.validate_config(yaml.safe_load(open(p)))
+        qs = webui._rule_to_structured(yaml.safe_load(open(p))["rules"][0])
+        assert (qs["actions"][0]["qos"], qs["actions"][0]["retain"]) == (2, True)
     finally:
         for s in ("", ".bak", ".tmp"):
             try: os.unlink(p + s)
