@@ -210,6 +210,32 @@ weather):
 - The remote status page stays **strictly read-only** — it can never issue a
   command; it only shows a "manual" indicator when a device is overridden.
 
+## Operator variables (optional)
+
+Declare virtual flags/setpoints you can toggle from the dashboard and reference
+from rules — handy for things like a "maintenance mode" that pauses everything,
+a seasonal flag, or an adjustable threshold:
+
+```yaml
+variables:
+  maintenance_mode: { type: bool,   default: false }
+  temp_setpoint:    { type: number, default: 70 }
+```
+
+Each becomes a metric named `var_<name>` (e.g. `var_maintenance_mode`,
+`var_temp_setpoint`) that the rule builder discovers automatically. When
+**manual control** is enabled, the dashboard shows a **Variables** card with a
+toggle per `bool` and an input per `number`; values **persist** to
+`variables.json` and apply on the next poll. Example rule:
+
+```yaml
+- name: pause_all_for_maintenance
+  when: { metric: var_maintenance_mode, operator: "==", value: true }
+  topic: "irrigation/rain_inhibit"
+  on_match: "INHIBIT"
+  on_clear: "ALLOW"
+```
+
 ## Slack alerts
 
 If the MQTT broker becomes unreachable and **stays** down past a threshold
