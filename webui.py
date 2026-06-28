@@ -16,11 +16,19 @@ import functools
 import hmac
 import json
 import os
+import threading
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, request, url_for, render_template_string, Response, jsonify
 
 import weather_mqtt as core
+
+try:
+    import paho.mqtt.client as mqtt
+except Exception:  # pragma: no cover - the console degrades gracefully
+    mqtt = None
 
 try:
     from ruamel.yaml import YAML
@@ -119,6 +127,150 @@ def load_state(cfg):
         return json.loads(Path(path).read_text())
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Live MQTT console (subscribe + buffer + publish)
+# ---------------------------------------------------------------------------
+def _decode_payload(raw, limit=4096):
+    """Bytes -> (text, is_binary, truncated). Best-effort UTF-8; non-text
+    payloads are hex-previewed so the feed never breaks on binary."""
+    if isinstance(raw, str):
+        data = raw.encode("utf-8", "replace")
+    else:
+        data = bytes(raw or b"")
+    try:
+        text = data.decode("utf-8")
+        binary = False
+    except Exception:
+        text = data[:64].hex(" ")
+        binary = True
+    truncated = len(text) > limit
+    return (text[:limit], binary, truncated)
+
+
+class MqttConsole:
+    """The web UI's own MQTT client: subscribes to wildcard topics, keeps a
+    capped ring buffer of recent messages plus a per-topic 'latest value' map,
+    and can publish on demand. All buffer/query logic is broker-independent so
+    it is unit-testable; the network client is created only by start()."""
+
+    MAX_TOPICS = 2000  # cap the latest-value map so a chatty broker can't grow it forever
+
+    def __init__(self, buffer_size=500):
+        self._lock = threading.Lock()
+        self._buf = deque(maxlen=buffer_size)
+        self._latest = {}            # topic -> {payload, ts, qos, retain, count, binary}
+        self._seq = 0
+        self._received = 0
+        self._client = None
+        self._connected = False
+        self._topics = ["#"]
+        self._started = False
+        self._err = None
+
+    # ---- ingest / query (no network) ----
+    def record(self, topic, payload, qos=0, retain=False, ts=None):
+        text, binary, truncated = _decode_payload(payload)
+        ts = ts or datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            self._seq += 1
+            self._received += 1
+            entry = {"seq": self._seq, "ts": ts, "topic": str(topic),
+                     "payload": text, "qos": int(qos), "retain": bool(retain),
+                     "binary": binary, "truncated": truncated}
+            self._buf.append(entry)
+            cur = self._latest.get(topic)
+            if cur is None and len(self._latest) >= self.MAX_TOPICS:
+                return entry  # at cap: still buffered in the feed, just not tracked as a distinct topic
+            self._latest[topic] = {"payload": text, "ts": ts, "qos": int(qos),
+                                   "retain": bool(retain), "binary": binary,
+                                   "count": (cur["count"] + 1 if cur else 1)}
+            return entry
+
+    def messages(self, since=0, topic=None, limit=300):
+        pre = (topic or "").strip()
+        with self._lock:
+            items = [e for e in self._buf if e["seq"] > since]
+        if pre:
+            items = [e for e in items if e["topic"].startswith(pre)]
+        return items[-limit:]
+
+    def topics(self):
+        with self._lock:
+            return [dict(topic=t, **v) for t, v in sorted(self._latest.items())]
+
+    def stats(self):
+        with self._lock:
+            return {"connected": self._connected, "buffered": len(self._buf),
+                    "received": self._received, "topics": len(self._latest),
+                    "seq": self._seq, "subscribed": list(self._topics),
+                    "started": self._started, "error": self._err}
+
+    # ---- publish ----
+    def publish(self, topic, payload, qos=0, retain=False):
+        topic = (topic or "").strip()
+        if not topic:
+            return (False, "topic is required")
+        if any(c in topic for c in "#+") or "\x00" in topic:
+            return (False, "topic must not contain wildcards (# +) or nulls")
+        if self._client is None or not self._connected:
+            return (False, "MQTT console is not connected to the broker")
+        try:
+            info = self._client.publish(topic, payload if payload is not None else "",
+                                        qos=int(qos), retain=bool(retain))
+            rc = getattr(info, "rc", 0)
+            if rc != 0:
+                return (False, f"publish failed (rc={rc})")
+            return (True, None)
+        except Exception as e:
+            return (False, f"publish error: {e}")
+
+    # ---- lifecycle (network) ----
+    def start(self, cfg):
+        """Connect + subscribe per config. Idempotent and best-effort: a broker
+        that is down just means an empty feed until it reconnects."""
+        if self._started or mqtt is None:
+            return
+        web = cfg.get("web", {}) or {}
+        if not web.get("mqtt_console_enabled", True):
+            return
+        mq = cfg.get("mqtt", {}) or {}
+        self._topics = list(web.get("mqtt_console_topics", ["#"])) or ["#"]
+        self._buf = deque(self._buf, maxlen=int(web.get("mqtt_console_buffer", 500)))
+        try:
+            client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id=str(mq.get("client_id", "weather-mqtt")) + "-webui")
+            if mq.get("username"):
+                client.username_pw_set(mq["username"], mq.get("password", ""))
+
+            def on_connect(c, u, flags, reason_code, props):
+                self._connected = not reason_code.is_failure
+                if self._connected:
+                    for t in self._topics:
+                        c.subscribe(t)
+
+            def on_disconnect(c, u, flags, reason_code, props):
+                self._connected = False
+
+            def on_message(c, u, msg):
+                self.record(msg.topic, msg.payload, msg.qos, msg.retain)
+
+            client.on_connect = on_connect
+            client.on_disconnect = on_disconnect
+            client.on_message = on_message
+            client.reconnect_delay_set(min_delay=1, max_delay=60)
+            client.connect_async(mq.get("host", "localhost"),
+                                 int(mq.get("port", 1883)), keepalive=60)
+            client.loop_start()
+            self._client = client
+            self._started = True
+        except Exception as e:
+            self._err = str(e)
+
+
+console = MqttConsole()
 
 
 def _config_error_page(page_name, err):
@@ -291,6 +443,7 @@ BASE = """
   <a href="{{ url_for('settings') }}" class="{{ 'active' if page=='settings' }}">Settings</a>
   <a href="{{ url_for('rules') }}" class="{{ 'active' if page=='rules' }}">Rules</a>
   <a href="{{ url_for('inputs') }}" class="{{ 'active' if page=='inputs' }}">Inputs</a>
+  <a href="{{ url_for('mqtt_page') }}" class="{{ 'active' if page=='mqtt' }}">MQTT</a>
   <a href="{{ url_for('activity') }}" class="{{ 'active' if page=='activity' }}">Activity</a>
   <a href="{{ url_for('system') }}" class="{{ 'active' if page=='system' }}">System</a>
  </nav>
@@ -754,6 +907,74 @@ def api_logs():
                     "lines": core.read_log(log_file, limit) if log_file else []})
 
 
+@app.route("/api/mqtt")
+@require_auth
+def api_mqtt():
+    """Live MQTT console feed: recent messages (optionally since a seq / filtered
+    by topic prefix), a per-topic latest-value summary, and connection stats."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    web = cfg.get("web", {}) or {}
+    try:
+        since = int(request.args.get("since", 0))
+    except Exception:
+        since = 0
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 300))))
+    except Exception:
+        limit = 300
+    topic = request.args.get("topic", "")
+    want_topics = request.args.get("topics") == "1"
+    out = {"enabled": bool(web.get("mqtt_console_enabled", True)),
+           "can_publish": bool(web.get("allow_mqtt_publish", False)
+                               and web.get("username") and web.get("password")),
+           "stats": console.stats(),
+           "messages": console.messages(since=since, topic=topic, limit=limit)}
+    if want_topics:
+        out["topic_list"] = console.topics()
+    return jsonify(out)
+
+
+@app.route("/api/mqtt/publish", methods=["POST"])
+@require_auth
+def api_mqtt_publish():
+    """Publish an arbitrary message. Fail-closed like /api/control: requires
+    web.allow_mqtt_publish AND a configured web login. Audited."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    web = cfg.get("web", {}) or {}
+    user = str(web.get("username") or "")
+    pw = str(web.get("password") or "")
+    if not (bool(web.get("allow_mqtt_publish", False)) and user and pw):
+        return jsonify({"error": "MQTT publishing is disabled "
+                        "(enable it and set a web login in Settings)"}), 403
+    data = request.get_json(silent=True) or request.form
+    topic = str(data.get("topic", "")).strip()
+    payload = data.get("payload", "")
+    if payload is None:
+        payload = ""
+    try:
+        qos = int(data.get("qos", 0))
+    except Exception:
+        qos = 0
+    if qos not in (0, 1, 2):
+        qos = 0
+    retain = str(data.get("retain", "")).strip().lower() in ("1", "true", "yes", "on") \
+        or data.get("retain") is True
+    ok, err = console.publish(topic, payload, qos=qos, retain=retain)
+    if not ok:
+        return jsonify({"error": err or "publish failed"}), 400
+    auth = request.authorization
+    core.audit(cfg.get("audit_file", "audit.log"), action="mqtt_publish",
+               topic=topic, qos=qos, retain=retain,
+               by=(auth.username if auth and auth.username else user or "local"))
+    return jsonify({"ok": True, "topic": topic, "qos": qos, "retain": retain})
+
+
 @app.route("/healthz")
 def healthz():
     """Unauthenticated liveness + freshness probe for systemd/monitoring."""
@@ -990,6 +1211,180 @@ def system():
 
 
 # ---------------------------------------------------------------------------
+# MQTT console (live topic feed + manual publish)
+# ---------------------------------------------------------------------------
+MQTT_PAGE = """
+<div class="card">
+  <div class="toprow" style="align-items:center">
+    <div><h3 style="margin:0">MQTT console</h3>
+      <p class="muted" style="margin:4px 0 0">Live view of broker traffic and a manual publish console.
+       The web UI keeps its own subscription so you can watch any topic and send test messages.</p></div>
+    <span class="conn" id="mq-conn"><span class="dot idle"></span>connecting…</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="tabs">
+    <button type="button" class="tab" data-tab="feed">Live feed</button>
+    <button type="button" class="tab" data-tab="topics">Topics</button>
+  </div>
+
+  <div id="tab-feed" class="tabpane">
+    <div class="row" style="align-items:flex-end">
+      <div style="flex:1"><label style="margin-top:0">Topic filter <span class="hint">(prefix, e.g. sensors/)</span></label>
+        <input id="filter" placeholder="(all topics)"></div>
+      <div style="flex:0 0 auto"><label class="muted" style="margin:0 0 8px;display:flex;align-items:center;gap:6px;font-weight:500">
+        <input type="checkbox" id="follow" checked style="width:auto;margin:0"> auto-refresh</label></div>
+      <div style="flex:0 0 auto"><button type="button" class="secondary mini" id="clear" style="margin:0 0 6px">Clear view</button></div>
+    </div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table>
+        <thead><tr><th style="width:90px">When</th><th>Topic</th><th style="width:70px">Flags</th><th>Payload</th></tr></thead>
+        <tbody id="feedbody"><tr><td colspan="4" class="muted">Waiting for messages…</td></tr></tbody>
+      </table>
+    </div>
+    <p class="muted" id="feednote" style="margin-top:10px">—</p>
+  </div>
+
+  <div id="tab-topics" class="tabpane" style="display:none">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Topic</th><th style="width:70px">Msgs</th><th style="width:90px">Updated</th><th>Latest payload</th></tr></thead>
+        <tbody id="topicsbody"><tr><td colspan="4" class="muted">No topics seen yet…</td></tr></tbody>
+      </table>
+    </div>
+    <p class="muted" style="margin-top:10px">The most recent value retained per topic (newest broker state first seen by the UI).</p>
+  </div>
+</div>
+
+<div class="card" id="pub-card">
+  <h3 style="margin:0 0 4px">Publish a message</h3>
+  <div id="pub-disabled" class="msg" style="display:none;background:#1a2742;border:1px solid var(--line);color:var(--muted)">
+    Publishing is <b>off</b>. Enable <b>Allow MQTT publishing</b> under
+    <a href="{{ url_for('settings') }}">Settings → Web interface</a> (a web login is required) to send messages.</div>
+  <div id="pub-form">
+    <div class="row">
+      <div style="flex:2"><label>Topic</label><input id="p-topic" placeholder="facility/cmd/relay1"></div>
+      <div style="flex:0 0 110px"><label>QoS</label>
+        <select id="p-qos"><option>0</option><option>1</option><option>2</option></select></div>
+      <div style="flex:0 0 auto"><label class="muted" style="display:flex;align-items:center;gap:6px;margin:14px 0 6px;font-weight:500">
+        <input type="checkbox" id="p-retain" style="width:auto;margin:0"> retain</label></div>
+    </div>
+    <label>Payload</label>
+    <textarea id="p-payload" style="min-height:90px" placeholder="ON  (or any string / JSON)"></textarea>
+    <div class="field-err" id="p-err"></div>
+    <button type="button" id="p-send">Publish</button>
+    <p class="muted" style="margin-top:10px">⚠ Messages go straight to the broker (LAN-only, authenticated, audited).
+     Wildcards (<code>#</code> <code>+</code>) are not allowed in a publish topic.</p>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+const REFRESH = {{ refresh }} * 1000;
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function toast(t,e){ const x=document.getElementById("toast"); if(!x) return; x.textContent=t; x.className="show"+(e?" err":""); clearTimeout(toast._t); toast._t=setTimeout(()=>x.className=e?"err":"",3200); }
+function agoText(iso){ if(!iso) return "—"; const t=Date.parse(iso); if(isNaN(t)) return iso;
+  const s=Math.max(0,Math.round((Date.now()-t)/1000));
+  if(s<5) return "now"; if(s<60) return s+"s"; if(s<3600) return Math.round(s/60)+"m"; return Math.round(s/3600)+"h"; }
+
+let SINCE=0, CAN_PUBLISH=false, ROWS=[];
+const MAXROWS=400;
+function flags(m){ let f=[]; if(m.retain) f.push('<span class="pill na" style="padding:1px 6px">R</span>'); if(m.qos) f.push('<span class="pill off" style="padding:1px 6px">q'+m.qos+'</span>'); return f.join(" "); }
+
+function renderFeed(){
+  const tb=document.getElementById("feedbody");
+  if(!ROWS.length){ tb.innerHTML='<tr><td colspan="4" class="muted">No messages yet on this filter.</td></tr>'; return; }
+  tb.innerHTML="";
+  for(const m of ROWS.slice().reverse()){
+    const tr=document.createElement("tr");
+    const pl = m.binary ? '<span class="muted">[binary] </span>'+esc(m.payload) : esc(m.payload) + (m.truncated?' <span class="muted">…(truncated)</span>':'');
+    tr.innerHTML='<td class="muted" title="'+esc(m.ts)+'">'+esc(agoText(m.ts))+'</td>'+
+      '<td><code>'+esc(m.topic)+'</code></td><td>'+flags(m)+'</td>'+
+      '<td style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">'+pl+'</td>';
+    tr.style.cursor="pointer";
+    tr.addEventListener("click",()=>{ document.getElementById("p-topic").value=m.topic; });
+    tb.appendChild(tr);
+  }
+}
+async function tickFeed(){
+  const topic=encodeURIComponent(document.getElementById("filter").value.trim());
+  let d; try{ const r=await fetch("api/mqtt?since="+SINCE+"&topic="+topic,{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
+  catch(e){ return; }
+  const st=d.stats||{}; const conn=document.getElementById("mq-conn");
+  if(!d.enabled){ conn.innerHTML='<span class="dot idle"></span>console disabled'; }
+  else conn.innerHTML='<span class="dot '+(st.connected?"up":"down")+'"></span>'+(st.connected?"connected":"broker offline")+' · '+(st.received||0)+' msgs';
+  CAN_PUBLISH=!!d.can_publish; applyPublishState();
+  for(const m of (d.messages||[])){ ROWS.push(m); SINCE=Math.max(SINCE,m.seq); }
+  if(ROWS.length>MAXROWS) ROWS=ROWS.slice(-MAXROWS);
+  document.getElementById("feednote").textContent =
+    (st.connected? "Live · ":"Offline · ")+(st.topics||0)+" topics · "+(st.buffered||0)+" buffered"+
+    (d.enabled? "":" · enable the console in config (web.mqtt_console_enabled)");
+  if(d.messages && d.messages.length) renderFeed();
+}
+async function tickTopics(){
+  let d; try{ const r=await fetch("api/mqtt?topics=1&limit=1",{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
+  catch(e){ return; }
+  const tb=document.getElementById("topicsbody"); const list=d.topic_list||[];
+  if(!list.length){ tb.innerHTML='<tr><td colspan="4" class="muted">No topics seen yet…</td></tr>'; return; }
+  tb.innerHTML="";
+  for(const t of list){
+    const tr=document.createElement("tr"); tr.style.cursor="pointer";
+    const pl = t.binary ? '[binary]' : (t.payload.length>120? t.payload.slice(0,120)+"…" : t.payload);
+    tr.innerHTML='<td><code>'+esc(t.topic)+'</code></td><td class="muted">'+t.count+'</td>'+
+      '<td class="muted" title="'+esc(t.ts)+'">'+esc(agoText(t.ts))+'</td>'+
+      '<td style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">'+esc(pl)+'</td>';
+    tr.addEventListener("click",()=>{ document.getElementById("p-topic").value=t.topic; document.getElementById("filter").value=t.topic; });
+    tb.appendChild(tr);
+  }
+}
+
+function applyPublishState(){
+  document.getElementById("pub-disabled").style.display = CAN_PUBLISH? "none":"";
+  document.getElementById("pub-form").style.display = CAN_PUBLISH? "":"none";
+}
+document.getElementById("p-send").addEventListener("click", async ()=>{
+  const topic=document.getElementById("p-topic").value.trim();
+  const payload=document.getElementById("p-payload").value;
+  const qos=Number(document.getElementById("p-qos").value);
+  const retain=document.getElementById("p-retain").checked;
+  const err=document.getElementById("p-err"); err.textContent="";
+  if(!topic){ err.textContent="Topic is required."; return; }
+  try{
+    const r=await fetch("api/mqtt/publish",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({topic,payload,qos,retain})});
+    const j=await r.json();
+    if(!r.ok){ err.textContent=j.error||"Publish failed."; toast(j.error||"Publish failed",true); return; }
+    toast("Published to "+topic);
+  }catch(e){ err.textContent="Network error."; toast("Network error",true); }
+});
+
+document.getElementById("clear").addEventListener("click",()=>{ ROWS=[]; renderFeed(); });
+document.getElementById("filter").addEventListener("input",()=>{ ROWS=[]; SINCE=0; renderFeed(); });
+document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
+  const tab=t.dataset.tab;
+  document.getElementById("tab-feed").style.display = tab==="feed"?"":"none";
+  document.getElementById("tab-topics").style.display = tab==="topics"?"":"none";
+  if(tab==="topics") tickTopics();
+}));
+
+function tick(){ if(document.getElementById("follow").checked) tickFeed();
+  if(document.getElementById("tab-topics").style.display!=="none") tickTopics(); }
+document.querySelector('.tab[data-tab="feed"]').click();
+tickFeed();
+setInterval(tick, 2500);
+</script>
+"""
+
+
+@app.route("/mqtt")
+@require_auth
+def mqtt_page():
+    return page(render_template_string(MQTT_PAGE, refresh=DASH_REFRESH_SECONDS),
+                page="mqtt", title="MQTT · The Castle Fun Center")
+
+
+# ---------------------------------------------------------------------------
 # Settings (friendly form for scalar config)
 # ---------------------------------------------------------------------------
 SETTINGS = """
@@ -1116,10 +1511,15 @@ SETTINGS = """
         <option value="false" {{ 'selected' if not c.web.allow_manual_control }}>off (display only)</option>
         <option value="true" {{ 'selected' if c.web.allow_manual_control }}>on (requires a login)</option>
       </select></div>
-    <div></div>
+    <div><label>Allow MQTT publishing <span class="hint">(send messages from the MQTT console)</span></label>
+      <select name="web_allow_mqtt_publish">
+        <option value="false" {{ 'selected' if not c.web.allow_mqtt_publish }}>off (feed is read-only)</option>
+        <option value="true" {{ 'selected' if c.web.allow_mqtt_publish }}>on (requires a login)</option>
+      </select></div>
   </div>
   <p class="muted">Manual control lets an authenticated operator force a device ON/OFF from the
-   dashboard (LAN-only, audited). It requires a login to be set; the remote status page stays read-only.</p>
+   dashboard (LAN-only, audited). <b>Allow MQTT publishing</b> lets the MQTT console send arbitrary
+   messages to the broker. Both require a login to be set; the remote status page stays read-only.</p>
   <p class="muted">⚠ Changing <b>location</b>, the <b>MQTT connection</b> (host/port/credentials/client id),
    or any <b>web interface</b> setting needs a restart of the corresponding service.
    Thresholds, lookback, poll interval, QoS, retain, status topic and rules apply on the next poll automatically.</p>
@@ -1241,6 +1641,11 @@ def settings():
                 raise ValueError("manual device control needs a web login "
                                  "(set a username and password first)")
             web["allow_manual_control"] = amc
+            amp = f.get("web_allow_mqtt_publish") == "true"
+            if amp and not (str(web.get("username") or "") and str(web.get("password") or "")):
+                raise ValueError("MQTT publishing needs a web login "
+                                 "(set a username and password first)")
+            web["allow_mqtt_publish"] = amp
 
             save_config(cfg)
             msg, msgclass = ("Settings saved. Thresholds/MQTT-publish/rules apply on the "
@@ -1267,6 +1672,7 @@ def settings():
     webd.setdefault("username", "")
     webd.setdefault("password", "")
     webd.setdefault("allow_manual_control", False)
+    webd.setdefault("allow_mqtt_publish", False)
     sld = cfg.setdefault("slack", {})
     sld.setdefault("enabled", False)
     sld.setdefault("channel", "")
@@ -2129,6 +2535,9 @@ def main():
         raise SystemExit(1)
     host = args.host or web.get("host", "0.0.0.0")
     port = args.port or web.get("port", 8080)
+    # Start the live MQTT console subscriber (best-effort; an unreachable broker
+    # just means an empty feed until it reconnects).
+    console.start(cfg)
     print(f"Web UI on http://{host}:{port}  (config: {CONFIG_PATH})")
     app.run(host=host, port=port)
 
