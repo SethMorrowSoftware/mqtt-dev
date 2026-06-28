@@ -240,9 +240,11 @@ system "as customizable as possible" without engine changes.
     existing broker connection and exposes each payload (`number`/`bool`/`string`) as
     a rule metric, discovered by the builder; unavailable until first message
     (fail‑safe hold).
-  - **Still to come (own PRs):** `http_poll` (GET JSON → metric via JSONPath),
-    `time_is_daytime` (sunrise/sunset), and optional event‑driven re‑eval on MQTT
-    input (today values are read each poll cycle).
+  - **Delivered (cont.):** **`http_poll`** — `http_inputs:` GETs a JSON endpoint on
+    an interval and maps fields (dotted path) to typed metrics, discovered by the
+    builder; best‑effort with fail‑safe hold.
+  - **Still to come (own PRs):** `time_is_daytime` (sunrise/sunset), and optional
+    event‑driven re‑eval on MQTT input (today inputs are read each poll cycle).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

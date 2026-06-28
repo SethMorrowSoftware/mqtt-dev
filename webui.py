@@ -958,11 +958,12 @@ RULE_METRICS = {
 
 def builder_metrics(cfg):
     """The builder's metric catalogue for this config: built-ins plus the
-    config-declared variables (var_<name>) and mqtt_in sensors, so dropdowns
-    discover them live."""
+    config-declared variables (var_<name>), mqtt_in sensors, and http_poll
+    metrics, so dropdowns discover them live."""
     out = dict(RULE_METRICS)
     extra = {**core.variable_specs(cfg.get("variables", {})),
-             **core.mqtt_input_specs(cfg.get("mqtt_inputs", []))}
+             **core.mqtt_input_specs(cfg.get("mqtt_inputs", [])),
+             **core.http_input_specs(cfg.get("http_inputs", []))}
     for name, spec in extra.items():
         out[name] = {"type": spec["type"], "ops": list(spec["ops"])}
     return out

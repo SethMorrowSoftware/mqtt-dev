@@ -628,6 +628,75 @@ def test_mqtt_in_validation_catalogue_and_rules():
             assert needle in str(e), f"got {e!r}, wanted {needle!r}"
 
 
+def test_http_extract_coerce_and_map():
+    data = {"current_kw": 3.5, "online": True, "phases": [{"volts": 240}, {"volts": 241}],
+            "name": "meter1"}
+    assert w.extract_path(data, "current_kw") == 3.5
+    assert w.extract_path(data, "$.phases.1.volts") == 241      # leading $., list index
+    assert w.extract_path(data, "phases.9.volts") is None       # out of range -> None
+    assert w.extract_path(data, "missing.key") is None
+    assert w.coerce_value("12.5", "number") == 12.5
+    assert w.coerce_value(True, "number") is None               # bool isn't a number
+    assert w.coerce_value("yes", "bool") is True
+    assert w.coerce_value(240, "string") == "240"
+    store = {}
+    w.apply_http_map(data, [
+        {"metric": "power_kw", "path": "current_kw", "type": "number"},
+        {"metric": "grid_up", "path": "online", "type": "bool"},
+        {"metric": "v1", "path": "phases.0.volts", "type": "number"},
+        {"metric": "absent", "path": "nope", "type": "number"},   # missing -> skipped
+    ], store)
+    assert store == {"power_kw": 3.5, "grid_up": True, "v1": 240}
+
+
+def test_poll_http_inputs_due_logic_and_failsafe():
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    calls = []
+
+    def fake_fetch(url, timeout, ua):
+        calls.append(url)
+        return {"v": 7} if url.endswith("ok") else None
+
+    inputs = [{"url": "http://x/ok", "interval_minutes": 5, "timeout": 10,
+               "map": [{"metric": "kw", "path": "v", "type": "number"}]}]
+    store, last = {}, {}
+    w.poll_http_inputs(inputs, store, last, t0, "ua", fetch=fake_fetch)
+    assert store == {"kw": 7} and len(calls) == 1
+    # not due yet (2 min < 5 min) -> no fetch
+    w.poll_http_inputs(inputs, store, last, t0 + timedelta(minutes=2), "ua", fetch=fake_fetch)
+    assert len(calls) == 1
+    # due again
+    w.poll_http_inputs(inputs, store, last, t0 + timedelta(minutes=6), "ua", fetch=fake_fetch)
+    assert len(calls) == 2
+    # a failed fetch keeps the last good value
+    inputs[0]["url"] = "http://x/bad"
+    last.clear()
+    w.poll_http_inputs(inputs, store, last, t0 + timedelta(minutes=12), "ua", fetch=fake_fetch)
+    assert store == {"kw": 7}
+
+
+def test_http_inputs_validation_and_catalogue():
+    cfg = w.validate_config(_min_cfg(
+        http_inputs=[{"url": "https://meter.local/api", "interval_minutes": 5,
+                      "map": [{"metric": "power_kw", "path": "current_kw", "type": "number"}]}],
+        rules=[{"name": "r", "topic": "t", "on_match": "1",
+                "when": {"metric": "power_kw", "operator": ">", "value": 5}}]))
+    assert w.metric_catalogue(cfg)["power_kw"]["type"] == "number"
+    assert cfg["http_inputs"][0]["interval_minutes"] == 5
+    for inputs, needle in [
+        ([{"url": "ftp://x", "map": [{"metric": "a", "path": "b"}]}], "http:// or https://"),
+        ([{"url": "https://x", "map": []}], "non-empty list"),
+        ([{"url": "https://x", "map": [{"metric": "temperature", "path": "b"}]}], "collides"),
+        ([{"url": "https://x", "map": [{"metric": "a", "path": ""}]}], "needs a 'path'"),
+    ]:
+        try:
+            w.validate_config(_min_cfg(http_inputs=inputs))
+            raise AssertionError(f"expected ValueError for {inputs}")
+        except ValueError as e:
+            assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

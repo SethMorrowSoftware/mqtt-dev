@@ -184,10 +184,20 @@ def variable_specs(variables):
 
 
 def metric_catalogue(cfg):
-    """The full metric catalogue: built-ins + declared variables + mqtt_in metrics."""
+    """The full metric catalogue: built-ins + variables + mqtt_in + http_poll."""
     return {**METRIC_SPECS,
             **variable_specs(cfg.get("variables", {})),
-            **mqtt_input_specs(cfg.get("mqtt_inputs", []))}
+            **mqtt_input_specs(cfg.get("mqtt_inputs", [])),
+            **http_input_specs(cfg.get("http_inputs", []))}
+
+
+def _ops_for_type(mtype):
+    """The operator set offered for a dynamic metric of the given type."""
+    if mtype == "number":
+        return NUMBER_OPS + ("changed",)
+    if mtype == "bool":
+        return ("==", "!=", "changed")
+    return TEXT_OPS + ("changed",)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +278,139 @@ def handle_mqtt_input(in_store, topic_map, topic, payload):
     val = coerce_payload(payload, it["parse"])
     if val is not None:
         in_store[it["metric"]] = val
+
+
+# ---------------------------------------------------------------------------
+# http_poll: GET a JSON endpoint on an interval, map fields to metrics (Phase 3)
+# ---------------------------------------------------------------------------
+def http_input_specs(inputs):
+    """Metric specs for http_poll mappings: {metric: {type, ops}}."""
+    out = {}
+    for src in (inputs or []):
+        for mp in (src or {}).get("map", []):
+            metric = str((mp or {}).get("metric", "")).strip()
+            if not metric:
+                continue
+            mtype = MQTT_IN_PARSE.get(str(mp.get("type", "number")).strip().lower(), "number")
+            out[metric] = {"type": mtype, "ops": _ops_for_type(mtype)}
+    return out
+
+
+def _validate_http_inputs(inputs, taken_names):
+    """Validate/normalize the `http_inputs:` list. `taken_names` are metric names
+    already in use that a mapping must not shadow."""
+    if not isinstance(inputs, list):
+        raise ValueError("'http_inputs' must be a list")
+    clean, seen = [], set(taken_names)
+    for src in inputs:
+        if not isinstance(src, dict):
+            raise ValueError("each http_inputs entry must be a mapping")
+        url = str(src.get("url", "")).strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("http_inputs entry needs a url starting http:// or https://")
+        interval = max(1, int(_as_number(src.get("interval_minutes", 5), 5,
+                                         "http_inputs.interval_minutes")))
+        timeout = max(1, int(_as_number(src.get("timeout", 10), 10, "http_inputs.timeout")))
+        mapping = src.get("map")
+        if not isinstance(mapping, list) or not mapping:
+            raise ValueError(f"http_inputs '{url}': 'map' must be a non-empty list")
+        clean_map = []
+        for mp in mapping:
+            if not isinstance(mp, dict):
+                raise ValueError(f"http_inputs '{url}': each map entry must be a mapping")
+            metric = str(mp.get("metric", "")).strip()
+            path = str(mp.get("path", "")).strip()
+            mtype = str(mp.get("type", "number")).strip().lower()
+            if not metric or not all(c.isalnum() or c == "_" for c in metric):
+                raise ValueError(f"http_inputs metric '{metric}' must be alphanumeric/underscore")
+            if metric in seen:
+                raise ValueError(f"http_inputs metric '{metric}' collides with an existing metric")
+            if not path:
+                raise ValueError(f"http_inputs '{metric}': needs a 'path'")
+            if mtype not in MQTT_IN_PARSE:
+                raise ValueError(f"http_inputs '{metric}': type must be one of "
+                                 f"{tuple(MQTT_IN_PARSE)}")
+            seen.add(metric)
+            clean_map.append({"metric": metric, "path": path, "type": mtype})
+        clean.append({"url": url, "interval_minutes": interval, "timeout": timeout,
+                      "map": clean_map})
+    return clean
+
+
+def extract_path(obj, path):
+    """Resolve a dotted path (a subset of JSONPath) into a nested JSON value.
+    Leading '$.'/'$' is ignored; numeric segments index lists. Returns None if
+    any segment is missing."""
+    cur = obj
+    for part in path.lstrip("$").lstrip(".").split("."):
+        if part == "":
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def coerce_value(value, mtype):
+    """Coerce an extracted JSON value to a metric type. Returns None when a
+    'number' value isn't numeric (so the metric holds its last value)."""
+    if value is None:
+        return None
+    if mtype == "number":
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        return _as_number(value, None, "http value")
+    if mtype == "bool":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("true", "1", "yes", "on")
+    return str(value)
+
+
+def apply_http_map(data, mapping, store):
+    """Extract + coerce each mapped field into `store`. Pure; a None result is
+    skipped so the last good value persists."""
+    for mp in mapping:
+        val = coerce_value(extract_path(data, mp["path"]), mp["type"])
+        if val is not None:
+            store[mp["metric"]] = val
+
+
+def _http_fetch_json(url, timeout, user_agent):
+    """GET a JSON endpoint. Best-effort: returns the decoded object or None."""
+    try:
+        r = requests.get(url, headers={"User-Agent": user_agent}, timeout=timeout)
+        if r.status_code // 100 != 2:
+            LOG.warning("http_poll %s returned HTTP %s", url, r.status_code)
+            return None
+        return r.json()
+    except Exception as e:
+        LOG.warning("http_poll %s failed: %s", url, e)
+        return None
+
+
+def poll_http_inputs(inputs, store, last_fetch, now, user_agent, fetch=_http_fetch_json):
+    """Fetch any http_inputs whose interval has elapsed and merge mapped values
+    into `store`. `last_fetch` (url -> datetime) tracks due times across cycles."""
+    for src in (inputs or []):
+        url = src["url"]
+        last = last_fetch.get(url)
+        if last is not None and (now - last).total_seconds() < src["interval_minutes"] * 60:
+            continue
+        last_fetch[url] = now
+        data = fetch(url, src.get("timeout", 10), user_agent)
+        if data is not None:
+            apply_http_map(data, src["map"], store)
 
 
 def _validate_variables(variables):
@@ -380,6 +523,13 @@ def validate_config(cfg):
         cfg["mqtt_inputs"] = _validate_mqtt_inputs(cfg["mqtt_inputs"], taken)
     else:
         cfg.setdefault("mqtt_inputs", [])
+    # http_poll inputs -> dynamic metrics, must not shadow earlier metrics.
+    if "http_inputs" in cfg and cfg["http_inputs"] is not None:
+        taken = (set(METRIC_SPECS) | set(variable_specs(cfg["variables"]))
+                 | set(mqtt_input_specs(cfg["mqtt_inputs"])))
+        cfg["http_inputs"] = _validate_http_inputs(cfg["http_inputs"], taken)
+    else:
+        cfg.setdefault("http_inputs", [])
     specs = metric_catalogue(cfg)
 
     if not isinstance(cfg["rules"], list) or not cfg["rules"]:
@@ -1438,6 +1588,7 @@ def main():
     last_state = {}            # rule name -> bool
     last_change = {}           # rule name -> iso timestamp of last published change
     engine_state = EngineState()   # history for `changed` / `for:` across cycles
+    http_store, http_last = {}, {}  # latest http_poll values + per-url last fetch
     broker_watch = BrokerWatch(cfg["slack"]["broker_unreachable_minutes"])
 
     while not stop["flag"]:
@@ -1485,6 +1636,9 @@ def main():
             m.update(schedule_metrics(now_local))   # time_* inputs into the context
             m.update(variable_metrics(var_values))  # var_* operator-set inputs
             m.update(dict(mqtt_in_store))            # latest mqtt_in sensor values
+            poll_http_inputs(cfg.get("http_inputs", []), http_store, http_last,
+                             now_utc, ua)            # GET due http_poll endpoints
+            m.update(dict(http_store))               # latest http_poll values
             rule_rows = []
             for rule in rules:
               try:
