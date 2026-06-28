@@ -5,6 +5,10 @@
 # Purpose: watch rainfall and tell irrigation PLCs when NOT to water.
 # ===========================================================================
 
+# Config schema version. Leave at 1; a future "Conditions -> Actions" schema
+# (see ROADMAP.md) will introduce version 2 with an automatic migration.
+version: 1
+
 # --- Your facility's location ----------------------------------------------
 # Decimal degrees. REPLACE THESE with your actual coordinates.
 location:

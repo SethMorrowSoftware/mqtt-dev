@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# --- Virtualenvs ---
+venv/
+.venv/
+env/
+
+# --- Runtime files written by the controller / web UI ---
+# Cached NWS grid/station resolution and the per-cycle state snapshot.
+nws_location_cache.json
+weather_state.json
+# Atomic-write temp + backup files left by the web UI's config saves.
+*.tmp
+*.bak
+
+# --- cloud-status (PHP) runtime / secrets ---
+# secret.php holds the shared push token; status.json is written by ingest.php.
+cloud-status/secret.php
+cloud-status/status.json
+cloud-status/status.json.tmp
+
+# --- Local config overrides (keep the committed example config.yaml) ---
+config.local.yaml
+
+# --- Editor / OS noise ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

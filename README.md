@@ -330,7 +330,7 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 ## Development & tests
 
 ```bash
-python test_weather_mqtt.py          # 24 offline tests, no network required
+python test_weather_mqtt.py          # offline test suite, no network required
 ```
 
 CI (GitHub Actions, `.github/workflows/tests.yml`) runs the suite on Python

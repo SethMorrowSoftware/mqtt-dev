@@ -55,20 +55,27 @@ function render(s, ok){
   conn.innerHTML = '<span class="dot '+(fresh ? (up?'up':'down') : 'idle')+'"></span>' +
     (fresh ? ('MQTT '+(up?'connected':'offline')) : 'stale');
 
-  // directive (first irrigation / rain_inhibit rule)
+  // Headline device: prefer the irrigation rule (back-compat), else the first
+  // rule with a known state, else the first rule, so a renamed first rule still
+  // drives the hero instead of leaving it stuck on UNKNOWN.
   const rules = s.rules || [];
-  const irr = rules.find(r => /irrigation|rain_inhibit/.test(r.name||""));
+  const irr = rules.find(r => /irrigation|rain_inhibit/.test(r.name||""))
+           || rules.find(r => r.active !== null && r.active !== undefined)
+           || rules[0];
   const d = document.getElementById("directive");
   let st = "unknown";
   if(irr && irr.active !== null && irr.active !== undefined){
+    const isIrr = /irrigation|rain_inhibit/.test(irr.name||"");
     st = irr.active ? "inhibit" : "allow";
     d.className = "big " + st;
-    setText("directive", (irr.current_payload ?? "?") + (irr.active ? " — do NOT water" : " — watering allowed"));
+    const suffix = isIrr ? (irr.active ? " — do NOT water" : " — watering allowed")
+                         : (irr.active ? " — active" : " — clear");
+    setText("directive", (irr.current_payload ?? "?") + suffix);
     setText("directive-sub", "topic " + irr.topic + (irr.last_change ? " · changed " + agoText(irr.last_change) : ""));
   } else {
     d.className = "big unknown";
     setText("directive","UNKNOWN");
-    setText("directive-sub","No irrigation rule data yet.");
+    setText("directive-sub", irr ? "Waiting on data…" : "No rules configured.");
   }
   card.className = "card state-" + st;
 
