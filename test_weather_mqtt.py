@@ -182,6 +182,94 @@ def test_validate_enabled_default_and_coercion():
     assert cfg3["rules"][0]["enabled"] is False          # string coerced
 
 
+def test_parse_duration():
+    assert w.parse_duration("30s") == 30
+    assert w.parse_duration("10m") == 600
+    assert w.parse_duration("2h") == 7200
+    assert w.parse_duration(5) == 300          # bare number == minutes
+    assert w.parse_duration("0m") == 0
+    assert w.parse_duration(None, 0) == 0
+    assert w.parse_duration("garbage", 99) == 99
+
+
+def test_in_window_hours_days_and_wrap():
+    from datetime import datetime
+    mon_10 = datetime(2026, 6, 29, 10, 0)   # Monday 10:00
+    mon_05 = datetime(2026, 6, 29, 5, 0)    # Monday 05:00
+    sun_10 = datetime(2026, 6, 28, 10, 0)   # Sunday 10:00
+    assert w.in_window(None, mon_10) is True                                  # no window -> always
+    assert w.in_window({"from": "06:00", "to": "20:00"}, mon_10) is True
+    assert w.in_window({"from": "06:00", "to": "20:00"}, mon_05) is False     # before open
+    assert w.in_window({"from": "06:00", "to": "20:00",
+                        "days": ["mon", "tue"]}, sun_10) is False             # wrong day
+    # overnight window 22:00 -> 06:00 wraps past midnight
+    assert w.in_window({"from": "22:00", "to": "06:00"}, mon_05) is True
+    assert w.in_window({"from": "22:00", "to": "06:00"}, mon_10) is False
+    # `to` is exclusive
+    assert w.in_window({"from": "06:00", "to": "10:00"}, mon_10) is False
+
+
+def test_apply_hysteresis_min_on_off_cooldown():
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    # first commit: no prior state -> desired wins regardless of timers
+    assert w.apply_hysteresis({"min_off": "10m"}, None, True, None, t0) is True
+    # currently ON, want OFF, min_on=10m not yet elapsed -> hold ON
+    assert w.apply_hysteresis({"min_on": "10m"}, True, False, t0, t0 + timedelta(minutes=5)) is True
+    # ...once min_on elapses, allow OFF
+    assert w.apply_hysteresis({"min_on": "10m"}, True, False, t0, t0 + timedelta(minutes=11)) is False
+    # currently OFF, want ON, min_off holds it OFF until elapsed
+    assert w.apply_hysteresis({"min_off": "10m"}, False, True, t0, t0 + timedelta(minutes=5)) is False
+    assert w.apply_hysteresis({"min_off": "10m"}, False, True, t0, t0 + timedelta(minutes=11)) is True
+    # cooldown blocks any transition regardless of direction
+    assert w.apply_hysteresis({"cooldown": "30m"}, True, False, t0, t0 + timedelta(minutes=20)) is True
+    # no hysteresis config -> desired passes straight through
+    assert w.apply_hysteresis(None, True, False, t0, t0 + timedelta(minutes=1)) is False
+
+
+def test_resolve_desired_window_gate():
+    from datetime import datetime
+    rule = {"name": "r", "window": {"from": "06:00", "to": "20:00"},
+            "when": {"metric": "temperature", "operator": ">", "value": 50}}
+    inside = datetime(2026, 6, 29, 10, 0)
+    outside = datetime(2026, 6, 29, 22, 0)
+    assert w.resolve_desired(rule, {"temperature": 60}, inside) is True
+    assert w.resolve_desired(rule, {"temperature": 40}, inside) is False
+    assert w.resolve_desired(rule, {"temperature": 60}, outside) is False    # window forces off
+    # no window -> just the evaluation
+    assert w.resolve_desired({"name": "r", "when": rule["when"]},
+                             {"temperature": 60}, outside) is True
+
+
+def test_validate_window_and_hysteresis():
+    w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1",
+        "window": {"from": "06:00", "to": "20:00", "days": ["mon", "fri"]},
+        "hysteresis": {"min_on": "10m", "min_off": "5m", "cooldown": "0m"},
+        "when": {"metric": "temperature", "operator": ">", "value": 50}}]))
+    for win, needle in [
+        ({"from": "25:00", "to": "26:00"}, "out of range"),
+        ({"from": "6am", "to": "20:00"}, "HH:MM"),
+        ({"days": ["funday"]}, "invalid day"),
+        ({"days": []}, "non-empty list"),
+    ]:
+        try:
+            w.validate_config(_min_cfg(rules=[{
+                "name": "r", "topic": "t", "on_match": "1", "window": win,
+                "when": {"metric": "temperature", "operator": ">", "value": 50}}]))
+            raise AssertionError(f"expected ValueError for window {win}")
+        except ValueError as e:
+            assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+    try:
+        w.validate_config(_min_cfg(rules=[{
+            "name": "r", "topic": "t", "on_match": "1",
+            "hysteresis": {"min_on": "ten minutes"},
+            "when": {"metric": "temperature", "operator": ">", "value": 50}}]))
+        raise AssertionError("expected ValueError for bad hysteresis duration")
+    except ValueError as e:
+        assert "duration" in str(e)
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

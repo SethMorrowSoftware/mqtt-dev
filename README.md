@@ -330,8 +330,38 @@ values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).
 A rule may set `enabled: false` to leave it idle — it is not evaluated and
 publishes nothing, so the broker's last retained value stands. The web UI's
 **form builder** edits flat rules (one condition or one `any`/`all` group);
-nested/`not` rules are edited in the **YAML (advanced)** tab, which the Rules
-page opens automatically when it detects them.
+rules using nested/`not` conditions, a time window, hysteresis, or `enabled:
+false` are edited in the **YAML (advanced)** tab, which the Rules page opens
+automatically when it detects them.
+
+### Time windows & hysteresis (anti-short-cycle)
+
+Two optional per-rule layers turn a rule's evaluated *desired* state into the
+*committed* state that's actually published — useful when a rule drives a real
+load (pump, valve, compressor) rather than just an advisory directive:
+
+```yaml
+- name: vent_fan
+  when: { metric: temperature, operator: ">", value: 85 }
+  window:                      # only active 06:00–20:00, weekdays
+    from: "06:00"
+    to:   "20:00"              # `to` is exclusive; from > to wraps past midnight
+    days: [mon, tue, wed, thu, fri]
+  hysteresis:                  # don't short-cycle the fan
+    min_on:  10m               # once ON, stay ON ≥ 10 min
+    min_off: 5m                # once OFF, stay OFF ≥ 5 min
+    cooldown: 0m               # min gap between any two switches
+  topic: "facility/vent_fan"
+  on_match: "ON"
+  on_clear: "OFF"
+```
+
+- **`window`** — outside its hours/days the desired state is forced **OFF**.
+  `from`/`to` default to the whole day; `days` defaults to every day.
+- **`hysteresis`** — `min_on` / `min_off` hold the current state for at least
+  that long before the opposite transition; `cooldown` is a floor between any
+  two switches. Durations accept `30s`, `10m`, `2h`, or a bare number (minutes).
+  Unknown inputs still hold the last state (the fail-safe is preserved).
 
 `on_match` / `on_clear` payloads are sent literally, so they can be anything
 your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.

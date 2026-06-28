@@ -102,6 +102,13 @@ status_push:
 # Each rule may also set `enabled: false` to leave it idle (not evaluated, no
 # publishing -- the broker's last retained value stands).
 #
+# Optional per-rule gating for driving real loads (pumps/valves/fans):
+#   window:     { from: "06:00", to: "20:00", days: [mon,tue,wed,thu,fri] }
+#               outside the window the desired state is forced OFF ('to' is
+#               exclusive; from > to wraps past midnight; days defaults to all).
+#   hysteresis: { min_on: 10m, min_off: 5m, cooldown: 0m }
+#               anti-short-cycle timers (accept 30s / 10m / 2h / bare minutes).
+#
 # Available metrics:
 #   is_raining                 precipitating right now (true/false)   [== !=]
 #   precip_accum_in            measured rainfall over lookback_hours, inches

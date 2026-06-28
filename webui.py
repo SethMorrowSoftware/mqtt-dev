@@ -1215,9 +1215,15 @@ def rules():
 
 def _rule_is_flat(rule):
     """True if the form builder can faithfully represent this rule (a single
-    leaf condition, or one any/all group of leaf conditions). Nested groups or
-    `not` are YAML-editor only."""
+    leaf condition, or one any/all group of leaf conditions, with no advanced
+    fields). Nested groups, `not`, time windows, hysteresis, and a disabled
+    flag are YAML-editor only -- a rule using any of them opens the YAML tab so
+    a form save can't silently drop it."""
     if not isinstance(rule, dict):
+        return False
+    if rule.get("window") is not None or rule.get("hysteresis") is not None:
+        return False
+    if rule.get("enabled") is False:
         return False
     when = rule.get("when")
     if not isinstance(when, dict):
