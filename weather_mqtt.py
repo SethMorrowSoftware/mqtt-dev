@@ -22,6 +22,7 @@ Test:  python weather_mqtt.py --config config.yaml --once --dry-run --verbose
 
 import argparse
 import ast
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -43,6 +44,36 @@ import paho.mqtt.client as mqtt
 LOG = logging.getLogger("weather_mqtt")
 NWS_API = "https://api.weather.gov"
 CACHE_FILE = Path("nws_location_cache.json")
+
+# Set by the signal handler so blocking HTTP backoff sleeps bail out promptly on
+# shutdown instead of making SIGTERM wait out a full retry cycle.
+_SHUTDOWN = threading.Event()
+
+# One pooled HTTP session for the NWS calls (keep-alive across the ~4-6 requests
+# per cycle to the same host, instead of a fresh TCP+TLS handshake each time).
+_SESSION = None
+
+
+def _session():
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+    return _SESSION
+
+
+def _atomic_write(path, text, fsync=True):
+    """Write `text` to `path` atomically: temp file + os.replace so a reader never
+    sees a partial file. With fsync (the default for durable state) the data is
+    flushed to disk before the rename, so a power loss can't leave a zero-length
+    or stale file behind the successful rename. Raises on failure."""
+    path = Path(path)
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        if fsync:
+            os.fsync(f.fileno())
+    tmp.replace(path)
 
 # Words in NWS present-weather / textDescription that mean "it's precipitating".
 # Note "freezing" is intentionally NOT here: alone it matches "Freezing Fog"
@@ -141,11 +172,22 @@ def _validate_condition(cond, rule_name, specs=METRIC_SPECS):
     value = cond["value"]
     if op == "between":
         _validate_between_value(value, metric, rule_name)
+        # Store coerced numbers so a quoted YAML bound (e.g. "40") never reaches
+        # the comparison as a string (which would TypeError and freeze the rule).
+        cond["value"] = [_as_number(value[0], None, "between low"),
+                         _as_number(value[1], None, "between high")]
     elif op == "in":
         _validate_in_value(value, spec["type"], metric, rule_name)
-    elif spec["type"] == "number" and _as_number(value, None, f"{metric} value") is None:
-        raise ValueError(f"rule '{rule_name}': '{metric}' value "
-                         f"{value!r} must be a number")
+        if spec["type"] == "number":
+            cond["value"] = [_as_number(v, None, "in item") for v in value]
+    elif spec["type"] == "number":
+        num = _as_number(value, None, f"{metric} value")
+        if num is None:
+            raise ValueError(f"rule '{rule_name}': '{metric}' value "
+                             f"{value!r} must be a number")
+        # Normalize to a real number; the engine then never compares against a
+        # string (e.g. value: "5" in YAML), which would raise and hold the rule.
+        cond["value"] = num
 
 
 def _validate_between_value(value, metric, rule_name):
@@ -293,6 +335,19 @@ def _eval_expr(node, metrics):
         if a is None or b is None:
             return None
         try:
+            if isinstance(node.op, ast.Pow):
+                # Python ints are arbitrary-precision, so `9**9**9` never raises
+                # OverflowError -- it just computes a galaxy-sized integer and
+                # hangs the (single-threaded) control loop. Bound the operands and
+                # evaluate in float so a runaway exponent overflows cleanly to
+                # None instead of wedging the monitor.
+                if abs(a) > 1e9 or abs(b) > 308:
+                    return None
+                r = float(a) ** float(b)
+                # A negative base with a fractional exponent yields a complex
+                # number; downstream numeric comparisons would TypeError and
+                # freeze the rule, so treat it as unavailable.
+                return r if isinstance(r, float) else None
             return _EXPR_BINOPS[type(node.op)](a, b)
         except (ZeroDivisionError, ValueError, OverflowError):
             return None
@@ -540,7 +595,14 @@ def coerce_value(value, mtype):
     if mtype == "bool":
         if isinstance(value, bool):
             return value
-        return str(value).strip().lower() in ("true", "1", "yes", "on")
+        s = str(value).strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        # Unrecognized value (an unexpected string/object): hold the last value
+        # instead of fabricating False, which could read as a real "off".
+        return None
     return str(value)
 
 
@@ -762,6 +824,9 @@ def validate_config(cfg):
     cfg.setdefault("event_driven", True)
     cfg["event_driven"] = bool(cfg["event_driven"])
     cfg.setdefault("state_file", "weather_state.json")
+    # Persisted engine decision history (last_state / last_change / for: timers /
+    # changed baseline) so hysteresis and actions survive a monitor restart.
+    cfg.setdefault("engine_state_file", "engine_state.json")
     # Where runtime manual overrides + the audit trail live (Phase 2).
     cfg.setdefault("overrides_file", "overrides.json")
     cfg.setdefault("audit_file", "audit.log")
@@ -834,6 +899,25 @@ def validate_config(cfg):
     mq.setdefault("retain", True)
     mq["retain"] = bool(mq["retain"])
     mq.setdefault("status_topic", "")   # optional: JSON snapshot of conditions
+    # Retained online/offline availability topic + MQTT Last Will. On by default
+    # so a dead controller is detectable; set to "" to disable.
+    mq.setdefault("availability_topic", "weather-mqtt/status")
+    mq["availability_topic"] = str(mq.get("availability_topic") or "")
+    # Optional TLS for the broker connection. Absent/disabled == plaintext (the
+    # historical behavior). enabled+ca_certs verifies the broker; insecure skips
+    # verification (testing only).
+    tls = mq.get("tls")
+    if tls is not None:
+        if not isinstance(tls, dict):
+            raise ValueError("config.mqtt.tls must be a mapping")
+        tls.setdefault("enabled", False)
+        tls["enabled"] = bool(tls["enabled"])
+        for k in ("ca_certs", "certfile", "keyfile"):
+            if tls.get(k) is not None:
+                tls[k] = str(tls[k])
+        tls.setdefault("insecure", False)
+        tls["insecure"] = bool(tls["insecure"])
+        mq["tls"] = tls
 
     # --- Slack alerts (optional) ---
     slack = cfg.setdefault("slack", {})
@@ -844,6 +928,10 @@ def validate_config(cfg):
     mins = _as_number(slack.get("broker_unreachable_minutes", 60), 60,
                       "slack.broker_unreachable_minutes")
     slack["broker_unreachable_minutes"] = max(1, int(mins))
+    # Alert when NWS weather has been unusable this long (0 = off).
+    swm = _as_number(slack.get("stale_weather_minutes", 0), 0,
+                     "slack.stale_weather_minutes")
+    slack["stale_weather_minutes"] = max(0, int(swm))
 
     # --- Remote status push (optional, read-only/outbound) ---
     sp = cfg.setdefault("status_push", {})
@@ -893,8 +981,9 @@ def nws_get(url, user_agent, retries=3, timeout=20):
     headers = {"User-Agent": user_agent, "Accept": "application/geo+json"}
     delay = 2
     for attempt in range(1, retries + 1):
+        wait = delay
         try:
-            r = requests.get(url, headers=headers, timeout=timeout)
+            r = _session().get(url, headers=headers, timeout=timeout)
             if r.status_code == 200:
                 try:
                     return r.json()
@@ -907,13 +996,31 @@ def nws_get(url, user_agent, retries=3, timeout=20):
             if not retryable:
                 raise RuntimeError(
                     f"NWS request rejected with HTTP {r.status_code}: {url}")
+            # Honor Retry-After (seconds form) when the API asks us to back off.
+            wait = _retry_after_seconds(r, delay)
         except requests.RequestException as e:
             LOG.warning("NWS request error for %s: %s (attempt %d/%d)",
                         url, e, attempt, retries)
         if attempt < retries:
-            time.sleep(delay)
-            delay *= 2
+            # Interruptible backoff: return early if we're shutting down so
+            # SIGTERM isn't stuck waiting out the sleep.
+            if _SHUTDOWN.wait(wait):
+                break
+            delay = min(delay * 2, 60)
     raise RuntimeError(f"NWS request failed after {retries} attempts: {url}")
+
+
+def _retry_after_seconds(resp, default):
+    """Parse a Retry-After header (seconds form). Falls back to `default` for the
+    HTTP-date form or a missing/garbage header. Capped so a hostile value can't
+    park the monitor for hours."""
+    ra = resp.headers.get("Retry-After")
+    if not ra:
+        return default
+    try:
+        return max(0, min(300, int(float(ra))))
+    except (TypeError, ValueError):
+        return default
 
 
 def resolve_location(lat, lon, user_agent, station_override=None):
@@ -921,8 +1028,13 @@ def resolve_location(lat, lon, user_agent, station_override=None):
     if CACHE_FILE.exists():
         try:
             cached = json.loads(CACHE_FILE.read_text())
-            if (cached.get("lat") == lat and cached.get("lon") == lon
-                    and cached.get("station_override") == station_override):
+            # Trust the cache only if it matches this location AND still has the
+            # URLs we need -- a truncated/partial cache must re-resolve, not feed
+            # dead URLs into every cycle.
+            if (isinstance(cached, dict)
+                    and cached.get("lat") == lat and cached.get("lon") == lon
+                    and cached.get("station_override") == station_override
+                    and cached.get("forecast_hourly") and cached.get("stations_url")):
                 LOG.info("Using cached NWS location data")
                 return cached
         except Exception:
@@ -955,7 +1067,7 @@ def resolve_location(lat, lon, user_agent, station_override=None):
         except Exception as e:
             LOG.warning("Could not resolve observation station: %s", e)
 
-    CACHE_FILE.write_text(json.dumps(info))
+    _atomic_write(CACHE_FILE, json.dumps(info))
     LOG.info("Resolved grid %s; observation station %s",
              info.get("grid_id"), info.get("station_id"))
     return info
@@ -1343,6 +1455,62 @@ def _apply_for(base, key, dur, state, now):
     return (now - since).total_seconds() >= dur
 
 
+def save_engine_state(path, last_state, last_change, engine_state):
+    """Persist the engine's decision history (atomic, best-effort) so hysteresis
+    timers, `for:` sustain and the `changed` baseline survive a restart. Without
+    this, every restart resets `last_change` (so `apply_hysteresis` sees
+    elapsed=inf and a load can short-cycle) and clears `last_state` (so actions
+    re-fire and directives re-publish spuriously)."""
+    if not path:
+        return
+    try:
+        data = {
+            "last_state": {k: v for k, v in last_state.items() if v is not None},
+            "last_change": dict(last_change),
+            "cond_since": {k: dt.isoformat() for k, dt in
+                           engine_state.cond_since.items()},
+        }
+        # prev_metrics powers the `changed` operator; keep it only if it's
+        # cleanly serializable so a weird value never blocks the whole save.
+        try:
+            data["prev_metrics"] = json.loads(json.dumps(engine_state.prev_metrics))
+        except (TypeError, ValueError):
+            data["prev_metrics"] = {}
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
+    except Exception as e:
+        LOG.warning("Could not save engine state %s: %s", path, e)
+
+
+def load_engine_state(path):
+    """Reload persisted decision history written by save_engine_state. Returns
+    (last_state, last_change, EngineState). A missing or corrupt file yields a
+    clean cold-start state (never raises)."""
+    es = EngineState()
+    last_state, last_change = {}, {}
+    if not path:
+        return last_state, last_change, es
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return last_state, last_change, es
+    if not isinstance(data, dict):
+        return last_state, last_change, es
+    if isinstance(data.get("last_state"), dict):
+        last_state = {str(k): bool(v) for k, v in data["last_state"].items()}
+    if isinstance(data.get("last_change"), dict):
+        last_change = {str(k): str(v) for k, v in data["last_change"].items() if v}
+    if isinstance(data.get("cond_since"), dict):
+        for k, v in data["cond_since"].items():
+            dt = _parse_iso(v)
+            if dt is not None:
+                es.cond_since[str(k)] = dt
+    if isinstance(data.get("prev_metrics"), dict):
+        es.prev_metrics = dict(data["prev_metrics"])
+    return last_state, last_change, es
+
+
 # ---------------------------------------------------------------------------
 # Engine: time windows + hysteresis (ROADMAP Phase 1)
 # ---------------------------------------------------------------------------
@@ -1549,9 +1717,9 @@ def set_override(path, name, state):
         overrides.pop(name, None)
     else:
         overrides[name] = state
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(overrides, indent=2))
-    tmp.replace(path)
+    # fsync: a forced Auto/On/Off is a safety decision that must survive a power
+    # loss, not silently revert.
+    _atomic_write(path, json.dumps(overrides, indent=2))
     return overrides
 
 
@@ -1602,9 +1770,7 @@ def set_variable(path, name, value, declared):
     except Exception:
         stored = {}
     stored[name] = coerced
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(stored, indent=2))
-    tmp.replace(path)
+    _atomic_write(path, json.dumps(stored, indent=2))
     return coerced
 
 
@@ -1660,6 +1826,19 @@ def _history_numeric(metrics):
     return out
 
 
+def _history_connect(db_path):
+    """Open the history db in WAL mode with a busy timeout so the monitor's
+    writes and the web UI's reads (separate processes) don't lock each other
+    out -- a plain rollback journal would surface 'database is locked'."""
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error:
+        pass
+    return con
+
+
 def record_history(db_path, metrics, ts=None, retention_days=14):
     """Append this cycle's numeric metrics to the SQLite history, then prune
     anything older than the retention window. Best-effort: never raises."""
@@ -1670,7 +1849,7 @@ def record_history(db_path, metrics, ts=None, retention_days=14):
     if not rows:
         return
     try:
-        con = sqlite3.connect(db_path, timeout=5)
+        con = _history_connect(db_path)
         try:
             con.execute("CREATE TABLE IF NOT EXISTS samples "
                         "(ts TEXT NOT NULL, name TEXT NOT NULL, value REAL NOT NULL)")
@@ -1696,7 +1875,7 @@ def read_history(db_path, hours=24, names=None, max_points=600):
     cutoff = (datetime.now(timezone.utc)
               - timedelta(hours=max(1, hours))).isoformat(timespec="seconds")
     try:
-        con = sqlite3.connect(db_path, timeout=5)
+        con = _history_connect(db_path)
         try:
             q = "SELECT ts, name, value FROM samples WHERE ts >= ?"
             args = [cutoff]
@@ -1726,7 +1905,7 @@ def history_metrics(db_path):
     if not db_path or not Path(db_path).exists():
         return []
     try:
-        con = sqlite3.connect(db_path, timeout=5)
+        con = _history_connect(db_path)
         try:
             return [r[0] for r in con.execute(
                 "SELECT DISTINCT name FROM samples ORDER BY name").fetchall()]
@@ -1772,27 +1951,73 @@ def read_log(path, limit=300):
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
-def make_mqtt_client(mq, mqtt_inputs=None, in_store=None, on_input=None):
+def _apply_mqtt_tls(client, mq):
+    """Enable TLS on a paho client when mqtt.tls.enabled is set. No-op otherwise,
+    so plaintext deployments are unchanged. `insecure` skips cert verification
+    (testing only)."""
+    tls = mq.get("tls") or {}
+    if not tls.get("enabled"):
+        return
+    import ssl
+    client.tls_set(
+        ca_certs=(tls.get("ca_certs") or None),
+        certfile=(tls.get("certfile") or None),
+        keyfile=(tls.get("keyfile") or None),
+        cert_reqs=ssl.CERT_NONE if tls.get("insecure") else ssl.CERT_REQUIRED,
+    )
+    if tls.get("insecure"):
+        client.tls_insecure_set(True)
+
+
+def make_mqtt_client(mq, mqtt_inputs=None, in_store=None, on_input=None,
+                     on_reconnect=None):
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=mq["client_id"],
     )
     if mq.get("username"):
         client.username_pw_set(mq["username"], mq.get("password", ""))
+    _apply_mqtt_tls(client, mq)
 
     inputs = list(mqtt_inputs or [])
     topic_map = {i["topic"]: i for i in inputs}
+    # mqtt_in messages are delivered on paho's network thread; the main loop reads
+    # the same store. Guard both sides with this lock so a sensor burst can't race
+    # the loop's snapshot (a "dictionary changed size during iteration" crash that
+    # would silently drop a whole evaluation cycle).
+    client.in_lock = threading.Lock()
+    # Retained availability topic. The LWT marks us "offline" if we die
+    # unexpectedly (crash/power-loss/network-drop); a birth message marks us
+    # "online" on (re)connect. Subscribers can then distinguish "controller alive"
+    # from "controller gone" instead of trusting a stale retained directive forever.
+    avail = mq.get("availability_topic", "")
+    if avail:
+        client.will_set(avail, "offline", qos=1, retain=True)
+    # Set on every (re)connect to tell the main loop to re-assert all retained
+    # directives: a broker restart wipes retained messages, so we must re-publish
+    # current state even though our in-memory last_state hasn't changed.
+    client.republish_event = threading.Event()
 
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
             LOG.error("MQTT connect failed: %s", reason_code)
-        else:
-            LOG.info("Connected to MQTT broker %s:%s", mq["host"], mq["port"])
-            # (Re)subscribe to mqtt_in sensor topics on every (re)connect.
-            for i in inputs:
-                client.subscribe(i["topic"])
-                LOG.info("Subscribed to mqtt_in '%s' -> metric '%s' (%s)",
-                         i["topic"], i["metric"], i["parse"])
+            return
+        LOG.info("Connected to MQTT broker %s:%s", mq["host"], mq["port"])
+        if avail:
+            client.publish(avail, "online", qos=1, retain=True)
+        # (Re)subscribe to mqtt_in sensor topics on every (re)connect.
+        for i in inputs:
+            client.subscribe(i["topic"])
+            LOG.info("Subscribed to mqtt_in '%s' -> metric '%s' (%s)",
+                     i["topic"], i["metric"], i["parse"])
+        # Ask the loop to re-assert directives, and wake it so the re-publish
+        # happens promptly rather than at the next poll.
+        client.republish_event.set()
+        if on_reconnect is not None:
+            try:
+                on_reconnect()
+            except Exception as e:
+                LOG.debug("on_reconnect hook failed: %s", e)
 
     def on_disconnect(client, userdata, flags, reason_code, properties):
         LOG.warning("Disconnected from MQTT broker (%s); auto-reconnecting",
@@ -1800,10 +2025,13 @@ def make_mqtt_client(mq, mqtt_inputs=None, in_store=None, on_input=None):
 
     def on_message(client, userdata, msg):
         if in_store is not None:
-            changed = handle_mqtt_input(in_store, topic_map, msg.topic, msg.payload)
+            with client.in_lock:
+                changed = handle_mqtt_input(in_store, topic_map, msg.topic,
+                                            msg.payload)
             # Wake the main loop for a prompt re-evaluation when a *known* input
             # actually changed (event-driven mode). Runs on the network thread, so
-            # on_input must be cheap and thread-safe (an Event.set()).
+            # on_input must be cheap and thread-safe (an Event.set()). Called
+            # outside the lock so the callback never blocks the network thread.
             if changed and on_input is not None:
                 try:
                     on_input()
@@ -1907,11 +2135,10 @@ def build_snapshot(metrics, rule_rows, lookback, connected, manual_control=False
 
 
 def write_state(path, snapshot):
-    """Atomically write the snapshot JSON for the local web UI."""
+    """Atomically write the snapshot JSON for the local web UI. Throwaway display
+    state refreshed every cycle, so no fsync (don't pay a disk flush per re-eval)."""
     try:
-        tmp = Path(str(path) + ".tmp")
-        tmp.write_text(json.dumps(snapshot, indent=2))
-        tmp.replace(path)
+        _atomic_write(path, json.dumps(snapshot, indent=2), fsync=False)
     except Exception as e:
         LOG.warning("Could not write state file %s: %s", path, e)
 
@@ -2062,8 +2289,13 @@ def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg, audit_fi
                 else:
                     info = client.publish(topic, payload, qos=aqos, retain=aretain)
                     ok = getattr(info, "rc", 0) == 0
-                    LOG.info("Action published '%s' -> %s (rule '%s')",
-                             payload, topic, rule["name"])
+                    if ok:
+                        LOG.info("Action published '%s' -> %s (rule '%s')",
+                                 payload, topic, rule["name"])
+                    else:
+                        LOG.warning("Action publish '%s' -> %s (rule '%s') "
+                                    "returned rc=%s", payload, topic,
+                                    rule["name"], getattr(info, "rc", "?"))
                     record("mqtt", topic, ok)
             elif "webhook" in a:
                 if client is None:
@@ -2123,6 +2355,7 @@ def main():
     mq = cfg["mqtt"]
 
     stop = {"flag": False}
+    _SHUTDOWN.clear()   # reset in case main() is re-entered (tests / embedding)
 
     # Set by an incoming mqtt_in message (event-driven re-eval) or a signal, to
     # break the between-cycle wait early.
@@ -2131,6 +2364,7 @@ def main():
     def handle_sig(signum, frame):
         LOG.info("Signal %s received, shutting down ...", signum)
         stop["flag"] = True
+        _SHUTDOWN.set()   # interrupt any in-flight HTTP backoff sleep
         wake.set()
 
     signal.signal(signal.SIGINT, handle_sig)
@@ -2167,15 +2401,22 @@ def main():
     event_driven = cfg.get("event_driven", True)
     if not args.dry_run:
         client = make_mqtt_client(mq, cfg.get("mqtt_inputs", []), mqtt_in_store,
-                                  on_input=(wake.set if event_driven else None))
+                                  on_input=(wake.set if event_driven else None),
+                                  on_reconnect=wake.set)
         client.connect_async(mq["host"], int(mq["port"]), keepalive=60)
         client.loop_start()
 
-    last_state = {}            # rule name -> bool
-    last_change = {}           # rule name -> iso timestamp of last published change
-    engine_state = EngineState()   # history for `changed` / `for:` across cycles
+    # Reload persisted decision history so hysteresis timers, `for:` sustain and
+    # the `changed` baseline carry across a restart instead of resetting (which
+    # would re-fire actions and let a load short-cycle right after a restart).
+    engine_state_file = cfg.get("engine_state_file", "engine_state.json")
+    last_state, last_change, engine_state = load_engine_state(engine_state_file)
     http_store, http_last = {}, {}  # latest http_poll values + per-url last fetch
     broker_watch = BrokerWatch(cfg["slack"]["broker_unreachable_minutes"])
+    # Track weather freshness so a silent NWS outage is visible (and optionally
+    # alerted) instead of the engine acting on stale data with no signal.
+    weather_watch = BrokerWatch(max(1, cfg["slack"].get("stale_weather_minutes", 0) or 1))
+    last_weather_ok_iso = None
     # Cache the slow NWS weather between poll cycles so an input-triggered
     # re-evaluation reuses it instead of re-fetching (and hammering the API).
     weather_cache = None
@@ -2208,6 +2449,10 @@ def main():
         qos, retain = mq_live["qos"], mq_live["retain"]
         status_topic = mq_live.get("status_topic", "")
 
+        # Hoisted so the weather-freshness watch (below, outside this try) can run
+        # even if a cycle raises before they're computed.
+        fetched_this_cycle = False
+        weather_ok = None
         try:
             # Fetch the slow NWS weather at most once per poll interval; an
             # input-triggered re-eval between fetches reuses the cached weather.
@@ -2216,6 +2461,15 @@ def main():
                 m = fetch_conditions(loc, ua, lookback)
                 weather_cache = dict(m)
                 next_weather_at = time.monotonic() + interval
+                fetched_this_cycle = True
+                # A fetch "succeeded" if at least one safety-relevant weather
+                # metric came back; an all-None result means NWS gave us nothing.
+                weather_ok = any(m.get(k) is not None for k in
+                                 ("temperature", "precip_accum_in", "is_raining",
+                                  "humidity"))
+                if weather_ok:
+                    last_weather_ok_iso = datetime.now(timezone.utc).isoformat(
+                        timespec="seconds")
                 LOG.info("Conditions: temp=%s F  humidity=%s%%  wind=%s mph  "
                          "raining=%s  precip_%dh=%s in  precip_prob=%s%%  '%s'  "
                          "alerts=%s",
@@ -2224,8 +2478,12 @@ def main():
                          m["precipitation_probability"], m["short_forecast"],
                          m["active_alerts"] or "none")
                 if client is not None and status_topic:
-                    client.publish(status_topic, json.dumps(m),
-                                   qos=qos, retain=retain)
+                    sinfo = client.publish(status_topic, json.dumps(m),
+                                           qos=qos, retain=retain)
+                    if getattr(sinfo, "rc", 0) != mqtt.MQTT_ERR_SUCCESS:
+                        LOG.warning("Status publish to %s returned rc=%s "
+                                    "(broker offline?)", status_topic,
+                                    getattr(sinfo, "rc", "?"))
             else:
                 m = dict(weather_cache)
 
@@ -2233,7 +2491,11 @@ def main():
             now_local = now_utc.astimezone()    # system local civil time for windows
             m.update(schedule_metrics(now_local, lat, lon))   # time_* inputs
             m.update(variable_metrics(var_values))  # var_* operator-set inputs
-            m.update(dict(mqtt_in_store))            # latest mqtt_in sensor values
+            # Snapshot the mqtt_in store under the network thread's lock so a
+            # concurrent sensor message can't change it mid-copy.
+            in_lock = getattr(client, "in_lock", None)
+            with (in_lock or contextlib.nullcontext()):
+                m.update(dict(mqtt_in_store))        # latest mqtt_in sensor values
             poll_http_inputs(cfg.get("http_inputs", []), http_store, http_last,
                              now_utc, ua)            # GET due http_poll endpoints
             m.update(dict(http_store))               # latest http_poll values
@@ -2243,6 +2505,18 @@ def main():
                 record_history(hist.get("file", "history.db"), m,
                                ts=now_utc.isoformat(timespec="seconds"),
                                retention_days=int(hist.get("retention_days", 14)))
+            # After a (re)connect the broker may have lost all retained messages,
+            # so re-assert every rule's current directive once. This re-publishes
+            # the retained value but is NOT a transition: hysteresis, last_change,
+            # the audit trail and extra actions are all left untouched.
+            republish = False
+            if client is not None:
+                ev = getattr(client, "republish_event", None)
+                if ev is not None and ev.is_set():
+                    ev.clear()
+                    republish = True
+                    LOG.info("Re-asserting retained directives after (re)connect")
+
             rule_rows = []
             for rule in rules:
               try:
@@ -2268,7 +2542,8 @@ def main():
                     # always_publish heartbeat only on a real poll tick, so an
                     # input-triggered re-eval doesn't re-broadcast every rule.
                     changed = ((prev is None) or (prev != result)
-                               or (cfg["always_publish"] and do_fetch))
+                               or (cfg["always_publish"] and do_fetch)
+                               or republish)
                     # Assume committed unless a real publish fails below. A failed
                     # publish leaves last_state unchanged so the next cycle retries
                     # the directive instead of silently dropping a state change.
@@ -2330,14 +2605,27 @@ def main():
                 LOG.warning("Rule '%s' failed this cycle, skipping: %s",
                             rule.get("name", "?") if isinstance(rule, dict) else rule, e)
 
-            # Remember this cycle's metrics so next cycle's `changed` can compare.
+            # Remember this cycle's metrics so next cycle's `changed` can compare,
+            # and persist the decision history so it survives a restart.
             engine_state.observe(m)
+            save_engine_state(engine_state_file, last_state, last_change,
+                              engine_state)
 
             connected = bool(client is not None and client.is_connected())
             var_rows = [{"name": n, "type": declared_vars[n].get("type", "bool"),
                          "value": var_values.get(n)} for n in declared_vars]
             snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual,
                                       var_rows)
+            # Surface weather freshness so the dashboard can show "data is N min
+            # old" rather than always looking current (the snapshot's `updated`
+            # is just when it was built, not when the weather was last fetched).
+            snapshot["last_weather_fetch"] = last_weather_ok_iso
+            snapshot["weather_ok"] = last_weather_ok_iso is not None
+            if last_weather_ok_iso:
+                ok_dt = _parse_iso(last_weather_ok_iso)
+                if ok_dt is not None:
+                    snapshot["weather_age_seconds"] = int(
+                        (datetime.now(timezone.utc) - ok_dt).total_seconds())
             write_state(state_file, snapshot)        # local: refresh every re-eval
             if do_fetch:
                 # Outbound remote push stays at poll cadence so a chatty sensor
@@ -2367,6 +2655,25 @@ def main():
                              f":large_green_circle: *weather-mqtt*: MQTT broker "
                              f"`{mq['host']}:{mq['port']}` is reachable again.")
 
+        # Weather-freshness watch (opt-in via slack.stale_weather_minutes > 0).
+        # Only evaluated on cycles that actually attempted a fetch, so a chatty
+        # sensor's between-fetch re-evals don't skew the timer.
+        stale_min = cfg["slack"].get("stale_weather_minutes", 0)
+        if stale_min and fetched_this_cycle:
+            weather_watch.threshold = timedelta(minutes=max(1, int(stale_min)))
+            now = datetime.now(timezone.utc)
+            wtrig = weather_watch.update(bool(weather_ok), now)
+            if wtrig == "down":
+                mins = weather_watch.downtime_minutes(now)
+                notify_slack(cfg.get("slack", {}),
+                             f":red_circle: *weather-mqtt*: no usable NWS weather "
+                             f"for ~{mins} min. Directives are running on the last "
+                             f"known data.")
+            elif wtrig == "recovered":
+                notify_slack(cfg.get("slack", {}),
+                             ":large_green_circle: *weather-mqtt*: NWS weather data "
+                             "is flowing again.")
+
         if args.once:
             break
 
@@ -2382,6 +2689,18 @@ def main():
         wake.clear()
 
     if client is not None:
+        # Mark ourselves offline on a *clean* shutdown (the LWT only fires on an
+        # unexpected drop), and wait for it to flush so the retained state is
+        # accurate before we disconnect.
+        avail = cfg["mqtt"].get("availability_topic", "")
+        if avail:
+            try:
+                info = client.publish(avail, "offline", qos=1, retain=True)
+                wfp = getattr(info, "wait_for_publish", None)
+                if callable(wfp):
+                    wfp(timeout=2)
+            except Exception as e:
+                LOG.debug("offline availability publish failed: %s", e)
         client.loop_stop()
         client.disconnect()
     LOG.info("Stopped.")
