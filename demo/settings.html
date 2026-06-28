@@ -23,6 +23,14 @@
 </header>
 
 <main>
+<div class="card" style="background:linear-gradient(180deg,#0e1a2e,#0e1828)">
+  <h3 style="margin:0 0 4px">Settings</h3>
+  <p class="muted" style="margin:0">Configure the controller. Everything is <b>validated before saving</b> —
+   out-of-range values are rejected and nothing is written. Thresholds, the lookback window, the poll
+   interval, MQTT publish options and rules apply on the <b>next poll</b>; changing <b>location</b>, the
+   <b>MQTT connection</b>, or any <b>web</b> setting needs a service restart. Passwords/tokens are never
+   shown back — leave a field blank to keep the stored value.</p>
+</div>
 <form id="settings-form" autocomplete="off" novalidate>
   <div class="card">
     <h3>Location &amp; polling</h3>
@@ -155,7 +163,7 @@
 </form>
 </main>
 
-<footer>Precipitation → MQTT controller · demo build</footer>
+<footer>Precipitation → MQTT controller · demo build · <a href="https://github.com/SethMorrowSoftware/mqtt-dev" target="_blank" rel="noopener">Docs ↗</a></footer>
 <div id="toast"></div>
 <script src="assets/app.js"></script>
 </body>

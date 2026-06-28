@@ -299,7 +299,8 @@ BASE = """
  {% if msg %}<div class="msg {{ msgclass }}">{{ msg }}</div>{% endif %}
  {{ body|safe }}
 </main>
-<footer>Precipitation → MQTT controller · data source: National Weather Service (api.weather.gov)</footer>
+<footer>Precipitation → MQTT controller · data source: National Weather Service (api.weather.gov)
+ · <a href="https://github.com/SethMorrowSoftware/mqtt-dev" target="_blank" rel="noopener">Docs ↗</a></footer>
 </body></html>
 """
 
@@ -360,6 +361,9 @@ DASH = """
         <span class="pill na">disabled / n/a</span>
       </div>
     </div>
+    <p class="muted" id="manual-hint" style="display:none;margin:8px 0 0">💡 Manual control is off — enable it
+     under <a href="{{ url_for('settings') }}">Settings → Web interface</a> (a login is required) to add
+     <b>Auto / On / Off</b> buttons to each device.</p>
     <div class="grid" id="devicegrid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr));margin-top:12px">
       <div class="muted">Loading…</div>
     </div>
@@ -438,6 +442,8 @@ function render(s){
   setText("forecast", (m.short_forecast || "—") + " · alerts: " + alerts);
 
   const manualControl = !!s.manual_control;
+  const hint = document.getElementById("manual-hint");
+  if(hint) hint.style.display = manualControl ? "none" : "";
   const grid = document.getElementById("devicegrid");
   grid.innerHTML = "";
   for(const r of rules){
@@ -754,6 +760,14 @@ def activity():
 # Settings (friendly form for scalar config)
 # ---------------------------------------------------------------------------
 SETTINGS = """
+<div class="card" style="background:linear-gradient(180deg,#0e1a2e,var(--panel2))">
+  <h3 style="margin:0 0 4px">Settings</h3>
+  <p class="muted" style="margin:0">Configure the controller. Everything is <b>validated before saving</b> —
+   out-of-range values are rejected and nothing is written. Thresholds, the lookback window, the poll
+   interval, MQTT publish options and rules apply on the <b>next poll</b>; changing <b>location</b>, the
+   <b>MQTT connection</b>, or any <b>web</b> setting needs a service restart. Passwords/tokens are never
+   shown back — leave a field blank to keep the stored value.</p>
+</div>
 <form method="post" autocomplete="off">
 <div class="card">
   <h3>Location &amp; polling</h3>
