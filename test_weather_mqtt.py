@@ -788,6 +788,120 @@ def test_webui_inputs_editor():
             except OSError: pass
 
 
+def test_mqtt_console_buffer_and_publish():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_mqtt_console_buffer_and_publish ({e})")
+        return
+    con = webui.MqttConsole(buffer_size=3)
+    con.record("sensors/a", b"1", qos=0, retain=True)
+    con.record("sensors/b", b"hello", qos=1, retain=False)
+    con.record("other/c", b"\xff\xfe", qos=0, retain=False)  # binary payload
+    # ring buffer caps at 3; a 4th drops the oldest
+    con.record("sensors/a", b"2", qos=0, retain=True)
+    msgs = con.messages()
+    assert len(msgs) == 3 and msgs[0]["topic"] == "sensors/b"   # oldest ("sensors/a"/1) evicted
+    assert msgs[-1]["payload"] == "2"
+    # incremental fetch by seq, and topic-prefix filter
+    last = msgs[-1]["seq"]
+    assert con.messages(since=last) == []
+    assert [m["topic"] for m in con.messages(topic="sensors/")] == ["sensors/b", "sensors/a"]
+    # binary payloads are flagged, never crash (other/c survived the eviction)
+    assert con.messages(topic="other/")[0]["binary"] is True
+    # per-topic latest map tracks the newest value + a count
+    tops = {t["topic"]: t for t in con.topics()}
+    assert tops["sensors/a"]["payload"] == "2" and tops["sensors/a"]["count"] == 2
+    # publish guards: wildcards/empty rejected; not-connected rejected
+    assert con.publish("", "x")[0] is False
+    assert con.publish("a/#", "x")[0] is False
+    assert con.publish("a/b", "x")[0] is False           # no client/connection
+    class _Info:  rc = 0
+    class _Fake:
+        def __init__(self): self.calls = []
+        def publish(self, *a, **k): self.calls.append((a, k)); return _Info()
+    con._client = _Fake(); con._connected = True
+    ok, err = con.publish("facility/cmd", "ON", qos=1, retain=True)
+    assert ok and err is None and con._client.calls[0][0][0] == "facility/cmd"
+
+
+def test_webui_mqtt_console_api_and_publish_gating():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_mqtt_console_api_and_publish_gating ({e})")
+        return
+    import tempfile, os, json, base64, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    aud = tempfile.mktemp(suffix=".log")
+
+    def write_cfg(allow_publish, login=True):
+        web = {"enabled": True, "host": "0.0.0.0", "port": 8080,
+               "allow_mqtt_publish": allow_publish}
+        web["username"], web["password"] = ("admin", "pw") if login else ("", "")
+        cfg = {
+            "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+            "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+            "precipitation": {"lookback_hours": 24},
+            "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+            "web": web, "audit_file": aud,
+            "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                       "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+        }
+        open(p, "w").write(yaml.safe_dump(cfg))
+
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    webui.console = webui.MqttConsole()        # fresh, isolated console
+    c = webui.app.test_client()
+    hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:pw").decode()}
+    try:
+        write_cfg(allow_publish=True)
+        # page + nav link
+        assert c.get("/mqtt", headers=hdr).status_code == 200
+        assert b'href="/mqtt"' in c.get("/", headers=hdr).data
+        # feed reflects recorded messages and the publish gate
+        webui.console.record("sensors/x", b"7", qos=0, retain=True)
+        j = c.get("/api/mqtt?topics=1", headers=hdr).get_json()
+        assert j["enabled"] is True and j["can_publish"] is True
+        assert j["messages"][0]["topic"] == "sensors/x"
+        assert j["topic_list"][0]["topic"] == "sensors/x"
+        # publish succeeds with a fake broker client and is audited
+        class _Info:  rc = 0
+        class _Fake:
+            def publish(self, *a, **k): return _Info()
+        webui.console._client = _Fake(); webui.console._connected = True
+        r = c.post("/api/mqtt/publish", headers=hdr,
+                   json={"topic": "facility/cmd", "payload": "ON", "qos": 1, "retain": True})
+        assert r.status_code == 200 and r.get_json()["ok"] is True
+        assert json.loads(open(aud).read().splitlines()[-1])["action"] == "mqtt_publish"
+        # fail-closed: turn publishing off -> 403 even with a valid login
+        write_cfg(allow_publish=False)
+        r = c.post("/api/mqtt/publish", headers=hdr, json={"topic": "facility/cmd", "payload": "ON"})
+        assert r.status_code == 403
+        assert c.get("/api/mqtt", headers=hdr).get_json()["can_publish"] is False
+    finally:
+        for f in (p, aud):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
+def test_allow_mqtt_publish_requires_login():
+    # Fail-closed at the config layer: enabling publish without a login is forced off.
+    cfg = {
+        "location": {"latitude": 1, "longitude": 2}, "user_agent": "x (a@b.com)",
+        "mqtt": {}, "web": {"allow_mqtt_publish": True},  # no username/password
+        "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                   "when": {"metric": "temperature", "operator": "<", "value": 5}}],
+    }
+    out = w.validate_config(cfg)
+    assert out["web"]["allow_mqtt_publish"] is False
+    # with a login it sticks
+    cfg2 = dict(cfg); cfg2["web"] = {"allow_mqtt_publish": True, "username": "a", "password": "b"}
+    assert w.validate_config(cfg2)["web"]["allow_mqtt_publish"] is True
+
+
 def test_webui_activity_page_and_audit_api():
     try:
         import webui

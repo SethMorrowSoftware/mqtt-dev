@@ -610,6 +610,25 @@ def validate_config(cfg):
                     "password); disabling manual control until one is set")
         amc = False
     web["allow_manual_control"] = amc
+    # Arbitrary MQTT publishing from the web UI's console. Same fail-closed
+    # posture as manual control: off by default, and enabling it requires a web
+    # login so the publish surface is always authenticated.
+    amp = bool(web.get("allow_mqtt_publish", False))
+    if amp and not (str(web.get("username") or "") and str(web.get("password") or "")):
+        LOG.warning("web.allow_mqtt_publish requires a web login (username + "
+                    "password); disabling MQTT publishing until one is set")
+        amp = False
+    web["allow_mqtt_publish"] = amp
+    # Web UI's live MQTT console (subscribe + buffer). Display-only; independent
+    # of publishing. Topics default to everything ("#"); buffer is capped.
+    web.setdefault("mqtt_console_enabled", True)
+    web["mqtt_console_enabled"] = bool(web["mqtt_console_enabled"])
+    topics = web.get("mqtt_console_topics", ["#"])
+    if isinstance(topics, str):
+        topics = [topics]
+    web["mqtt_console_topics"] = [str(t) for t in (topics or ["#"]) if str(t).strip()] or ["#"]
+    web["mqtt_console_buffer"] = max(50, min(5000, int(
+        _as_number(web.get("mqtt_console_buffer", 500), 500, "web.mqtt_console_buffer"))))
 
     mq = cfg["mqtt"]
     if not isinstance(mq, dict):

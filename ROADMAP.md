@@ -237,6 +237,12 @@ system "as customizable as possible" without engine changes.
     and a **live runtime‑log viewer** with level filtering. The monitor mirrors its
     log to a rolling `log_file` (default `monitor.log`) so the separate web‑UI process
     can tail it. Mirrored in the static demo.
+  - **Delivered (cont.):** a live **MQTT console** (`/mqtt` + `/api/mqtt` +
+    `/api/mqtt/publish`) — the web UI keeps its own broker subscription and shows a
+    live message feed (topic‑prefix filter) and a per‑topic latest‑value view, plus a
+    **manual publish console** (topic/payload/QoS/retain). Publishing is fail‑closed
+    (`web.allow_mqtt_publish` + a login required) and audited; the subscription is
+    configurable (`mqtt_console_enabled`/`_topics`/`_buffer`). Mirrored in the demo.
   - Phase 2 is complete.
 - **Phase 3 — Inputs:** `schedule`, `manual` variables, `mqtt_in` sensors, `http_poll`;
   dynamic metric discovery in the builder; optional event‑driven re‑eval on MQTT input.
