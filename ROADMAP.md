@@ -236,9 +236,13 @@ system "as customizable as possible" without engine changes.
     flags declared in config, toggled from the dashboard, persisted to
     `variables.json`, audited) surfaced as `var_<name>` metrics; and **dynamic metric
     discovery** — the builder dropdowns now include declared variables live.
-  - **Still to come (own PRs):** `mqtt_in` sensors (subscribe → metric, with
-    event‑driven re‑eval), `http_poll` (GET JSON → metric via JSONPath), and
-    `time_is_daytime` (sunrise/sunset).
+  - **Delivered (cont.):** **`mqtt_in` sensors** — `mqtt_inputs:` subscribes on the
+    existing broker connection and exposes each payload (`number`/`bool`/`string`) as
+    a rule metric, discovered by the builder; unavailable until first message
+    (fail‑safe hold).
+  - **Still to come (own PRs):** `http_poll` (GET JSON → metric via JSONPath),
+    `time_is_daytime` (sunrise/sunset), and optional event‑driven re‑eval on MQTT
+    input (today values are read each poll cycle).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

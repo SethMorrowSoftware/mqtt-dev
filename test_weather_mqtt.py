@@ -582,6 +582,52 @@ def test_webui_variable_endpoint_and_builder_metrics():
                 except OSError: pass
 
 
+def test_mqtt_in_coerce_and_routing():
+    assert w.coerce_payload(b"3.5", "number") == 3.5
+    assert w.coerce_payload(b"  on ", "bool") is True
+    assert w.coerce_payload(b"off", "bool") is False
+    assert w.coerce_payload(b"hello", "string") == "hello"
+    assert w.coerce_payload(b"not-a-number", "number") is None     # junk -> None
+    # routing: store updates only for known topics; None coercion keeps last value
+    store, tmap = {}, {"sensors/tank": {"topic": "sensors/tank", "metric": "tank_level",
+                                        "parse": "number"}}
+    w.handle_mqtt_input(store, tmap, "sensors/tank", b"42")
+    assert store == {"tank_level": 42}
+    w.handle_mqtt_input(store, tmap, "sensors/tank", b"bad")        # ignored
+    assert store == {"tank_level": 42}
+    w.handle_mqtt_input(store, tmap, "other/topic", b"9")           # unknown topic
+    assert store == {"tank_level": 42}
+
+
+def test_mqtt_in_validation_catalogue_and_rules():
+    cfg = w.validate_config(_min_cfg(
+        mqtt_inputs=[{"topic": "sensors/tank/level", "metric": "tank_level", "parse": "number"},
+                     {"topic": "sensors/door", "metric": "door_open", "parse": "bool"}],
+        rules=[{"name": "r", "topic": "t", "on_match": "1",
+                "when": {"all": [
+                    {"metric": "tank_level", "operator": "<", "value": 20},
+                    {"metric": "door_open", "operator": "==", "value": True},
+                ]}}]))
+    cat = w.metric_catalogue(cfg)
+    assert cat["tank_level"]["type"] == "number" and cat["door_open"]["type"] == "bool"
+    # the rule evaluates against merged mqtt_in values
+    rule = cfg["rules"][0]
+    assert w.evaluate_rule(rule, {"tank_level": 10, "door_open": True}) is True
+    assert w.evaluate_rule(rule, {"tank_level": 30, "door_open": True}) is False
+    # rejections: missing topic, bad parse, collision with a built-in metric
+    for inputs, needle in [
+        ([{"metric": "x", "parse": "number"}], "needs a 'topic'"),
+        ([{"topic": "t", "metric": "x", "parse": "weird"}], "parse must be one of"),
+        ([{"topic": "t", "metric": "temperature", "parse": "number"}], "collides"),
+        ([{"topic": "t", "metric": "bad name", "parse": "number"}], "alphanumeric"),
+    ]:
+        try:
+            w.validate_config(_min_cfg(mqtt_inputs=inputs))
+            raise AssertionError(f"expected ValueError for {inputs}")
+        except ValueError as e:
+            assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

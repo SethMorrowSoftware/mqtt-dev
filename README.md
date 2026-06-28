@@ -236,6 +236,34 @@ toggle per `bool` and an input per `number`; values **persist** to
   on_clear: "ALLOW"
 ```
 
+## MQTT sensor inputs (optional)
+
+Subscribe to other devices' MQTT topics and use their values as rule metrics —
+e.g. a tank level, a door switch, or a power meter. The controller subscribes on
+the **same broker connection** it already uses to publish:
+
+```yaml
+mqtt_inputs:
+  - { topic: "sensors/tank/level", metric: tank_level, parse: number }
+  - { topic: "sensors/door/open",  metric: door_open,  parse: bool }
+```
+
+Each `metric` becomes a rule metric of its own (discovered by the builder
+automatically), typed by `parse` (`number`, `bool`, or `string`). The latest
+received value is used each poll cycle; until a value arrives the metric is
+unavailable, so the rule **holds its last state** (the usual fail-safe).
+
+```yaml
+- name: low_tank_hold
+  when: { metric: tank_level, operator: "<", value: 20 }
+  topic: "pumps/refill"
+  on_match: "ON"
+  on_clear: "OFF"
+```
+
+Subscriptions are established at startup; adding/removing a `mqtt_inputs` entry
+takes effect after a service restart (like the broker connection settings).
+
 ## Slack alerts
 
 If the MQTT broker becomes unreachable and **stays** down past a threshold
