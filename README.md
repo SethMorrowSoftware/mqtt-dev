@@ -264,6 +264,26 @@ unavailable, so the rule **holds its last state** (the usual fail-safe).
 Subscriptions are established at startup; adding/removing a `mqtt_inputs` entry
 takes effect after a service restart (like the broker connection settings).
 
+## HTTP JSON inputs (optional)
+
+Poll a JSON HTTP endpoint on an interval and map fields into rule metrics — e.g.
+a local power meter, inverter, or any device with a small JSON API:
+
+```yaml
+http_inputs:
+  - url: "https://meter.local/api"
+    interval_minutes: 5            # effective granularity is the poll interval
+    map:
+      - { metric: power_kw, path: "current_kw",     type: number }
+      - { metric: grid_up,  path: "status.online",  type: bool }
+```
+
+`path` is a dotted path into the JSON (a subset of JSONPath — a leading `$.` is
+optional and numeric segments index arrays, e.g. `phases.0.volts`). Each
+`metric` becomes a rule metric (discovered by the builder), typed by `type`
+(`number`/`bool`/`string`). Fetches are best-effort: a failed request or a
+missing field leaves the metric at its last value, so rules **hold state**.
+
 ## Slack alerts
 
 If the MQTT broker becomes unreachable and **stays** down past a threshold

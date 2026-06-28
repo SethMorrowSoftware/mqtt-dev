@@ -48,6 +48,16 @@ always_publish: false
 #   - { topic: "sensors/tank/level", metric: tank_level, parse: number }
 #   - { topic: "sensors/door/open",  metric: door_open,  parse: bool }
 
+# --- HTTP JSON inputs (optional) -------------------------------------------
+# Poll a JSON endpoint and map fields (dotted path; arrays by index) to metrics.
+# type: number | bool | string. Uncomment to use:
+# http_inputs:
+#   - url: "https://meter.local/api"
+#     interval_minutes: 5
+#     map:
+#       - { metric: power_kw, path: "current_kw",    type: number }
+#       - { metric: grid_up,  path: "status.online", type: bool }
+
 # --- Precipitation settings ------------------------------------------------
 precipitation:
   # Rolling window (hours) used to total measured rainfall into the
