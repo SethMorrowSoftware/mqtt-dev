@@ -261,6 +261,13 @@ system "as customizable as possible" without engine changes.
     hand‑editing `config.yaml`; saved through the monitor's own validator
     (name‑collision checks, clear errors) so new metrics appear in the Rules
     builder immediately. Mirrored in the static demo.
+  - **Delivered (cont.):** **richer conditionals** — compare a metric to *another*
+    metric's live value (`value_metric`, with `< <= > >= == !=`); a `regex`
+    operator for text metrics and NWS alerts; and **computed (derived) metrics**
+    (a `computed:` section with a safe arithmetic expression — `+ - * / // % **` —
+    over earlier metrics, evaluated fail‑safe). All discovered by the builder,
+    editable in the UI (value_metric in the form builder, computed on the Inputs
+    page), and mirrored in the demo.
   - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
     read each poll cycle).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;

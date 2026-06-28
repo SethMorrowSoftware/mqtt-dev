@@ -788,6 +788,82 @@ def test_webui_inputs_editor():
             except OSError: pass
 
 
+def test_value_metric_comparison():
+    # Compare a metric to another metric's live value (number and bool).
+    cond = {"metric": "tank_level", "operator": "<", "value_metric": "tank_setpoint"}
+    assert w._eval_condition(cond, {"tank_level": 40, "tank_setpoint": 50}, "r") is True
+    assert w._eval_condition(cond, {"tank_level": 60, "tank_setpoint": 50}, "r") is False
+    # rhs unavailable -> None (fail-safe hold), not a crash
+    assert w._eval_condition(cond, {"tank_level": 60}, "r") is None
+    # validation: only numeric-compare operators, both sides number/bool
+    specs = {**w.METRIC_SPECS,
+             "tank_level": {"type": "number", "ops": w.NUMBER_OPS},
+             "tank_setpoint": {"type": "number", "ops": w.NUMBER_OPS}}
+    w._validate_condition(cond, "r", specs)                      # ok
+    # comparing to a text metric is rejected (it has no numeric-compare op)
+    specs_txt = {**specs, "label": {"type": "text", "ops": w.TEXT_OPS}}
+    for bad, needle in [
+        ({"metric": "tank_level", "operator": "between", "value_metric": "tank_setpoint"}, "only works with"),
+        ({"metric": "tank_level", "operator": "<", "value_metric": "nope"}, "not a known metric"),
+        ({"metric": "tank_level", "operator": "<", "value_metric": "label"}, "must be a number/bool"),
+    ]:
+        try:
+            w._validate_condition(bad, "r", specs_txt)
+            assert False, f"expected rejection: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+
+def test_regex_operator():
+    # Text metric regex (case-insensitive) and alert regex.
+    fc = {"metric": "short_forecast", "operator": "regex", "value": "^(light|heavy) rain"}
+    assert w._eval_condition(fc, {"short_forecast": "Light Rain"}, "r") is True
+    assert w._eval_condition(fc, {"short_forecast": "Sunny"}, "r") is False
+    al = {"metric": "active_alert", "operator": "regex", "value": "flood|tornado"}
+    assert w._eval_condition(al, {"active_alerts": ["Flood Warning"]}, "r") is True
+    assert w._eval_condition(al, {"active_alerts": ["Heat Advisory"]}, "r") is False
+    # regex is offered for text metrics and validated as a pattern
+    assert "regex" in w.METRIC_SPECS["short_forecast"]["ops"]
+    w._validate_condition(fc, "r")                               # ok
+    try:
+        w._validate_condition({"metric": "short_forecast", "operator": "regex",
+                               "value": "([unclosed"}, "r")
+        assert False, "expected invalid-regex rejection"
+    except ValueError as e:
+        assert "invalid" in str(e)
+
+
+def test_computed_metrics_eval_and_validate():
+    # Safe arithmetic: ordered eval, dependency on earlier computed, fail-safe None.
+    computed = {"net_power": {"expr": "power_kw - solar_kw"},
+                "headroom": {"expr": "(net_power) * 2 + 1"}}
+    out = w.compute_metrics(computed, {"power_kw": 5, "solar_kw": 3})
+    assert out == {"net_power": 2, "headroom": 5}
+    assert w.compute_metrics(computed, {"power_kw": 5})["headroom"] is None   # missing input
+    assert w.compute_metrics({"r": {"expr": "a / b"}}, {"a": 1, "b": 0})["r"] is None  # div by zero
+    # bools coerce to 0/1 so flags can drive arithmetic
+    assert w.compute_metrics({"x": {"expr": "is_raining * 10"}}, {"is_raining": True}) == {"x": 10}
+    # unsafe expressions are rejected at compile time
+    for bad in ("__import__('os')", "a.b", "foo(1)", "a if b else c"):
+        try:
+            w.compile_expr(bad); assert False, f"expected rejection of {bad!r}"
+        except ValueError:
+            pass
+    # validation: collision, unknown ref, missing expr, cycle-by-forward-ref
+    taken = set(w.METRIC_SPECS) | {"power_kw", "solar_kw"}
+    w._validate_computed({"net_power": {"expr": "power_kw - solar_kw"}}, taken)
+    for bad, needle in [
+        ({"temperature": {"expr": "1+1"}}, "collides"),
+        ({"x": {"expr": "missing + 1"}}, "unknown metric"),
+        ({"x": {"expr": "power_kw"}, "y": {"expr": "z + 1"}}, "unknown metric"),  # forward ref to later 'z'
+        ({"x": {}}, "needs an 'expr'"),
+    ]:
+        try:
+            w._validate_computed(bad, taken); assert False, f"expected: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+
 def test_webui_activity_page_and_audit_api():
     try:
         import webui
@@ -1313,7 +1389,7 @@ def test_webui_structured_rule_builder():
     struct = webui._rule_to_structured(parsed[0])
     assert struct["combine"] == "any" and len(struct["conditions"]) == 2
     assert struct["conditions"][0] == {"metric": "is_raining", "operator": "==",
-                                       "value": "true", "for": ""}
+                                       "value": "true", "value_metric": "", "for": ""}
 
     # rejections
     for bad, needle in [
@@ -1377,7 +1453,7 @@ def test_webui_builder_advanced_constructs():
     # round-trips back to the editable shape
     s0 = webui._rule_to_structured(parsed[0])
     assert s0["conditions"][0] == {"metric": "temperature", "operator": "between",
-                                   "value": "40, 80", "for": "10m"}
+                                   "value": "40, 80", "value_metric": "", "for": "10m"}
     assert webui._rule_to_structured(parsed[2])["enabled"] is False
 
     # rejections surface clearly

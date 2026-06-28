@@ -155,11 +155,22 @@ status_push:
 #
 # Numeric operators:  <  <=  >  >=  ==  !=  between  in
 #   between -> inclusive [low, high] pair;   in -> list of allowed values
+# Text operators:  contains  equals  in  regex   (regex is case-insensitive)
+#
+# Compare two metrics: use value_metric instead of value (number/bool, with
+#   < <= > >= == !=), e.g. { metric: tank_level, operator: "<", value_metric: var_setpoint }
 #
 # History-aware (any metric):
 #   operator: changed   -> true the cycle a metric's value changes (no value)
 #   for: <duration>      -> condition must hold continuously this long, e.g.
 #                           { metric: temperature, operator: ">", value: 85, for: "10m" }
+#
+# Computed metrics (optional): derive new number metrics from a formula over
+# others (+ - * / // % ** and parentheses). Each becomes a usable metric; refs
+# must be defined above it. A missing input yields no value (rules hold).
+# computed:
+#   net_power:  { expr: "power_kw - solar_kw" }
+#   temp_delta: { expr: "temperature - var_temp_setpoint" }
 # ---------------------------------------------------------------------------
 rules:
   # The main one: don't water if it's raining now OR it has already rained

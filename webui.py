@@ -1310,7 +1310,8 @@ def builder_metrics(cfg):
     out = dict(RULE_METRICS)
     extra = {**core.variable_specs(cfg.get("variables", {})),
              **core.mqtt_input_specs(cfg.get("mqtt_inputs", [])),
-             **core.http_input_specs(cfg.get("http_inputs", []))}
+             **core.http_input_specs(cfg.get("http_inputs", [])),
+             **core.computed_specs(cfg.get("computed", {}))}
     for name, spec in extra.items():
         out[name] = {"type": spec["type"], "ops": list(spec["ops"])}
     return out
@@ -1389,16 +1390,28 @@ def _rules_from_structured(items, metrics=RULE_METRICS):
             if not metric:
                 continue
             operator = str(c.get("operator", "")).strip()
-            try:
-                val = _coerce_cond_value(metric, operator, c.get("value"), metrics)
-            except ValueError as e:
-                raise ValueError(f"rule '{name}': {e}")
             cond = {"metric": metric, "operator": _qstr(operator)}
-            if val is not None:
-                if isinstance(val, list):     # between/in -> protect any string items
-                    cond["value"] = [_qstr(x) if isinstance(x, str) else x for x in val]
-                else:
-                    cond["value"] = _qstr(val) if isinstance(val, str) else val
+            # Compare against another metric instead of a constant value.
+            vmetric = str(c.get("value_metric", "") or "").strip()
+            if vmetric:
+                if metrics.get(metric) is None:
+                    raise ValueError(f"rule '{name}': unknown metric '{metric}'")
+                if operator not in core.NUMERIC_COMPARE:
+                    raise ValueError(f"rule '{name}': comparing to a metric needs one of "
+                                     f"{', '.join(core.NUMERIC_COMPARE)} (not '{operator}')")
+                if metrics.get(vmetric) is None:
+                    raise ValueError(f"rule '{name}': unknown comparison metric '{vmetric}'")
+                cond["value_metric"] = _qstr(vmetric)
+            else:
+                try:
+                    val = _coerce_cond_value(metric, operator, c.get("value"), metrics)
+                except ValueError as e:
+                    raise ValueError(f"rule '{name}': {e}")
+                if val is not None:
+                    if isinstance(val, list):  # between/in -> protect any string items
+                        cond["value"] = [_qstr(x) if isinstance(x, str) else x for x in val]
+                    else:
+                        cond["value"] = _qstr(val) if isinstance(val, str) else val
             forr = str(c.get("for", "") or "").strip()
             if forr:
                 if core.parse_duration(forr, None) is None:
@@ -1465,6 +1478,7 @@ def _rule_to_structured(rule):
             "metric": str(c.get("metric", "")),
             "operator": "" if op is None else str(op),
             "value": _value_to_str(c.get("value")),
+            "value_metric": str(c.get("value_metric", "") or ""),
             "for": str(c.get("for", "") or ""),
         })
     return {
@@ -1588,8 +1602,15 @@ function fillOps(sel, metric, chosen){
   if(!ops.includes(chosen) && ops.length) sel.value=ops[0];
 }
 
+const NUMCMP = ["<","<=",">",">=","==","!="];
+function cmpMetricNames(){ return METRIC_NAMES.filter(n=>{ const t=(METRICS[n]||{}).type; return t==="number"||t==="bool"; }); }
+function metricPicker(selected){
+  const s=document.createElement("select"); s.className="c-vmetric"; s.setAttribute("aria-label","comparison metric");
+  cmpMetricNames().forEach(n=> s.appendChild(opt(n,n, n===selected)));
+  return s;
+}
 function condRow(cond){
-  cond = cond || {metric:METRIC_NAMES[0], operator:"", value:"", for:""};
+  cond = cond || {metric:METRIC_NAMES[0], operator:"", value:"", value_metric:"", for:""};
   const row = el("div","cond row");
   const metricWrap = el("div"); const m = document.createElement("select"); m.className="c-metric";
   m.setAttribute("aria-label","metric");
@@ -1599,7 +1620,13 @@ function condRow(cond){
   const opWrap = el("div"); const o=document.createElement("select"); o.className="c-op";
   o.setAttribute("aria-label","operator");
   fillOps(o, m.value, cond.operator); opWrap.appendChild(o);
-  const valWrap = el("div","c-val-wrap"); valWrap.appendChild(valueControl(m.value, o.value, cond.value));
+  // "compare to" mode: a constant value, or another metric's live value.
+  const modeWrap = el("div","c-vmode-wrap"); const mode=document.createElement("select"); mode.className="c-vmode";
+  mode.setAttribute("aria-label","compare to");
+  mode.appendChild(opt("value","a value", !cond.value_metric));
+  mode.appendChild(opt("metric","a metric", !!cond.value_metric));
+  modeWrap.appendChild(mode);
+  const valWrap = el("div","c-val-wrap");
   const forWrap = el("div","c-for-wrap"); const f=document.createElement("input"); f.className="c-for"; f.type="text";
   f.placeholder="for (e.g. 10m)"; f.value=cond.for||""; f.setAttribute("aria-label","sustain duration");
   f.title="optional: the condition must hold continuously this long (e.g. 30s, 10m, 2h)";
@@ -1608,13 +1635,20 @@ function condRow(cond){
   rmWrap.appendChild(rm);
 
   function noValue(){ const meta=METRICS[m.value]||{}; return o.value==="changed" || (meta.type==="alert" && o.value==="any"); }
-  function syncValVisible(){ valWrap.style.display = noValue() ? "none" : ""; }
-  function rebuildVal(keep){ valWrap.innerHTML=""; valWrap.appendChild(valueControl(m.value, o.value, keep)); syncValVisible(); }
-  m.addEventListener("change", ()=>{ fillOps(o, m.value, o.value); rebuildVal(null); });
-  o.addEventListener("change", ()=> rebuildVal(null));
+  function cmpEligible(){ const meta=METRICS[m.value]||{}; return (meta.type==="number"||meta.type==="bool") && NUMCMP.includes(o.value); }
+  function syncMode(){ modeWrap.style.display = (cmpEligible() && !noValue()) ? "" : "none"; if(!cmpEligible()) mode.value="value"; }
+  function buildVal(keep){
+    valWrap.innerHTML="";
+    if(mode.value==="metric" && cmpEligible()) valWrap.appendChild(metricPicker(cond.value_metric));
+    else valWrap.appendChild(valueControl(m.value, o.value, keep));
+    valWrap.style.display = noValue() ? "none" : "";
+  }
+  m.addEventListener("change", ()=>{ fillOps(o, m.value, o.value); syncMode(); buildVal(null); });
+  o.addEventListener("change", ()=>{ syncMode(); buildVal(null); });
+  mode.addEventListener("change", ()=> buildVal(null));
   rm.addEventListener("click", ()=>{ const card=row.closest(".rule-card"); row.remove(); refreshCombine(card); });
-  syncValVisible();
-  row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
+  syncMode(); buildVal(cond.value);
+  row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(modeWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
   return row;
 }
 
@@ -1671,9 +1705,14 @@ function collect(){
       const operator=row.querySelector(".c-op").value;
       const meta=METRICS[metric]||{};
       const noVal = operator==="changed" || (meta.type==="alert" && operator==="any");
+      const forv=(row.querySelector(".c-for").value||"").trim();
+      const modeSel=row.querySelector(".c-vmode");
+      const vm=row.querySelector(".c-vmetric");
+      if(modeSel && modeSel.value==="metric" && vm){
+        return {metric, operator, value_metric:vm.value, for:forv};
+      }
       let value="";
       if(!noVal){ const ctrl=row.querySelector(".c-val"); value=ctrl?ctrl.value:""; }
-      const forv=(row.querySelector(".c-for").value||"").trim();
       return {metric, operator, value, for:forv};
     });
     return {
@@ -1875,6 +1914,15 @@ def _apply_sources(cfg, payload):
                       "map": mp})
     cfg["http_inputs"] = hlist
 
+    computed = {}
+    for it in (payload.get("computed") or []):
+        name = str((it or {}).get("name", "")).strip()
+        expr = str(it.get("expr", "")).strip()
+        if not name and not expr:
+            continue
+        computed[_qstr(name)] = {"expr": _qstr(expr)}
+    cfg["computed"] = computed
+
 
 def _sources_payload(cfg):
     """Current sources as the builder's editable JSON shape."""
@@ -1890,7 +1938,10 @@ def _sources_payload(cfg):
                     "map": [{"metric": str((m or {}).get("metric", "")), "path": str(m.get("path", "")),
                              "type": str(m.get("type", "number"))} for m in (it.get("map") or [])]}
                    for it in (_to_plain(cfg.get("http_inputs", [])) or [])]
-    return {"variables": variables, "mqtt_inputs": mqtt_inputs, "http_inputs": http_inputs}
+    computed = [{"name": str(n), "expr": str((s or {}).get("expr", ""))}
+                for n, s in (_to_plain(cfg.get("computed", {})) or {}).items()]
+    return {"variables": variables, "mqtt_inputs": mqtt_inputs,
+            "http_inputs": http_inputs, "computed": computed}
 
 
 INPUTS = """
@@ -1926,6 +1977,16 @@ INPUTS = """
     <p class="muted" style="margin:6px 0 0">Poll a JSON endpoint and map fields (dotted path, arrays by
      index) to metrics.</p>
     <div id="https" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <div class="toprow"><h3 style="margin:0">Computed metrics</h3>
+      <button type="button" class="secondary mini" id="add-comp" style="margin:0">+ Add computed</button></div>
+    <p class="muted" style="margin:6px 0 0">Derive a new <b>number</b> metric from others with a small
+     formula: <code>+ - * / // % **</code> and parentheses over any metric defined <i>above</i> it (built-ins,
+     variables, mqtt/http inputs, or an earlier computed). E.g. <code>power_kw - solar_kw</code> or
+     <code>temperature - var_temp_setpoint</code>. A missing input yields no value (rules hold, fail-safe).</p>
+    <div id="comps" style="margin-top:10px"></div>
     <div class="field-err" id="inputs-err" style="margin-top:10px"></div>
     <button type="submit" id="save-inputs">Save inputs</button>
   </div>
@@ -2005,6 +2066,19 @@ function httpCard(h){
 }
 document.getElementById("add-http").addEventListener("click",()=>https.appendChild(httpCard()));
 
+// ---- computed ----
+const comps=document.getElementById("comps");
+function compRow(c){
+  c=c||{name:"",expr:""};
+  const row=el("div","row"); row.style.alignItems="flex-end";
+  const nw=el("div"); nw.innerHTML='<label style="margin-top:0">Metric name</label>'; const n=el("input","co-name");n.value=c.name||"";n.placeholder="net_power";nw.appendChild(n);
+  const ew=el("div"); ew.style.flex="2"; ew.innerHTML='<label style="margin-top:0">Formula</label>'; const ex=el("input","co-expr");ex.value=c.expr||"";ex.placeholder="power_kw - solar_kw";ew.appendChild(ex);
+  const rw=el("div"); rw.style.flex="0 0 auto"; const rm=rmBtn(); rw.appendChild(rm); rm.addEventListener("click",()=>row.remove());
+  row.appendChild(nw);row.appendChild(ew);row.appendChild(rw);
+  return row;
+}
+document.getElementById("add-comp").addEventListener("click",()=>comps.appendChild(compRow()));
+
 function collect(){
   const variables=[...vars.querySelectorAll(".row")].map(r=>({
     name:r.querySelector(".v-name").value.trim(),
@@ -2026,7 +2100,11 @@ function collect(){
       type:r.querySelector(".h-type").value
     })).filter(m=>m.metric)
   })).filter(h=>h.url||h.map.length);
-  return {variables,mqtt_inputs,http_inputs};
+  const computed=[...comps.querySelectorAll(".row")].map(r=>({
+    name:r.querySelector(".co-name").value.trim(),
+    expr:r.querySelector(".co-expr").value.trim()
+  })).filter(c=>c.name||c.expr);
+  return {variables,mqtt_inputs,http_inputs,computed};
 }
 document.getElementById("save-inputs").addEventListener("click",e=>{
   document.getElementById("inputs_json").value=JSON.stringify(collect());
@@ -2035,6 +2113,7 @@ document.getElementById("save-inputs").addEventListener("click",e=>{
 (SRC.variables||[]).forEach(v=>vars.appendChild(varRow(v)));
 (SRC.mqtt_inputs||[]).forEach(m=>mqtts.appendChild(mqttRow(m)));
 (SRC.http_inputs||[]).forEach(h=>https.appendChild(httpCard(h)));
+(SRC.computed||[]).forEach(c=>comps.appendChild(compRow(c)));
 </script>
 """
 

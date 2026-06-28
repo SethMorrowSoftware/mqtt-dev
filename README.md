@@ -27,11 +27,12 @@ publishes on/off MQTT directives, all editable from the web UI:
 
 - **Inputs:** NWS weather, a [schedule / clock](#available-metrics) (incl.
   sunrise/sunset), [operator variables](#operator-variables-optional) you toggle
-  in the UI, [MQTT sensor topics](#mqtt-sensor-inputs-optional), and
-  [HTTP JSON endpoints](#http-json-inputs-optional).
+  in the UI, [MQTT sensor topics](#mqtt-sensor-inputs-optional),
+  [HTTP JSON endpoints](#http-json-inputs-optional), and **computed metrics**
+  derived from any of these with a formula.
 - **Rules:** nested `any`/`all`/`not`, comparison + `between`/`in`/`changed`
-  operators, a `for:` sustain, per-rule `enable`, **time windows**, and
-  **hysteresis** (anti-short-cycle for real loads).
+  operators, `regex` on text, **metric-to-metric** comparison, a `for:` sustain,
+  per-rule `enable`, **time windows**, and **hysteresis** (anti-short-cycle).
 - **Control:** opt-in, audited [manual Auto/On/Off](#manual-control-opt-in) of
   any device from the dashboard; an outbound-only
   [remote status page](#remote-status-page-read-only).
@@ -187,10 +188,11 @@ Run the offline logic tests (no network needed):
 - **Inputs** — manage the **sources** your rules draw on, without hand-editing
   `config.yaml`: declare **operator variables** (`var_<name>` flags/setpoints you
   toggle from the dashboard), subscribe to **MQTT sensor inputs** (another
-  device's topic → a metric), and poll **HTTP JSON inputs** (an endpoint with
-  dotted-path field mappings → metrics). Add/remove rows inline; everything is
-  validated and name-collision-checked before saving, and each new source
-  immediately appears as a metric in the Rules builder.
+  device's topic → a metric), poll **HTTP JSON inputs** (an endpoint with
+  dotted-path field mappings → metrics), and define **computed metrics** (a
+  formula over other metrics). Add/remove rows inline; everything is validated
+  and name-collision-checked before saving, and each new source immediately
+  appears as a metric in the Rules builder.
 - **Activity** — a read-only audit log of every device state change (automatic
   or manual) and operator action, newest first, in plain language.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
@@ -460,8 +462,8 @@ Available metrics:
 | `temperature` | current air temp, °F (measured if a station is nearby) | `< <= > >= == != between in` |
 | `wind_speed_mph` | current wind speed, mph | `< <= > >= == != between in` |
 | `humidity` | relative humidity, 0–100% | `< <= > >= == != between in` |
-| `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in` |
-| `active_alert` | NWS watches/warnings | `any`, `contains`, `equals` |
+| `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in`, `regex` |
+| `active_alert` | NWS watches/warnings | `any`, `contains`, `equals`, `regex` |
 | `time_hour` | local hour, 0–23 | `< <= > >= == != between in` |
 | `time_minute` | local minute, 0–59 | `< <= > >= == != between in` |
 | `time_weekday` | `mon`…`sun` (local) | `equals`, `in`, `contains` |
@@ -486,6 +488,33 @@ during daytime hours, or skip a rule on weekends:
 
 `between` takes an inclusive `[low, high]` pair; `in` takes a list of allowed
 values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).
+
+**Richer conditionals** for building a fully custom controller:
+
+- **Compare two metrics** — use `value_metric` instead of `value` to compare a
+  metric against another metric's live value (works with `< <= > >= == !=` on
+  number/bool metrics). Great with operator variables as setpoints:
+  ```yaml
+  - { metric: tank_level, operator: "<", value_metric: var_tank_setpoint }
+  ```
+  If either metric is unavailable that cycle, the rule holds its last state.
+- **Regex on text** — `operator: regex` matches a text metric (or any NWS alert)
+  against a case-insensitive pattern:
+  `{ metric: short_forecast, operator: regex, value: "^(light|heavy) rain" }`.
+- **Computed (derived) metrics** — a top-level `computed:` section defines new
+  number metrics from a small formula (`+ - * / // % **` and parentheses) over
+  other metrics. Each becomes a first-class metric rules can use and the builder
+  discovers automatically:
+  ```yaml
+  computed:
+    net_power:  { expr: "power_kw - solar_kw" }       # references mqtt/http inputs
+    temp_delta: { expr: "temperature - var_temp_setpoint" }
+  ```
+  References must resolve to a metric defined **before** it (built-ins,
+  variables, mqtt/http inputs, or an earlier computed), which makes reference
+  cycles impossible. A missing input — or a divide-by-zero — yields no value, so
+  dependent rules hold their last state (fail-safe). Edit these on the **Inputs**
+  page, alongside variables and sensor inputs.
 
 Two history-aware constructs are also available on any condition:
 
