@@ -697,6 +697,23 @@ def test_http_inputs_validation_and_catalogue():
             assert needle in str(e), f"got {e!r}, wanted {needle!r}"
 
 
+def test_is_daytime_and_schedule_inclusion():
+    from datetime import datetime, timezone
+    lat, lon = 41.25, -74.27        # New York area (EDT, UTC-4 in June)
+    noon = datetime(2026, 6, 28, 16, 0, tzinfo=timezone.utc)    # ~12:00 EDT
+    midnight = datetime(2026, 6, 28, 4, 0, tzinfo=timezone.utc)  # ~00:00 EDT
+    assert w.is_daytime(lat, lon, noon) is True
+    assert w.is_daytime(lat, lon, midnight) is False
+    # polar: high north latitude in June = midnight sun; in December = polar night
+    jun = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    dec = datetime(2026, 12, 21, 12, 0, tzinfo=timezone.utc)
+    assert w.is_daytime(80.0, 0.0, jun) is True
+    assert w.is_daytime(80.0, 0.0, dec) is False
+    # schedule_metrics includes the flag only when lat/lon are supplied
+    assert "time_is_daytime" not in w.schedule_metrics(noon)
+    assert w.schedule_metrics(noon, lat, lon)["time_is_daytime"] is True
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}
