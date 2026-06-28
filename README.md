@@ -184,6 +184,13 @@ Run the offline logic tests (no network needed):
     conditions;
   - a **YAML (advanced)** editor for power users, with a metrics/operators
     reference and an "append example rule" helper.
+- **Inputs** — manage the **sources** your rules draw on, without hand-editing
+  `config.yaml`: declare **operator variables** (`var_<name>` flags/setpoints you
+  toggle from the dashboard), subscribe to **MQTT sensor inputs** (another
+  device's topic → a metric), and poll **HTTP JSON inputs** (an endpoint with
+  dotted-path field mappings → metrics). Add/remove rows inline; everything is
+  validated and name-collision-checked before saving, and each new source
+  immediately appears as a metric in the Rules builder.
 - **Activity** — a read-only audit log of every device state change (automatic
   or manual) and operator action, newest first, in plain language.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
@@ -534,7 +541,7 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 | Path | What it is |
 |---|---|
 | `weather_mqtt.py` | The monitor: gathers inputs (weather, schedule, variables, mqtt_in, http_poll), evaluates rules, publishes MQTT, writes `weather_state.json`. |
-| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Activity / System), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/api/system`, `/api/logs`, `/healthz`. |
+| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Inputs / Activity / System), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/api/system`, `/api/logs`, `/healthz`. |
 | `setup_wizard.py` | Interactive first-run config generator (`weather-mqtt-setup`). |
 | `install.sh` | One-command Debian/Ubuntu installer (Mosquitto + venv + services). |
 | `config.yaml` | Example/active configuration (the installer writes a real one from the wizard). |
