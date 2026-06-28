@@ -332,6 +332,16 @@ unavailable, so the rule **holds its last state** (the usual fail-safe).
 Subscriptions are established at startup; adding/removing a `mqtt_inputs` entry
 takes effect after a service restart (like the broker connection settings).
 
+**Event-driven re-evaluation.** By default (`event_driven: true`) the controller
+re-runs the rules the **instant** an `mqtt_in` value changes, instead of waiting
+for the next poll — so a tank crossing a threshold or a door opening reacts in
+well under a second rather than up to `poll_interval_minutes`. The slow NWS
+weather fetch still happens on the poll interval (its cached values are reused
+for the in-between re-evaluations), a burst of messages is debounced into one
+pass, and the outbound remote-status push stays at poll cadence. Set
+`event_driven: false` for strict poll-cadence behavior. (Toggle it under
+**Settings → Location & polling**; it takes effect on the next restart.)
+
 ## HTTP JSON inputs (optional)
 
 Poll a JSON HTTP endpoint on an interval and map fields into rule metrics — e.g.

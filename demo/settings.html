@@ -64,6 +64,14 @@
         <select name="always_publish"><option value="false">false</option><option value="true">true</option></select>
         <div class="field-err"></div></div>
     </div>
+    <div class="row">
+      <div><label>Event-driven re-evaluation <span class="hint">(re-run rules the instant an MQTT input changes)</span></label>
+        <select name="event_driven">
+          <option value="true">on (react immediately; needs a restart)</option>
+          <option value="false">off (only re-evaluate each poll cycle)</option>
+        </select><div class="field-err"></div></div>
+      <div></div>
+    </div>
   </div>
 
   <div class="card">
