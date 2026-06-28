@@ -92,6 +92,96 @@ def test_compound_unknown_is_failsafe():
     assert w.evaluate_rule(rule, {"is_raining": None, "precip_accum_in": 0.5}) is True
 
 
+def test_nested_any_all_not():
+    # not(temperature < 35)  AND  (raining OR accum >= 0.25)
+    rule = {"name": "r", "when": {"all": [
+        {"not": {"metric": "temperature", "operator": "<", "value": 35}},
+        {"any": [
+            {"metric": "is_raining", "operator": "==", "value": True},
+            {"metric": "precip_accum_in", "operator": ">=", "value": 0.25},
+        ]},
+    ]}}
+    # warm (not<35 -> true) and raining -> true
+    assert w.evaluate_rule(rule, {"temperature": 50, "is_raining": True,
+                                  "precip_accum_in": 0.0}) is True
+    # cold (not<35 -> false) kills the ALL regardless of the rain branch
+    assert w.evaluate_rule(rule, {"temperature": 20, "is_raining": True,
+                                  "precip_accum_in": 1.0}) is False
+    # warm, dry both ways -> false
+    assert w.evaluate_rule(rule, {"temperature": 50, "is_raining": False,
+                                  "precip_accum_in": 0.0}) is False
+
+
+def test_not_propagates_unknown():
+    rule = {"name": "r", "when": {"not": {"metric": "is_raining",
+                                          "operator": "==", "value": True}}}
+    assert w.evaluate_rule(rule, {"is_raining": True}) is False
+    assert w.evaluate_rule(rule, {"is_raining": False}) is True
+    assert w.evaluate_rule(rule, {"is_raining": None}) is None   # unknown stays unknown
+
+
+def test_between_operator():
+    rule = {"name": "r", "when": {"metric": "temperature",
+                                  "operator": "between", "value": [40, 80]}}
+    assert w.evaluate_rule(rule, {"temperature": 60}) is True
+    assert w.evaluate_rule(rule, {"temperature": 40}) is True    # inclusive
+    assert w.evaluate_rule(rule, {"temperature": 80}) is True    # inclusive
+    assert w.evaluate_rule(rule, {"temperature": 81}) is False
+    assert w.evaluate_rule(rule, {"temperature": None}) is None  # fail-safe
+
+
+def test_in_operator_numeric_and_text():
+    rnum = {"name": "r", "when": {"metric": "humidity",
+                                  "operator": "in", "value": [30, 50, 70]}}
+    assert w.evaluate_rule(rnum, {"humidity": 50}) is True
+    assert w.evaluate_rule(rnum, {"humidity": 55}) is False
+    rtext = {"name": "r", "when": {"metric": "short_forecast",
+                                   "operator": "in", "value": ["Sunny", "Clear"]}}
+    assert w.evaluate_rule(rtext, {"short_forecast": "clear"}) is True   # case-insensitive
+    assert w.evaluate_rule(rtext, {"short_forecast": "Rain"}) is False
+
+
+def test_validate_accepts_nested_and_new_ops():
+    w.validate_config(_min_cfg(rules=[{
+        "name": "complex", "topic": "t", "on_match": "1",
+        "when": {"all": [
+            {"not": {"metric": "is_raining", "operator": "==", "value": True}},
+            {"metric": "temperature", "operator": "between", "value": [40, 90]},
+            {"metric": "humidity", "operator": "in", "value": [10, 20, 30]},
+        ]}}]))
+
+
+def test_validate_rejects_bad_between_and_in():
+    for when, needle in [
+        ({"metric": "temperature", "operator": "between", "value": 5}, "between needs"),
+        ({"metric": "temperature", "operator": "between", "value": [90, 10]}, "low must be <= high"),
+        ({"metric": "temperature", "operator": "between", "value": ["a", "b"]}, "must be numbers"),
+        ({"metric": "humidity", "operator": "in", "value": []}, "non-empty list"),
+        ({"metric": "humidity", "operator": "in", "value": ["x"]}, "all numbers"),
+        ({"not": {"metric": "bogus", "operator": "<", "value": 1}}, "unknown metric"),
+        ({"any": []}, "non-empty list"),
+    ]:
+        try:
+            w.validate_config(_min_cfg(rules=[{
+                "name": "r", "topic": "t", "on_match": "1", "when": when}]))
+            raise AssertionError(f"expected ValueError containing {needle!r}")
+        except ValueError as e:
+            assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+
+
+def test_validate_enabled_default_and_coercion():
+    cfg = w.validate_config(_min_cfg())
+    assert cfg["rules"][0]["enabled"] is True            # default on
+    cfg2 = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1", "enabled": False,
+        "when": {"metric": "temperature", "operator": "<", "value": 5}}]))
+    assert cfg2["rules"][0]["enabled"] is False
+    cfg3 = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1", "enabled": "false",
+        "when": {"metric": "temperature", "operator": "<", "value": 5}}]))
+    assert cfg3["rules"][0]["enabled"] is False          # string coerced
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

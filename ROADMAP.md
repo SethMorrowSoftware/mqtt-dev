@@ -207,6 +207,11 @@ system "as customizable as possible" without engine changes.
 - **Phase 1 — Engine:** nested `any/all/not`; `between`/`in`/`changed`/`for`; per‑device
   `enabled`; **time windows**; **hysteresis / min‑on / min‑off / cooldown**. *Biggest
   reliability gain for switching real loads.*
+  - **Delivered so far:** nested `any/all/not`, the `between`/`in` operators, and
+    per‑rule `enabled` (engine + validation + tests + docs; back‑compatible).
+  - **Still to come (own PRs):** stateful `changed`/`for`, **time windows**,
+    **hysteresis/min‑on/min‑off/cooldown**, and a form‑builder UI for nested/`not`
+    rules (today edited in the YAML tab).
 - **Phase 2 — Devices + manual control:** device/channel model; generalized device‑grid
   dashboard; **manual Auto/On/Off** (opt‑in, persisted, audited) with the security gating
   above. (Actions still MQTT.)
