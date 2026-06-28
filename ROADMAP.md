@@ -231,6 +231,12 @@ system "as customizable as possible" without engine changes.
     with inline Auto/On/Off, a status legend, and a getting‑started empty state);
     onboarding/inline help; and **branding** as *The Castle Fun Center · MQTT Command
     Center* across the web UI, demo, and cloud‑status pages.
+  - **Delivered (cont.):** a **System** page (`/system` + `/api/system` + `/api/logs`)
+    — at‑a‑glance health (monitor running/stale, MQTT, config validity, poll
+    freshness), a configuration summary (rule/metric/input counts and files in use),
+    and a **live runtime‑log viewer** with level filtering. The monitor mirrors its
+    log to a rolling `log_file` (default `monitor.log`) so the separate web‑UI process
+    can tail it. Mirrored in the static demo.
   - Phase 2 is complete.
 - **Phase 3 — Inputs:** `schedule`, `manual` variables, `mqtt_in` sensors, `http_poll`;
   dynamic metric discovery in the builder; optional event‑driven re‑eval on MQTT input.

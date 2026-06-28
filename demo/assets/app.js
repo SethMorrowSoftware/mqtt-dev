@@ -3,8 +3,8 @@
    All client-side, no backend. Every page shares this file; each block runs
    only if the elements it needs are present on the page. Mirrors the live
    webui.py UI (dashboard with variables + manual control, the rule builder,
-   settings, the inputs/sources editor, the activity log) but everything is
-   mock data — nothing is published or saved.
+   settings, the activity log, and the System health/log page) but everything
+   is mock data — nothing is published or saved.
    =========================================================================== */
 "use strict";
 
@@ -612,148 +612,74 @@ function agoText(iso) {
 })();
 
 /* =========================================================================
-   INPUTS  ·  sources editor (operator variables, MQTT + HTTP JSON inputs)
-   Mirrors the live webui.py Inputs page; client-side only (no persistence).
+   SYSTEM  ·  health + config summary + runtime log (sample data in the demo)
+   Mirrors the live webui.py System page; mock data, no backend.
    ========================================================================= */
-(function inputs() {
-  const form = document.getElementById("inputs-form");
-  if (!form) return;
+(function system() {
+  const conn = document.getElementById("sys-conn");
+  if (!conn || !document.getElementById("logbox")) return;
 
-  const SRC = window.DEMO_SOURCES || {};
-  const PARSE = ["number", "bool", "string"];
-  function el(t, c, h) { const e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; }
-  function opt(v, l, s) { const o = document.createElement("option"); o.value = v; o.textContent = l || v; if (s) o.selected = true; return o; }
-  function rmBtn() { const b = el("button", "secondary danger mini", "×"); b.type = "button"; b.style.margin = "0"; return b; }
+  // Mock health + summary (what /api/system returns in the live app).
+  const SYS = {
+    monitor: "ok", mqtt_connected: true, config_ok: true,
+    last_update: isoNow(),
+    summary: { rules_total: 3, rules_enabled: 3, metrics: 18, variables: 2, mqtt_inputs: 1, http_inputs: 1 },
+    files: { config: "config.yaml", state: "weather_state.json", audit: "audit.log", log: "monitor.log" },
+  };
+  // Sample runtime log lines (newest first), as the live /api/logs returns.
+  const mins = m => new Date(Date.now() - m * 60000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  const LINES = [
+    { ts: mins(0),  level: "INFO",    msg: "facility/vent_fan -> ON (temperature sustained > 85 for 10m)" },
+    { ts: mins(2),  level: "INFO",    msg: "irrigation/rain_inhibit unchanged (INHIBIT)" },
+    { ts: mins(6),  level: "WARNING", msg: "http_poll meter.local timed out; holding last value (fail-safe)" },
+    { ts: mins(9),  level: "INFO",    msg: "Poll cycle complete: 3 rules evaluated, 1 published" },
+    { ts: mins(14), level: "ERROR",   msg: "Rule 'broken_demo' failed this cycle, skipping: unknown metric 'foo'" },
+    { ts: mins(15), level: "INFO",    msg: "MQTT connected to localhost:1883" },
+    { ts: mins(15), level: "INFO",    msg: "Runtime log mirrored to monitor.log" },
+  ];
+  const LEVEL_RANK = { DEBUG: 0, INFO: 1, WARNING: 2, ERROR: 3, CRITICAL: 4 };
 
-  // ---- variables ----
-  const vars = document.getElementById("vars");
-  function varDefault(type, val) {
-    let c;
-    if (type === "number") { c = document.createElement("input"); c.type = "number"; c.step = "any"; c.className = "v-def"; c.value = val != null ? val : ""; c.placeholder = "default"; }
-    else { c = document.createElement("select"); c.className = "v-def"; c.appendChild(opt("true", "true", String(val) === "true")); c.appendChild(opt("false", "false", String(val) !== "true")); }
-    return c;
-  }
-  function varRow(v) {
-    v = v || { name: "", type: "bool", default: "false" };
-    const row = el("div", "row"); row.style.alignItems = "flex-end";
-    const nw = el("div"); nw.innerHTML = '<label style="margin-top:0">Name</label>'; const n = el("input", "v-name"); n.value = v.name || ""; n.placeholder = "maintenance_mode"; nw.appendChild(n);
-    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Type</label>'; const t = document.createElement("select"); t.className = "v-type"; ["bool", "number"].forEach(x => t.appendChild(opt(x, x, x === v.type))); tw.appendChild(t);
-    const dw = el("div"); dw.innerHTML = '<label style="margin-top:0">Default</label>'; const dwrap = el("div", "v-defwrap"); dwrap.appendChild(varDefault(v.type, v.default)); dw.appendChild(dwrap);
-    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm);
-    t.addEventListener("change", () => { dwrap.innerHTML = ""; dwrap.appendChild(varDefault(t.value, null)); });
-    rm.addEventListener("click", () => row.remove());
-    row.appendChild(nw); row.appendChild(tw); row.appendChild(dw); row.appendChild(rw);
-    return row;
-  }
-  document.getElementById("add-var").addEventListener("click", () => vars.appendChild(varRow()));
+  function renderHealth() {
+    SYS.last_update = isoNow();          // demo: monitor stays fresh between ticks
+    const mon = SYS.monitor;
+    const dot = mon === "ok" ? "up" : (mon === "stale" || mon === "no_data" ? "down" : "idle");
+    conn.innerHTML = '<span class="dot ' + dot + '"></span>' + (mon === "ok" ? "healthy" : mon === "stale" ? "monitor stale" : mon === "no_data" ? "no data yet" : "unknown");
+    setText("h_monitor", { ok: "running", stale: "stale", no_data: "no data", unknown: "unknown" }[mon] || mon);
+    document.getElementById("h_monitor").className = "v " + (mon === "ok" ? "allow" : mon === "unknown" ? "unknown" : "inhibit");
+    const mq = SYS.mqtt_connected;
+    setText("h_mqtt", mq == null ? "—" : (mq ? "connected" : "offline"));
+    document.getElementById("h_mqtt").className = "v " + (mq ? "allow" : mq === false ? "inhibit" : "unknown");
+    setText("h_config", SYS.config_ok ? "valid" : "invalid");
+    document.getElementById("h_config").className = "v " + (SYS.config_ok ? "allow" : "inhibit");
+    const u = document.getElementById("h_update");
+    setText("h_update", agoText(SYS.last_update)); u.title = SYS.last_update || "";
 
-  // ---- mqtt ----
-  const mqtts = document.getElementById("mqtts");
-  function mqttRow(m) {
-    m = m || { topic: "", metric: "", parse: "number" };
-    const row = el("div", "row"); row.style.alignItems = "flex-end";
-    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Topic</label>'; const t = el("input", "m-topic"); t.value = m.topic || ""; t.placeholder = "sensors/tank/level"; tw.appendChild(t);
-    const me = el("div"); me.innerHTML = '<label style="margin-top:0">Metric name</label>'; const mm = el("input", "m-metric"); mm.value = m.metric || ""; mm.placeholder = "tank_level"; me.appendChild(mm);
-    const pw = el("div"); pw.innerHTML = '<label style="margin-top:0">Parse</label>'; const p = document.createElement("select"); p.className = "m-parse"; PARSE.forEach(x => p.appendChild(opt(x, x, x === m.parse))); pw.appendChild(p);
-    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm); rm.addEventListener("click", () => row.remove());
-    row.appendChild(tw); row.appendChild(me); row.appendChild(pw); row.appendChild(rw);
-    return row;
-  }
-  document.getElementById("add-mqtt").addEventListener("click", () => mqtts.appendChild(mqttRow()));
-
-  // ---- http ----
-  const https = document.getElementById("https");
-  function httpMapRow(mp) {
-    mp = mp || { metric: "", path: "", type: "number" };
-    const row = el("div", "row"); row.style.alignItems = "flex-end";
-    const me = el("div"); me.innerHTML = '<label style="margin-top:0">Metric</label>'; const m = el("input", "h-metric"); m.value = mp.metric || ""; m.placeholder = "power_kw"; me.appendChild(m);
-    const pe = el("div"); pe.innerHTML = '<label style="margin-top:0">JSON path</label>'; const p = el("input", "h-path"); p.value = mp.path || ""; p.placeholder = "data.current_kw"; pe.appendChild(p);
-    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Type</label>'; const t = document.createElement("select"); t.className = "h-type"; PARSE.forEach(x => t.appendChild(opt(x, x, x === mp.type))); tw.appendChild(t);
-    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm); rm.addEventListener("click", () => row.remove());
-    row.appendChild(me); row.appendChild(pe); row.appendChild(tw); row.appendChild(rw);
-    return row;
-  }
-  function httpCard(h) {
-    h = h || { url: "", interval_minutes: 5, timeout: 10, map: [] };
-    const card = el("div", "rule-card");
-    card.innerHTML = '<div class="row"><div><label style="margin-top:0">URL</label><input class="h-url"></div>' +
-      '<div style="flex:0 0 130px"><label style="margin-top:0">Every (min)</label><input class="h-iv" type="number" min="1"></div>' +
-      '<div style="flex:0 0 120px"><label style="margin-top:0">Timeout (s)</label><input class="h-to" type="number" min="1"></div></div>' +
-      '<label style="margin-top:10px">Field mappings</label><div class="h-map"></div>' +
-      '<div class="btnrow"><button type="button" class="secondary mini add-map">+ Add mapping</button>' +
-      '<button type="button" class="danger mini rm-http">Remove input</button></div>';
-    card.querySelector(".h-url").value = h.url || ""; card.querySelector(".h-url").placeholder = "https://meter.local/api";
-    card.querySelector(".h-iv").value = h.interval_minutes != null ? h.interval_minutes : 5;
-    card.querySelector(".h-to").value = h.timeout != null ? h.timeout : 10;
-    const mapWrap = card.querySelector(".h-map");
-    (h.map && h.map.length ? h.map : [null]).forEach(mp => mapWrap.appendChild(httpMapRow(mp)));
-    card.querySelector(".add-map").addEventListener("click", () => mapWrap.appendChild(httpMapRow()));
-    card.querySelector(".rm-http").addEventListener("click", () => card.remove());
-    return card;
-  }
-  document.getElementById("add-http").addEventListener("click", () => https.appendChild(httpCard()));
-
-  function collect() {
-    const variables = [...vars.querySelectorAll(".row")].map(r => ({
-      name: r.querySelector(".v-name").value.trim(),
-      type: r.querySelector(".v-type").value,
-      default: (r.querySelector(".v-def") || {}).value || "",
-    })).filter(v => v.name);
-    const mqtt_inputs = [...mqtts.querySelectorAll(".row")].map(r => ({
-      topic: r.querySelector(".m-topic").value.trim(),
-      metric: r.querySelector(".m-metric").value.trim(),
-      parse: r.querySelector(".m-parse").value,
-    })).filter(m => m.topic || m.metric);
-    const http_inputs = [...https.querySelectorAll(".rule-card")].map(c => ({
-      url: c.querySelector(".h-url").value.trim(),
-      interval_minutes: c.querySelector(".h-iv").value,
-      timeout: c.querySelector(".h-to").value,
-      map: [...c.querySelectorAll(".h-map .row")].map(r => ({
-        metric: r.querySelector(".h-metric").value.trim(),
-        path: r.querySelector(".h-path").value.trim(),
-        type: r.querySelector(".h-type").value,
-      })).filter(m => m.metric),
-    })).filter(h => h.url || h.map.length);
-    return { variables, mqtt_inputs, http_inputs };
+    const s = SYS.summary;
+    setText("s_rules", s.rules_enabled + " / " + s.rules_total);
+    setText("s_metrics", s.metrics);
+    setText("s_vars", s.variables);
+    setText("s_mqtt", s.mqtt_inputs);
+    setText("s_http", s.http_inputs);
+    const f = SYS.files;
+    setText("files", "config " + f.config + " · state " + f.state + " · audit " + f.audit + " · log " + f.log);
   }
 
-  // Lightweight client-side validation mirroring the server's collision/empty checks.
-  const RESERVED = ["is_raining", "precip_accum_in", "precipitation_probability", "temperature",
-    "wind_speed_mph", "humidity", "short_forecast", "active_alert", "time_hour", "time_minute",
-    "time_weekday", "time_is_weekend", "time_is_daytime"];
-  function validate(src) {
-    const seen = {};
-    function claim(name, label) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return "'" + name + "' is not a valid metric name (letters, digits, underscore).";
-      if (RESERVED.includes(name)) return "'" + name + "' collides with a built-in metric.";
-      if (seen[name]) return "'" + name + "' is defined twice (collides).";
-      seen[name] = label; return "";
-    }
-    for (const v of src.variables) { const e = claim("var_" + v.name, "variable"); if (e) return e; }
-    for (const m of src.mqtt_inputs) {
-      if (!m.topic) return "Each MQTT input needs a topic.";
-      if (!m.metric) return "MQTT input on '" + m.topic + "' needs a metric name.";
-      const e = claim(m.metric, "mqtt"); if (e) return e;
-    }
-    for (const h of src.http_inputs) {
-      if (!h.url) return "Each HTTP input needs a URL.";
-      if (!h.map.length) return "HTTP input '" + h.url + "' needs at least one field mapping.";
-      for (const mp of h.map) { if (!mp.path) return "HTTP mapping for '" + mp.metric + "' needs a JSON path."; const e = claim(mp.metric, "http"); if (e) return e; }
-    }
-    return "";
+  function renderLog() {
+    const min = LEVEL_RANK[document.getElementById("lvl").value];
+    const box = document.getElementById("logbox");
+    const rows = (min == null) ? LINES : LINES.filter(l => LEVEL_RANK[l.level] == null || LEVEL_RANK[l.level] >= min);
+    if (!rows.length) { box.textContent = "No lines at this level."; return; }
+    box.innerHTML = rows.map(l => {
+      const lv = l.level || "";
+      const color = lv === "ERROR" || lv === "CRITICAL" ? "var(--bad)" : lv === "WARNING" ? "var(--warn)" : lv === "DEBUG" ? "var(--muted2)" : "var(--good)";
+      const tag = lv ? '<span style="color:' + color + ';font-weight:700">' + esc(lv.padEnd(7)) + "</span> " : "";
+      const ts = l.ts ? '<span style="color:var(--muted2)">' + esc(l.ts) + "</span> " : "";
+      return ts + tag + esc(l.msg || "");
+    }).join("\n");
   }
+  document.getElementById("lvl").addEventListener("change", renderLog);
 
-  const errBox = document.getElementById("inputs-err");
-  form.addEventListener("submit", e => {
-    e.preventDefault();
-    const src = collect();
-    const err = validate(src);
-    errBox.textContent = err; errBox.style.color = "#fda4a4";
-    if (err) { toast("Could not save: " + err, true); return; }
-    toast("Inputs saved (demo — nothing was written).");
-  });
-
-  (SRC.variables || []).forEach(v => vars.appendChild(varRow(v)));
-  (SRC.mqtt_inputs || []).forEach(m => mqtts.appendChild(mqttRow(m)));
-  (SRC.http_inputs || []).forEach(h => https.appendChild(httpCard(h)));
+  // "last poll" drifts so agoText stays lively, like the auto-refresh in the live page.
+  renderHealth(); renderLog();
+  setInterval(renderHealth, 4000);
 })();

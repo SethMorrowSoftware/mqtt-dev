@@ -184,20 +184,22 @@ Run the offline logic tests (no network needed):
     conditions;
   - a **YAML (advanced)** editor for power users, with a metrics/operators
     reference and an "append example rule" helper.
-- **Inputs** — manage the **sources** your rules draw on, without hand-editing
-  `config.yaml`: declare **operator variables** (`var_<name>` flags/setpoints you
-  toggle from the dashboard), subscribe to **MQTT sensor inputs** (another
-  device's topic → a metric), and poll **HTTP JSON inputs** (an endpoint with
-  dotted-path field mappings → metrics). Add/remove rows inline; everything is
-  validated and name-collision-checked before saving, and each new source
-  immediately appears as a metric in the Rules builder.
 - **Activity** — a read-only audit log of every device state change (automatic
-  or manual) and operator action, newest first, rendered in plain language.
+  or manual) and operator action, newest first, in plain language.
+- **System** — at-a-glance health (monitor running/stale, MQTT connected,
+  config valid, time since last poll), a configuration summary (rule/metric/
+  input counts and the files in use), and a **live runtime log viewer** that
+  tails the monitor's log with level filtering and auto-refresh. The monitor
+  mirrors its log to `log_file` (default `monitor.log`, a rolling ~1 MB file
+  with 3 backups) so the web UI — a separate process — can read it; set
+  `log_file:` to `""` in `config.yaml` to turn it off.
 
-Two extra endpoints are available:
+Extra endpoints are available:
 
 - `GET /api/state` — the JSON snapshot the dashboard polls (503 until the
   monitor has written its first cycle).
+- `GET /api/system` — health + config summary the System page polls.
+- `GET /api/logs?limit=N` — the tailed runtime log (newest first).
 - `GET /healthz` — unauthenticated liveness/freshness probe for systemd or an
   uptime monitor; reports whether the config loads and how fresh the monitor's
   last update is.
@@ -532,7 +534,7 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 | Path | What it is |
 |---|---|
 | `weather_mqtt.py` | The monitor: gathers inputs (weather, schedule, variables, mqtt_in, http_poll), evaluates rules, publishes MQTT, writes `weather_state.json`. |
-| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Inputs / Activity), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/healthz`. |
+| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Activity / System), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/api/system`, `/api/logs`, `/healthz`. |
 | `setup_wizard.py` | Interactive first-run config generator (`weather-mqtt-setup`). |
 | `install.sh` | One-command Debian/Ubuntu installer (Mosquitto + venv + services). |
 | `config.yaml` | Example/active configuration (the installer writes a real one from the wizard). |
