@@ -730,7 +730,8 @@ def test_webui_structured_rule_builder():
     # round-trips back to the editable shape
     struct = webui._rule_to_structured(parsed[0])
     assert struct["combine"] == "any" and len(struct["conditions"]) == 2
-    assert struct["conditions"][0] == {"metric": "is_raining", "operator": "==", "value": "true"}
+    assert struct["conditions"][0] == {"metric": "is_raining", "operator": "==",
+                                       "value": "true", "for": ""}
 
     # rejections
     for bad, needle in [
@@ -744,6 +745,67 @@ def test_webui_structured_rule_builder():
            "conditions": [{"metric": "temperature", "operator": "<", "value": "abc"}]}], "numeric"),
         ([{"name": "r", "topic": "t", "on_match": "x", "combine": "any", "conditions": []}], "at least one condition"),
         ([], "at least one rule"),
+    ]:
+        try:
+            webui._rules_from_structured(bad)
+            raise AssertionError(f"expected rejection containing {needle!r}")
+        except ValueError as e:
+            assert needle in str(e), f"got {e!r}, wanted {needle!r}"
+
+
+def test_webui_builder_advanced_constructs():
+    """The form builder round-trips the constructs added in Phase 1: between/in,
+    the value-less `changed` operator, a per-condition `for:` sustain, and a
+    disabled rule -- producing YAML the monitor accepts."""
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_builder_advanced_constructs ({e})")
+        return
+    import yaml, copy
+
+    items = [
+        {"name": "comfort", "topic": "f/comfort", "on_match": "ON", "on_clear": "OFF",
+         "enabled": True, "combine": "all", "conditions": [
+             {"metric": "temperature", "operator": "between", "value": "40, 80", "for": "10m"},
+             {"metric": "humidity", "operator": "in", "value": "30, 50, 70", "for": ""},
+         ]},
+        {"name": "alert_pulse", "topic": "f/pulse", "on_match": "1", "enabled": True,
+         "combine": "any", "conditions": [
+             {"metric": "temperature", "operator": "changed", "value": "", "for": ""}]},
+        {"name": "off_rule", "topic": "f/off", "on_match": "X", "enabled": False,
+         "combine": "any", "conditions": [
+             {"metric": "wind_speed_mph", "operator": ">", "value": "25", "for": ""}]},
+    ]
+    built = webui._rules_from_structured(items)
+    parsed = yaml.safe_load(webui.dump_raw({"rules": built}))["rules"]
+
+    assert parsed[0]["when"]["all"][0]["value"] == [40, 80]          # between -> list
+    assert parsed[0]["when"]["all"][0]["for"] == "10m"               # for preserved
+    assert parsed[0]["when"]["all"][1]["value"] == [30, 50, 70]      # in -> numeric list
+    assert parsed[1]["when"]["operator"] == "changed"
+    assert "value" not in parsed[1]["when"]                          # changed -> no value
+    assert parsed[2]["enabled"] is False                             # disabled preserved
+    assert "enabled" not in parsed[0]                                # default-on stays clean
+    # the monitor accepts what the builder produced
+    w.validate_config(copy.deepcopy({
+        "location": {"latitude": 1, "longitude": 2}, "user_agent": "x (a@b)",
+        "mqtt": {}, "rules": parsed}))
+
+    # round-trips back to the editable shape
+    s0 = webui._rule_to_structured(parsed[0])
+    assert s0["conditions"][0] == {"metric": "temperature", "operator": "between",
+                                   "value": "40, 80", "for": "10m"}
+    assert webui._rule_to_structured(parsed[2])["enabled"] is False
+
+    # rejections surface clearly
+    for bad, needle in [
+        ([{"name": "r", "topic": "t", "on_match": "x", "combine": "any", "conditions": [
+            {"metric": "temperature", "operator": "between", "value": "40", "for": ""}]}], "two numbers"),
+        ([{"name": "r", "topic": "t", "on_match": "x", "combine": "any", "conditions": [
+            {"metric": "humidity", "operator": "in", "value": "", "for": ""}]}], "at least one"),
+        ([{"name": "r", "topic": "t", "on_match": "x", "combine": "any", "conditions": [
+            {"metric": "temperature", "operator": ">", "value": "5", "for": "soon"}]}], "valid duration"),
     ]:
         try:
             webui._rules_from_structured(bad)

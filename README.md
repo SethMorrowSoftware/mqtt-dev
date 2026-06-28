@@ -338,10 +338,11 @@ Two history-aware constructs are also available on any condition:
 
 A rule may set `enabled: false` to leave it idle — it is not evaluated and
 publishes nothing, so the broker's last retained value stands. The web UI's
-**form builder** edits flat rules (one condition or one `any`/`all` group);
-rules using nested/`not` conditions, a time window, hysteresis, or `enabled:
-false` are edited in the **YAML (advanced)** tab, which the Rules page opens
-automatically when it detects them.
+**form builder** edits single-level rules (one condition or one `any`/`all`
+group), including the `enabled` toggle, `between`/`in`, the `changed` operator,
+and a per-condition `for:`. Rules using nested/`not` conditions, a time window,
+or hysteresis are edited in the **YAML (advanced)** tab, which the Rules page
+opens automatically when it detects them.
 
 ### Time windows & hysteresis (anti-short-cycle)
 
