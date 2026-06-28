@@ -283,8 +283,10 @@ system "as customizable as possible" without engine changes.
   (Slack). Payloads/URLs/bodies/text support **`{{metric}}` templating** with live
   values. Validated, fail‑safe (a failed action never blocks the cycle or changes
   committed state), editable in the form builder's *Extra actions* section, and
-  mirrored in the demo. (This delivers the ROADMAP's pluggable action registry —
-  webhooks are no longer out of scope.)
+  mirrored in the demo. Each firing is **audited** (kind/target/trigger/ok) and
+  surfaced on the **Activity** page, so you can see what fired and whether it
+  succeeded. (This delivers the ROADMAP's pluggable action registry — webhooks
+  are no longer out of scope.)
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

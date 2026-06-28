@@ -669,21 +669,33 @@ function agoText(iso) {
   // Mock events mirroring the two shapes the live app records (monitor + UI).
   const events = [
     { ts: ago(1),   device: "maintenance_hold", action: "manual_set", state: "on", by: "admin" },
+    { ts: ago(2),   device: "vent_fan", action: "action_fired", kind: "notify", target: "slack", trigger: "match", ok: true, by: "monitor" },
+    { ts: ago(2),   device: "vent_fan", action: "action_fired", kind: "webhook", target: "https://hooks.example.com/vent", trigger: "match", ok: true, by: "monitor" },
     { ts: ago(3),   device: "irrigation_rain_inhibit", source: "auto", state: "on", by: "monitor" },
+    { ts: ago(9),   topic: "facility/cmd/relay1", action: "mqtt_publish", qos: 1, retain: false, by: "admin" },
     { ts: ago(18),  variable: "maintenance_mode", action: "variable_set", value: true, by: "admin" },
     { ts: ago(46),  device: "vent_fan", source: "auto", state: "off", by: "monitor" },
+    { ts: ago(47),  device: "vent_fan", action: "action_fired", kind: "webhook", target: "https://hooks.example.com/vent", trigger: "clear", ok: false, by: "monitor" },
     { ts: ago(95),  device: "irrigation_rain_inhibit", source: "auto", state: "off", by: "monitor" },
     { ts: ago(140), device: "vent_fan", source: "manual", state: "on", by: "admin" },
   ];
   function describe(e) {
     if (e.action === "manual_set")   return { what: e.device, action: "manual override", detail: String(e.state).toUpperCase() };
     if (e.action === "variable_set") return { what: e.variable, action: "variable set", detail: String(e.value) };
+    if (e.action === "mqtt_publish") return { what: e.topic, action: "manual publish", detail: "qos " + e.qos + (e.retain ? " · retain" : "") };
+    if (e.action === "action_fired") {
+      const tgt = e.kind === "notify" ? "Slack" : (e.target || "");
+      return { what: e.device, action: e.kind + " action" + (e.ok === false ? " (failed)" : ""),
+               detail: "on " + (e.trigger || "") + (tgt ? " → " + tgt : "") };
+    }
     const src = e.source === "manual" ? "manual" : "automatic";
     return { what: e.device, action: src + " state change", detail: String(e.state).toUpperCase() };
   }
   function pillFor(d) {
-    if (d.action === "manual override" || /^manual/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
+    if (d.action === "manual override" || d.action === "manual publish" || /^manual/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
     if (d.action === "variable set") return '<span class="pill na">' + esc(d.action) + "</span>";
+    if (/\(failed\)/.test(d.action)) return '<span class="pill na">' + esc(d.action) + "</span>";
+    if (/ action$/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
     return '<span class="pill off">' + esc(d.action) + "</span>";
   }
   document.getElementById("act-count").textContent = events.length + " recent";

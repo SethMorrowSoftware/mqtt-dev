@@ -1036,12 +1036,21 @@ function describe(e){
   // Normalize the monitor's and the web UI's event shapes into one readable row.
   if(e.action==="manual_set")   return {what:e.device, action:"manual override", detail:String(e.state).toUpperCase()};
   if(e.action==="variable_set") return {what:e.variable, action:"variable set", detail:String(e.value)};
+  if(e.action==="mqtt_publish") return {what:e.topic, action:"manual publish", detail:"qos "+e.qos+(e.retain?" · retain":"")};
+  if(e.action==="action_fired"){
+    const tgt = e.kind==="notify" ? "Slack" : (e.target||"");
+    return {what:e.device, action:e.kind+" action"+(e.ok===false?" (failed)":""),
+            detail:"on "+(e.trigger||"")+(tgt?" → "+tgt:"")};
+  }
   const src = e.source==="manual" ? "manual" : "automatic";
   return {what:e.device, action:src+" state change", detail:String(e.state).toUpperCase()};
 }
 function pillFor(d){
   if(d.action==="manual override") return '<span class="pill on">'+esc(d.action)+'</span>';
   if(d.action==="variable set")    return '<span class="pill na">'+esc(d.action)+'</span>';
+  if(d.action==="manual publish")  return '<span class="pill on">'+esc(d.action)+'</span>';
+  if(/\(failed\)/.test(d.action))  return '<span class="pill na">'+esc(d.action)+'</span>';
+  if(/ action$/.test(d.action))    return '<span class="pill on">'+esc(d.action)+'</span>';
   if(/^manual/.test(d.action))     return '<span class="pill on">'+esc(d.action)+'</span>';
   return '<span class="pill off">'+esc(d.action)+'</span>';
 }

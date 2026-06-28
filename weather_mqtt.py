@@ -1912,10 +1912,18 @@ def _do_webhook(spec, metrics):
         return False
 
 
-def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg):
+def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg, audit_file=None):
     """Fire a rule's extra actions for an on (result=True) / off (result=False)
-    transition. Best-effort: each action is independent and never raises."""
+    transition. Best-effort: each action is independent and never raises. Each
+    real (non-dry-run) action is recorded to the audit log so the Activity page
+    can show what fired."""
     want = "match" if result else "clear"
+
+    def record(kind, target, ok):
+        if audit_file:
+            audit(audit_file, device=rule.get("name", "?"), action="action_fired",
+                  kind=kind, target=target, trigger=want, ok=bool(ok), by="monitor")
+
     for a in (rule.get("actions") or []):
         trig = str(a.get("trigger", "both")).strip().lower()
         if trig not in (want, "both"):
@@ -1931,20 +1939,24 @@ def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg):
                     LOG.info("[DRY-RUN] would publish action '%s' -> %s (rule '%s')",
                              payload, topic, rule["name"])
                 else:
-                    client.publish(topic, payload, qos=aqos, retain=aretain)
+                    info = client.publish(topic, payload, qos=aqos, retain=aretain)
+                    ok = getattr(info, "rc", 0) == 0
                     LOG.info("Action published '%s' -> %s (rule '%s')",
                              payload, topic, rule["name"])
+                    record("mqtt", topic, ok)
             elif "webhook" in a:
                 if client is None:
                     LOG.info("[DRY-RUN] would call webhook for rule '%s'", rule["name"])
                 else:
-                    _do_webhook(a["webhook"], metrics)
+                    ok = _do_webhook(a["webhook"], metrics)
+                    record("webhook", render_template(str(a["webhook"].get("url", "")), metrics), ok)
             elif "notify" in a:
                 text = render_template(str(a["notify"].get("text", "")), metrics)
                 if client is None:
                     LOG.info("[DRY-RUN] would notify: %s", text)
                 else:
-                    notify_slack(slack_cfg, text)
+                    ok = notify_slack(slack_cfg, text)
+                    record("notify", "slack", ok)
         except Exception as e:
             LOG.warning("Rule '%s' action failed: %s", rule.get("name", "?"), e)
 
@@ -2147,7 +2159,7 @@ def main():
                         # publish; best-effort.
                         if prev != result and rule.get("actions"):
                             fire_actions(rule, result, m, client, qos, retain,
-                                         cfg.get("slack", {}))
+                                         cfg.get("slack", {}), audit_file)
                     if commit:
                         last_state[rule["name"]] = result
 

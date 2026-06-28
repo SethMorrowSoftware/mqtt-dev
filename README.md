@@ -205,7 +205,9 @@ Run the offline logic tests (no network needed):
   LAN-only and audited). The subscription is configurable
   (`web.mqtt_console_enabled` / `mqtt_console_topics` / `mqtt_console_buffer`).
 - **Activity** — a read-only audit log of every device state change (automatic
-  or manual) and operator action, newest first, in plain language.
+  or manual), operator action, manual MQTT publish, and **extra action that
+  fired** (webhook / notify / extra publish, with an ok/failed indicator),
+  newest first, in plain language.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
   config valid, time since last poll), a configuration summary (rule/metric/
   input counts and the files in use), and a **live runtime log viewer** that

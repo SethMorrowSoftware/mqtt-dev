@@ -924,6 +924,33 @@ def test_full_config_with_actions_validates():
         assert "needs a 'url'" in str(e)
 
 
+def test_fire_actions_audits():
+    # Each fired action is recorded to the audit log (so Activity can show it),
+    # with the kind, target, trigger, and an ok flag.
+    import tempfile, os
+    aud = tempfile.mktemp(suffix=".log")
+    class _Info:  rc = 0
+    class _Fake:
+        def publish(self, *a, **k): return _Info()
+    rule = {"name": "vent", "actions": [
+        {"trigger": "match", "mqtt": {"topic": "facility/fan", "payload": "v={{t}}"}},
+        {"trigger": "clear", "notify": {"text": "off"}}]}
+    try:
+        w.fire_actions(rule, True, {"t": 9}, _Fake(), 1, True, {}, aud)   # match -> mqtt only
+        events = w.read_audit(aud, 50)
+        assert len(events) == 1
+        e = events[0]
+        assert e["action"] == "action_fired" and e["device"] == "vent"
+        assert e["kind"] == "mqtt" and e["target"] == "facility/fan"
+        assert e["trigger"] == "match" and e["ok"] is True
+        # dry-run (client None) records nothing
+        w.fire_actions(rule, True, {"t": 9}, None, 1, True, {}, aud)
+        assert len(w.read_audit(aud, 50)) == 1
+    finally:
+        try: os.unlink(aud)
+        except OSError: pass
+
+
 def test_webui_rule_actions_roundtrip():
     try:
         import webui
