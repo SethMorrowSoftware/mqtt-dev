@@ -445,6 +445,7 @@ BASE = """
   <a href="{{ url_for('inputs') }}" class="{{ 'active' if page=='inputs' }}">Inputs</a>
   <a href="{{ url_for('mqtt_page') }}" class="{{ 'active' if page=='mqtt' }}">MQTT</a>
   <a href="{{ url_for('activity') }}" class="{{ 'active' if page=='activity' }}">Activity</a>
+  <a href="{{ url_for('history') }}" class="{{ 'active' if page=='history' }}">History</a>
   <a href="{{ url_for('system') }}" class="{{ 'active' if page=='system' }}">System</a>
  </nav>
  <span class="spacer"></span>
@@ -907,6 +908,28 @@ def api_logs():
                     "lines": core.read_log(log_file, limit) if log_file else []})
 
 
+@app.route("/api/history")
+@require_auth
+def api_history():
+    """Metric history (time series) over the last N hours for the History page."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    hist = cfg.get("history", {}) or {}
+    enabled = bool(hist.get("enabled", True))
+    db = hist.get("file", "history.db")
+    try:
+        hours = max(1, min(24 * 90, int(request.args.get("hours", 24))))
+    except Exception:
+        hours = 24
+    names = [n for n in (request.args.get("metrics", "").split(",")) if n.strip()]
+    available = core.history_metrics(db) if enabled else []
+    series = core.read_history(db, hours=hours, names=names or None) if enabled else {}
+    return jsonify({"enabled": enabled, "hours": hours,
+                    "available": available, "series": series})
+
+
 @app.route("/api/mqtt")
 @require_auth
 def api_mqtt():
@@ -1217,6 +1240,103 @@ setInterval(tick, REFRESH);
 def system():
     return page(render_template_string(SYSTEM, refresh=DASH_REFRESH_SECONDS),
                 page="system", title="System · The Castle Fun Center")
+
+
+# ---------------------------------------------------------------------------
+# History (metric trend sparklines from the SQLite log)
+# ---------------------------------------------------------------------------
+HISTORY = """
+<div class="card">
+  <div class="toprow" style="align-items:center">
+    <div><h3 style="margin:0">History &amp; trends</h3>
+      <p class="muted" style="margin:4px 0 0">How each numeric metric has moved over time, sampled every poll
+       cycle. Use it to tune thresholds and spot drift.</p></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="win" style="margin:0;width:auto">
+        <option value="6">last 6 hours</option>
+        <option value="24" selected>last 24 hours</option>
+        <option value="72">last 3 days</option>
+        <option value="168">last 7 days</option>
+        <option value="720">last 30 days</option>
+      </select>
+      <label class="muted" style="margin:0;display:flex;align-items:center;gap:6px;font-weight:500">
+        <input type="checkbox" id="follow" checked style="width:auto;margin:0"> auto-refresh</label>
+    </div>
+  </div>
+  <div id="hist-note" class="muted" style="margin-top:10px;display:none"></div>
+</div>
+
+<div class="grid" id="charts" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+  <div class="muted">Loading…</div>
+</div>
+<script>
+const REFRESH = {{ refresh }} * 1000;
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function fmtNum(n){ if(n===null||n===undefined) return "—"; const r=Math.round(n*100)/100; return (r===Math.round(r))?String(r):r.toFixed(2); }
+function fmtTime(iso){ const t=Date.parse(iso); if(isNaN(t)) return ""; const d=new Date(t);
+  return d.toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}); }
+
+// Build an inline SVG sparkline from [[ts,value],...].
+function sparkline(points){
+  const W=260, H=64, pad=4;
+  if(!points.length) return '<div class="muted" style="height:'+H+'px;display:flex;align-items:center">no data</div>';
+  const vals=points.map(p=>p[1]); let lo=Math.min(...vals), hi=Math.max(...vals);
+  if(lo===hi){ lo-=1; hi+=1; }
+  const n=points.length;
+  const x=i=> pad + (n===1?0:(i/(n-1))*(W-2*pad));
+  const y=v=> pad + (1-(v-lo)/(hi-lo))*(H-2*pad);
+  let d=""; points.forEach((p,i)=>{ d += (i?" L":"M")+x(i).toFixed(1)+" "+y(p[1]).toFixed(1); });
+  const area = d + " L"+x(n-1).toFixed(1)+" "+(H-pad)+" L"+x(0).toFixed(1)+" "+(H-pad)+" Z";
+  const lastY=y(points[n-1][1]).toFixed(1), lastX=x(n-1).toFixed(1);
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="100%" height="'+H+'" preserveAspectRatio="none" style="display:block">'+
+    '<path d="'+area+'" fill="var(--accentglow)" stroke="none"/>'+
+    '<path d="'+d+'" fill="none" stroke="var(--accent)" stroke-width="1.6"/>'+
+    '<circle cx="'+lastX+'" cy="'+lastY+'" r="2.6" fill="var(--accent)"/></svg>';
+}
+
+async function tick(){
+  const hours=document.getElementById("win").value;
+  let d; try{ const r=await fetch("api/history?hours="+hours,{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
+  catch(e){ return; }
+  const note=document.getElementById("hist-note");
+  const charts=document.getElementById("charts");
+  if(!d.enabled){
+    note.style.display=""; note.innerHTML='History is off. Set <code>history.enabled: true</code> in <code>config.yaml</code> (or Settings) and let the monitor run a few cycles.';
+    charts.innerHTML=""; return;
+  }
+  const names=Object.keys(d.series||{}).sort();
+  if(!names.length){
+    note.style.display=""; note.textContent="No samples yet — the monitor writes a point each poll cycle; check back after a few cycles.";
+    charts.innerHTML=""; return;
+  }
+  note.style.display="none";
+  charts.innerHTML="";
+  for(const name of names){
+    const pts=d.series[name]; const vals=pts.map(p=>p[1]);
+    const last=vals[vals.length-1], lo=Math.min(...vals), hi=Math.max(...vals);
+    const card=document.createElement("div"); card.className="card"; card.style.margin="0";
+    card.innerHTML='<div class="toprow" style="align-items:baseline">'+
+      '<div class="eyebrow">'+esc(name)+'</div>'+
+      '<div class="big" style="font-size:22px;margin:0">'+fmtNum(last)+'</div></div>'+
+      '<div style="margin:10px 0 6px">'+sparkline(pts)+'</div>'+
+      '<div class="muted" style="display:flex;justify-content:space-between;font-size:11.5px">'+
+      '<span>min '+fmtNum(lo)+' · max '+fmtNum(hi)+'</span><span>'+pts.length+' pts</span></div>'+
+      '<div class="muted" style="font-size:11px;margin-top:2px">'+fmtTime(pts[0][0])+' → '+fmtTime(pts[pts.length-1][0])+'</div>';
+    charts.appendChild(card);
+  }
+}
+document.getElementById("win").addEventListener("change", tick);
+tick();
+setInterval(()=>{ if(document.getElementById("follow").checked) tick(); }, REFRESH);
+</script>
+"""
+
+
+@app.route("/history")
+@require_auth
+def history():
+    return page(render_template_string(HISTORY, refresh=DASH_REFRESH_SECONDS),
+                page="history", title="History · The Castle Fun Center")
 
 
 # ---------------------------------------------------------------------------
@@ -1532,6 +1652,21 @@ SETTINGS = """
   <p class="muted">⚠ Changing <b>location</b>, the <b>MQTT connection</b> (host/port/credentials/client id),
    or any <b>web interface</b> setting needs a restart of the corresponding service.
    Thresholds, lookback, poll interval, QoS, retain, status topic and rules apply on the next poll automatically.</p>
+</div>
+
+<div class="card">
+  <h3>Metric history</h3>
+  <p class="muted">Record each cycle's numeric metrics to a small local database so the
+   <b>History</b> page can chart trends. Applies on the next poll.</p>
+  <div class="row">
+    <div><label>Enabled</label>
+      <select name="history_enabled">
+        <option value="true" {{ 'selected' if c.history.enabled }}>true</option>
+        <option value="false" {{ 'selected' if not c.history.enabled }}>false</option>
+      </select></div>
+    <div><label>Retention <span class="hint">(days, 1…3650)</span></label>
+      <input name="history_retention_days" value="{{ c.history.retention_days }}"></div>
+  </div>
   <button type="submit">Save settings</button>
 </div></form>
 """
@@ -1656,6 +1791,13 @@ def settings():
                                  "(set a username and password first)")
             web["allow_mqtt_publish"] = amp
 
+            histd = cfg.setdefault("history", {})
+            if f.get("history_enabled") is not None:
+                histd["enabled"] = f.get("history_enabled") == "true"
+            if str(f.get("history_retention_days", "")).strip():
+                histd["retention_days"] = _ranged("History retention",
+                                                  f.get("history_retention_days"), 1, 3650, integer=True)
+
             save_config(cfg)
             msg, msgclass = ("Settings saved. Thresholds/MQTT-publish/rules apply on the "
                              "next poll; location, MQTT connection and web changes need a "
@@ -1691,6 +1833,9 @@ def settings():
     spd.setdefault("enabled", False)
     spd.setdefault("url", "")
     spd.setdefault("token", "")
+    histd = cfg.setdefault("history", {})
+    histd.setdefault("enabled", True)
+    histd.setdefault("retention_days", 14)
     body = render_template_string(SETTINGS, c=cfg)
     return page(body, page="settings", msg=msg, msgclass=msgclass,
                 title="Settings · The Castle Fun Center")

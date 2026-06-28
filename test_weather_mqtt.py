@@ -1176,6 +1176,90 @@ def test_read_log_parses_levels_and_continuations():
         os.unlink(p)
 
 
+def test_history_record_read_and_prune():
+    import tempfile, os
+    from datetime import datetime, timezone, timedelta
+    db = tempfile.mktemp(suffix=".db")
+    now = datetime.now(timezone.utc)
+    try:
+        for i in range(6):
+            ts = (now - timedelta(minutes=10 * (6 - i))).isoformat(timespec="seconds")
+            w.record_history(db, {"temperature": 70 + i, "is_raining": i % 2 == 0,
+                                  "short_forecast": "Sunny", "active_alerts": []},
+                             ts=ts, retention_days=14)
+        s = w.read_history(db, hours=24)
+        # numeric + bool(as 0/1) recorded; text/list skipped
+        assert set(s.keys()) == {"temperature", "is_raining"}
+        assert [p[1] for p in s["temperature"]] == [70, 71, 72, 73, 74, 75]
+        assert [p[1] for p in s["is_raining"]] == [1, 0, 1, 0, 1, 0]
+        assert w.history_metrics(db) == ["is_raining", "temperature"]
+        # name filter
+        assert set(w.read_history(db, hours=24, names=["temperature"]).keys()) == {"temperature"}
+        # retention prunes old rows
+        w.record_history(db, {"temperature": 99},
+                         ts=(now - timedelta(days=40)).isoformat(timespec="seconds"),
+                         retention_days=14)
+        assert len(w.read_history(db, hours=24 * 60)["temperature"]) == 6   # 40d-old pruned
+        # a short window keeps only recent points (the 10/20/30 min-old ones)
+        assert len(w.read_history(db, hours=1)["temperature"]) <= 6
+        # missing db / disabled -> empty, never raises
+        assert w.read_history("/nope/x.db") == {}
+        assert w.history_metrics("") == []
+        w.record_history("", {"temperature": 1})  # no-op, no raise
+        # down-sampling caps the point count
+        big = tempfile.mktemp(suffix=".db")
+        for i in range(50):
+            w.record_history(big, {"x": i}, ts=(now - timedelta(minutes=50 - i)).isoformat(timespec="seconds"))
+        assert len(w.read_history(big, hours=24, max_points=10)["x"]) == 10
+        os.unlink(big)
+    finally:
+        try: os.unlink(db)
+        except OSError: pass
+
+
+def test_webui_history_page_and_api():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_history_page_and_api ({e})")
+        return
+    import tempfile, os, yaml
+    from datetime import datetime, timezone, timedelta
+    p = tempfile.mktemp(suffix=".yaml")
+    db = tempfile.mktemp(suffix=".db")
+    now = datetime.now(timezone.utc)
+    for i in range(5):
+        w.record_history(db, {"temperature": 60 + i, "humidity": 40 + i},
+                         ts=(now - timedelta(minutes=10 * (5 - i))).isoformat(timespec="seconds"))
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+           "history": {"enabled": True, "file": db, "retention_days": 14},
+           "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        r = c.get("/history")
+        assert r.status_code == 200 and b"History" in r.data and b"api/history" in r.data
+        assert b'href="/history"' in c.get("/").data           # nav link
+        j = c.get("/api/history?hours=24").get_json()
+        assert j["enabled"] is True
+        assert set(j["available"]) == {"humidity", "temperature"}
+        assert [pt[1] for pt in j["series"]["temperature"]] == [60, 61, 62, 63, 64]
+        # Settings exposes the history toggle and round-trips a change
+        assert b"history_enabled" in c.get("/settings").data
+    finally:
+        for f in (p, db):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
 def test_webui_system_page_and_apis():
     try:
         import webui

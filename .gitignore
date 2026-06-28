@@ -19,6 +19,10 @@ weather_state.json
 overrides.json
 audit.log
 variables.json
+# Runtime log (System page) + metric history db (Phase 4).
+monitor.log
+monitor.log.*
+history.db
 # Atomic-write temp + backup files left by the web UI's config saves.
 *.tmp
 *.bak

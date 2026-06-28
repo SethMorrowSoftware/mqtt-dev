@@ -29,6 +29,7 @@ import math
 import os
 import re
 import signal
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -757,6 +758,14 @@ def validate_config(cfg):
     # Rolling runtime log the monitor mirrors its logging to, so the web UI's
     # System page can tail it (the two run as separate processes). Blank = off.
     cfg.setdefault("log_file", "monitor.log")
+    # Metric history (Phase 4): the monitor appends each cycle's numeric metrics
+    # to a small SQLite db so the web UI can chart trends. Best-effort + pruned.
+    hist = cfg.setdefault("history", {})
+    hist.setdefault("enabled", True)
+    hist["enabled"] = bool(hist["enabled"])
+    hist.setdefault("file", "history.db")
+    hist["retention_days"] = max(1, min(3650, int(
+        _as_number(hist.get("retention_days", 14), 14, "history.retention_days"))))
 
     precip = cfg.setdefault("precipitation", {})
     lb = _as_number(precip.get("lookback_hours", 24), 24, "precipitation.lookback_hours")
@@ -1623,6 +1632,99 @@ def read_audit(path, limit=200):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Metric history (Phase 4): a small SQLite log of each cycle's numeric metrics,
+# so the web UI can chart trends. Recording is best-effort and pruned to the
+# retention window; reading tolerates a missing/locked db.
+# ---------------------------------------------------------------------------
+def _history_numeric(metrics):
+    """The subset of a metrics dict worth charting: numbers and bools (as 0/1).
+    Text/list metrics (short_forecast, active_alerts) are skipped."""
+    out = {}
+    for name, v in (metrics or {}).items():
+        if isinstance(v, bool):
+            out[name] = 1.0 if v else 0.0
+        elif isinstance(v, (int, float)):
+            out[name] = float(v)
+    return out
+
+
+def record_history(db_path, metrics, ts=None, retention_days=14):
+    """Append this cycle's numeric metrics to the SQLite history, then prune
+    anything older than the retention window. Best-effort: never raises."""
+    if not db_path:
+        return
+    ts = ts or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = _history_numeric(metrics)
+    if not rows:
+        return
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            con.execute("CREATE TABLE IF NOT EXISTS samples "
+                        "(ts TEXT NOT NULL, name TEXT NOT NULL, value REAL NOT NULL)")
+            con.execute("CREATE INDEX IF NOT EXISTS ix_samples_name_ts "
+                        "ON samples(name, ts)")
+            con.executemany("INSERT INTO samples(ts, name, value) VALUES (?, ?, ?)",
+                            [(ts, n, v) for n, v in rows.items()])
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(days=retention_days)).isoformat(timespec="seconds")
+            con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        LOG.warning("Could not record history to %s: %s", db_path, e)
+
+
+def read_history(db_path, hours=24, names=None, max_points=600):
+    """Return {metric: [[ts, value], ...]} over the last `hours`. Optionally
+    restrict to `names`. Robust to a missing db; returns {} on any problem."""
+    if not db_path or not Path(db_path).exists():
+        return {}
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(hours=max(1, hours))).isoformat(timespec="seconds")
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            q = "SELECT ts, name, value FROM samples WHERE ts >= ?"
+            args = [cutoff]
+            if names:
+                q += " AND name IN (%s)" % ",".join("?" * len(names))
+                args += list(names)
+            q += " ORDER BY ts"
+            cur = con.execute(q, args)
+            series = {}
+            for ts, name, value in cur.fetchall():
+                series.setdefault(name, []).append([ts, value])
+        finally:
+            con.close()
+    except Exception as e:
+        LOG.warning("Could not read history from %s: %s", db_path, e)
+        return {}
+    # Down-sample very long series so the payload/redraw stays light.
+    for name, pts in series.items():
+        if len(pts) > max_points:
+            step = len(pts) / max_points
+            series[name] = [pts[int(i * step)] for i in range(max_points)]
+    return series
+
+
+def history_metrics(db_path):
+    """Distinct metric names present in the history db (for the UI's picker)."""
+    if not db_path or not Path(db_path).exists():
+        return []
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            return [r[0] for r in con.execute(
+                "SELECT DISTINCT name FROM samples ORDER BY name").fetchall()]
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
 # Lines like: "2026-06-28 16:40:01,234 INFO Published ..." -- pull the level out
 # so the UI can colour-code without re-parsing on every render.
 _LOG_LINE_RE = re.compile(
@@ -2098,6 +2200,11 @@ def main():
                              now_utc, ua)            # GET due http_poll endpoints
             m.update(dict(http_store))               # latest http_poll values
             m.update(compute_metrics(cfg.get("computed", {}), m))  # derived metrics
+            hist = cfg.get("history", {}) or {}
+            if hist.get("enabled", True):
+                record_history(hist.get("file", "history.db"), m,
+                               ts=now_utc.isoformat(timespec="seconds"),
+                               retention_days=int(hist.get("retention_days", 14)))
             rule_rows = []
             for rule in rules:
               try:

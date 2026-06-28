@@ -4,8 +4,8 @@
    only if the elements it needs are present on the page. Mirrors the live
    webui.py UI (dashboard with variables + manual control, the rule builder,
    settings, the inputs editor, the activity log, the System health/log page,
-   and the MQTT console) but everything is mock data — nothing is published or
-   saved.
+   the MQTT console, and the History trends page) but everything is mock data —
+   nothing is published or saved.
    =========================================================================== */
 "use strict";
 
@@ -1039,4 +1039,80 @@ function agoText(iso) {
     if (document.getElementById("follow").checked) { emit(); if (Math.random() < 0.5) emit(); renderFeed(); }
     if (document.getElementById("tab-topics").style.display !== "none") renderTopics();
   }, 1500);
+})();
+
+/* =========================================================================
+   HISTORY  ·  metric trend sparklines (mock time series in the demo)
+   Mirrors the live webui.py History page; client-side only, no backend.
+   ========================================================================= */
+(function history() {
+  const charts = document.getElementById("charts");
+  const win = document.getElementById("win");
+  if (!charts || !win) return;
+
+  // Mock metric generators: a base value the series drifts around (with a daily
+  // wobble), so the sparklines look like plausible sensor history.
+  const METRICS = [
+    { name: "temperature",     base: 68, amp: 14, jit: 1.2, dec: 1 },
+    { name: "humidity",        base: 55, amp: 25, jit: 3,   dec: 0 },
+    { name: "precip_accum_in", base: 0.1, amp: 0.18, jit: 0.04, dec: 2, floor: 0 },
+    { name: "wind_speed_mph",  base: 9,  amp: 7,  jit: 2,   dec: 0, floor: 0 },
+    { name: "tank_level",      base: 60, amp: 22, jit: 1.5, dec: 1 },
+    { name: "net_power",       base: 2.4, amp: 3.5, jit: 0.5, dec: 2 },
+  ];
+  // A deterministic-ish pseudo-random so re-renders of the same window look stable.
+  function series(m, hours) {
+    const n = Math.min(180, Math.max(24, Math.round(hours * (hours <= 24 ? 4 : 1))));
+    const now = Date.now(), span = hours * 3600 * 1000;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const frac = i / (n - 1);
+      const ts = new Date(now - span + frac * span).toISOString().replace(/\.\d+Z$/, "Z");
+      const daily = Math.sin(frac * Math.PI * 2 * Math.max(1, hours / 24));
+      let v = m.base + daily * m.amp + (Math.random() - 0.5) * m.jit * 2;
+      if (m.floor != null) v = Math.max(m.floor, v);
+      const p = Math.pow(10, m.dec); v = Math.round(v * p) / p;
+      out.push([ts, v]);
+    }
+    return out;
+  }
+
+  function fmtNum(x) { if (x == null) return "—"; const r = Math.round(x * 100) / 100; return (r === Math.round(r)) ? String(r) : r.toFixed(2); }
+  function fmtTime(iso) { const t = Date.parse(iso); if (isNaN(t)) return ""; return new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
+  function sparkline(points) {
+    const W = 260, H = 64, pad = 4;
+    const vals = points.map(p => p[1]); let lo = Math.min(...vals), hi = Math.max(...vals);
+    if (lo === hi) { lo -= 1; hi += 1; }
+    const n = points.length;
+    const x = i => pad + (n === 1 ? 0 : (i / (n - 1)) * (W - 2 * pad));
+    const y = v => pad + (1 - (v - lo) / (hi - lo)) * (H - 2 * pad);
+    let d = ""; points.forEach((p, i) => { d += (i ? " L" : "M") + x(i).toFixed(1) + " " + y(p[1]).toFixed(1); });
+    const area = d + " L" + x(n - 1).toFixed(1) + " " + (H - pad) + " L" + x(0).toFixed(1) + " " + (H - pad) + " Z";
+    const lx = x(n - 1).toFixed(1), ly = y(points[n - 1][1]).toFixed(1);
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" style="display:block">' +
+      '<path d="' + area + '" fill="var(--accentglow)" stroke="none"/>' +
+      '<path d="' + d + '" fill="none" stroke="var(--accent)" stroke-width="1.6"/>' +
+      '<circle cx="' + lx + '" cy="' + ly + '" r="2.6" fill="var(--accent)"/></svg>';
+  }
+
+  function render() {
+    const hours = Number(win.value);
+    charts.innerHTML = "";
+    for (const m of METRICS) {
+      const pts = series(m, hours); const vals = pts.map(p => p[1]);
+      const last = vals[vals.length - 1], lo = Math.min(...vals), hi = Math.max(...vals);
+      const card = document.createElement("div"); card.className = "card"; card.style.margin = "0";
+      card.innerHTML = '<div class="toprow" style="align-items:baseline">' +
+        '<div class="eyebrow">' + esc(m.name) + "</div>" +
+        '<div class="big" style="font-size:22px;margin:0">' + fmtNum(last) + "</div></div>" +
+        '<div style="margin:10px 0 6px">' + sparkline(pts) + "</div>" +
+        '<div class="muted" style="display:flex;justify-content:space-between;font-size:11.5px">' +
+        "<span>min " + fmtNum(lo) + " · max " + fmtNum(hi) + "</span><span>" + pts.length + " pts</span></div>" +
+        '<div class="muted" style="font-size:11px;margin-top:2px">' + fmtTime(pts[0][0]) + " → " + fmtTime(pts[pts.length - 1][0]) + "</div>";
+      charts.appendChild(card);
+    }
+  }
+  win.addEventListener("change", render);
+  render();
+  setInterval(() => { if (document.getElementById("follow").checked) render(); }, 5000);
 })();
