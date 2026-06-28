@@ -1,4 +1,4 @@
-# Precipitation → MQTT — UI demo
+# The Castle Fun Center · MQTT Command Center — UI demo
 
 A **static, self-contained** preview of the controller's web interface
 (`webui.py`). It uses sample data and runs entirely in the browser — nothing is

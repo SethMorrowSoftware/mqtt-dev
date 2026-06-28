@@ -1,6 +1,10 @@
-# Precipitation → MQTT Controller
+# The Castle Fun Center · MQTT Command Center
 
 [![tests](https://github.com/SethMorrowSoftware/mqtt-dev/actions/workflows/tests.yml/badge.svg)](https://github.com/SethMorrowSoftware/mqtt-dev/actions/workflows/tests.yml)
+
+The on-site automation controller behind **The Castle Fun Center's** MQTT command
+center — a web-configurable **conditions → actions** engine. Weather-driven
+irrigation is the default preset; the same engine drives any on/off device.
 
 Watches rainfall from the **National Weather Service** (`api.weather.gov`) and
 publishes **MQTT** messages so irrigation PLCs know when **not** to water.

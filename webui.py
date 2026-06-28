@@ -129,7 +129,7 @@ def _config_error_page(page_name, err):
         '<p class="muted">Fix the file on disk (check YAML syntax) and reload '
         'this page. The monitor keeps running on its last good config.</p></div>',
         err=str(err), favicon=FAVICON)
-    return page(body, page=page_name, title="Config error · Precipitation → MQTT")
+    return page(body, page=page_name, title="Config error · The Castle Fun Center")
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +176,13 @@ def require_auth(fn):
 # ---------------------------------------------------------------------------
 FAVICON = ("data:image/svg+xml,"
            "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E"
-           "%3Ctext y='.9em' font-size='90'%3E%F0%9F%8C%A7%3C/text%3E%3C/svg%3E")
+           "%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%B0%3C/text%3E%3C/svg%3E")
 
 BASE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>{{ title or 'Precipitation → MQTT' }}</title>
+<title>{{ title or "The Castle Fun Center · MQTT Command Center" }}</title>
 <link rel="icon" href="{{ favicon }}">
 <style>
  :root{
@@ -285,7 +285,7 @@ BASE = """
  @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}}
 </style></head><body>
 <header>
- <h1><span class="logo">🌧</span> Precipitation → MQTT</h1>
+ <h1><span class="logo">🏰</span> The Castle Fun Center <span style="font-weight:500;color:var(--muted2);font-size:12px;letter-spacing:.02em">· MQTT Command Center</span></h1>
  <nav>
   <a href="{{ url_for('dashboard') }}" class="{{ 'active' if page=='dash' }}">Dashboard</a>
   <a href="{{ url_for('settings') }}" class="{{ 'active' if page=='settings' }}">Settings</a>
@@ -299,7 +299,7 @@ BASE = """
  {% if msg %}<div class="msg {{ msgclass }}">{{ msg }}</div>{% endif %}
  {{ body|safe }}
 </main>
-<footer>Precipitation → MQTT controller · data source: National Weather Service (api.weather.gov)
+<footer>The Castle Fun Center · MQTT Command Center · data source: National Weather Service (api.weather.gov)
  · <a href="https://github.com/SethMorrowSoftware/mqtt-dev" target="_blank" rel="noopener">Docs ↗</a></footer>
 </body></html>
 """
@@ -327,7 +327,7 @@ DASH = """
   </div>
 
   <div class="card" id="directive-card">
-    <div class="eyebrow">Irrigation directive</div>
+    <div class="eyebrow">Headline device</div>
     <div class="big unknown" id="directive">…</div>
     <div class="muted" id="directive-sub">Loading current conditions…</div>
   </div>
@@ -556,7 +556,7 @@ def dashboard():
     body = render_template_string(
         DASH, refresh=DASH_REFRESH_SECONDS,
         state_file=cfg.get("state_file", "weather_state.json"))
-    return page(body, page="dash", title="Dashboard · Precipitation → MQTT")
+    return page(body, page="dash", title="Dashboard · The Castle Fun Center")
 
 
 @app.route("/api/state")
@@ -753,7 +753,7 @@ tick(); setInterval(tick, REFRESH);
 @require_auth
 def activity():
     return page(render_template_string(ACTIVITY, refresh=DASH_REFRESH_SECONDS),
-                page="activity", title="Activity · Precipitation → MQTT")
+                page="activity", title="Activity · The Castle Fun Center")
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1045,7 @@ def settings():
     spd.setdefault("token", "")
     body = render_template_string(SETTINGS, c=cfg)
     return page(body, page="settings", msg=msg, msgclass=msgclass,
-                title="Settings · Precipitation → MQTT")
+                title="Settings · The Castle Fun Center")
 
 
 # ---------------------------------------------------------------------------
@@ -1580,7 +1580,7 @@ def rules():
         RULES, rules_yaml=rules_yaml, structured=structured,
         metrics=builder_metrics(cfg), active_tab=active_tab)
     return page(body, page="rules", msg=msg, msgclass=msgclass,
-                title="Rules · Precipitation → MQTT")
+                title="Rules · The Castle Fun Center")
 
 
 def _rule_is_flat(rule):
