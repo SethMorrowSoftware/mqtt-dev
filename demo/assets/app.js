@@ -1,7 +1,9 @@
 /* ===========================================================================
-   Precipitation -> MQTT  ·  demo behaviour
+   Automation (Conditions → Actions) · demo behaviour
    All client-side, no backend. Three pages share this file; each block runs
-   only if the elements it needs are present on the page.
+   only if the elements it needs are present on the page. Mirrors the live
+   webui.py UI (dashboard with variables + manual control, the rule builder,
+   settings) but everything is mock data — nothing is published or saved.
    =========================================================================== */
 "use strict";
 
@@ -30,7 +32,7 @@ function agoText(iso) {
 }
 
 /* =========================================================================
-   DASHBOARD
+   DASHBOARD  ·  conditions + device states + variables + manual control
    ========================================================================= */
 (function dashboard() {
   if (!document.getElementById("rulebody")) return;
@@ -54,26 +56,42 @@ function agoText(iso) {
                short_forecast: "Partly Cloudy", active_alerts: [], connected: false },
   };
   const LOOKBACK = 24;
+  const MANUAL_CONTROL = true;             // demo: controls are enabled
   let current = "wet";
-  let lastChange = { irrigation_rain_inhibit: isoNow(), any_nws_alert: isoNow() };
+  // operator-set variables (toggled below) and per-device manual overrides
+  let variables = [
+    { name: "maintenance_mode", type: "bool",   value: false },
+    { name: "temp_setpoint",    type: "number", value: 70 },
+  ];
+  let manual = { irrigation_rain_inhibit: "auto", maintenance_hold: "auto", any_nws_alert: "auto" };
+  let lastChange = {};
   let prevActive = {};
 
   function round(n, d) { const p = Math.pow(10, d); return Math.round(n * p) / p; }
+  function varVal(name) { const v = variables.find(x => x.name === name); return v ? v.value : undefined; }
 
-  // Re-derive rule state the same way the monitor does, for the demo rules.
+  // Re-derive device state the way the monitor does: rules -> desired, then a
+  // manual override (on/off) wins.
   function deriveRules(m) {
     const rules = [
-      { name: "irrigation_rain_inhibit", description: "Hold irrigation when raining or >= 0.25 in / 24h",
-        topic: "irrigation/rain_inhibit", on_match: "INHIBIT", on_clear: "ALLOW",
-        active: m.is_raining || m.precip_accum_in >= 0.25 },
+      { name: "irrigation_rain_inhibit", description: "Hold irrigation when raining or ≥ 0.25 in / 24h",
+        topic: "irrigation/rain_inhibit", on_match: "INHIBIT", on_clear: "ALLOW", enabled: true,
+        desired: m.is_raining || m.precip_accum_in >= 0.25 },
+      { name: "maintenance_hold", description: "Pause everything while in maintenance mode",
+        topic: "facility/maintenance", on_match: "ON", on_clear: "OFF", enabled: true,
+        desired: !!varVal("maintenance_mode") },
       { name: "any_nws_alert", description: "Flag whenever any NWS alert is active",
-        topic: "facility/weather/nws_alert", on_match: "1", on_clear: "0",
-        active: m.active_alerts.length > 0 },
+        topic: "facility/weather/nws_alert", on_match: "1", on_clear: "0", enabled: true,
+        desired: m.active_alerts.length > 0 },
     ];
     for (const r of rules) {
+      const man = manual[r.name] || "auto";
+      r.manual = man;
+      r.active = !r.enabled ? null : (man === "on" ? true : man === "off" ? false : r.desired);
       if (prevActive[r.name] !== undefined && prevActive[r.name] !== r.active) lastChange[r.name] = isoNow();
+      if (lastChange[r.name] === undefined) lastChange[r.name] = isoNow();
       prevActive[r.name] = r.active;
-      r.current_payload = r.active ? r.on_match : r.on_clear;
+      r.current_payload = r.active == null ? null : (r.active ? r.on_match : r.on_clear);
       r.last_change = lastChange[r.name];
     }
     return rules;
@@ -81,7 +99,6 @@ function agoText(iso) {
 
   function buildState() {
     const s = SCENARIOS[current];
-    // gentle drift so it feels live without changing rule outcomes
     const d = (base, amp, dec) => round(base + (Math.random() - 0.5) * amp, dec);
     const m = {
       is_raining: s.is_raining,
@@ -94,7 +111,42 @@ function agoText(iso) {
       active_alerts: s.active_alerts,
     };
     return { updated: isoNow(), lookback_hours: LOOKBACK, mqtt_connected: s.connected,
-             metrics: m, rules: deriveRules(m) };
+             manual_control: MANUAL_CONTROL, metrics: m, rules: deriveRules(m),
+             variables: variables.map(v => ({ ...v })) };
+  }
+
+  function ctlButtons(r) {
+    const cur = r.manual || "auto";
+    const mk = (st, lbl) => '<button type="button" class="mini ' + (cur === st ? "" : "secondary") +
+      '" data-state="' + st + '" style="margin:0;padding:5px 11px;font-size:12px">' + lbl + '</button>';
+    return '<div class="ctl" data-device="' + esc(r.name) +
+      '" style="display:flex;gap:5px;margin-top:8px">' + mk("auto", "Auto") + mk("on", "On") + mk("off", "Off") + '</div>';
+  }
+
+  function renderVars(vars, manualControl) {
+    const card = document.getElementById("vars-card");
+    const box = document.getElementById("vars-body");
+    if (!card || !box) return;
+    if (!vars.length) { card.style.display = "none"; return; }
+    card.style.display = "";
+    box.innerHTML = "";
+    for (const v of vars) {
+      let ctrl;
+      if (!manualControl) {
+        ctrl = '<span class="v">' + esc(fmt(v.value)) + "</span>";
+      } else if (v.type === "bool") {
+        const on = v.value === true;
+        ctrl = '<button type="button" class="mini ' + (on ? "" : "secondary") + '" data-var="' + esc(v.name) +
+          '" data-next="' + (on ? "false" : "true") + '" style="margin:0">' + (on ? "ON" : "OFF") + "</button>";
+      } else {
+        ctrl = '<input class="var-num" data-var="' + esc(v.name) + '" type="number" step="any" value="' +
+          (v.value != null ? esc(v.value) : "") + '" style="width:120px;margin:0">';
+      }
+      const cell = document.createElement("div"); cell.className = "metric";
+      cell.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:10px";
+      cell.innerHTML = '<div class="k">' + esc(v.name) + "</div><div>" + ctrl + "</div>";
+      box.appendChild(cell);
+    }
   }
 
   function render(s) {
@@ -102,24 +154,25 @@ function agoText(iso) {
     const up = !!s.mqtt_connected;
     conn.innerHTML = '<span class="dot ' + (up ? "up" : "down") + '"></span>MQTT ' + (up ? "connected" : "offline");
 
-    // Headline device: prefer the irrigation rule (back-compat), else the first
-    // rule with a known state, else the first rule.
-    const irr = s.rules.find(r => /irrigation|rain_inhibit/.test(r.name || ""))
-             || s.rules.find(r => r.active !== null && r.active !== undefined)
-             || s.rules[0];
-    const d = document.getElementById("directive");
+    // Headline device: prefer the irrigation rule (back-compat), else first
+    // enabled rule with a known state, else the first rule.
+    const rules = s.rules;
+    const irr = rules.find(r => r.enabled !== false && /irrigation|rain_inhibit/.test(r.name || ""))
+             || rules.find(r => r.enabled !== false && r.active !== null && r.active !== undefined)
+             || rules[0];
+    const dEl = document.getElementById("directive");
     const card = document.getElementById("directive-card");
     let st = "unknown";
     if (irr && irr.active !== null && irr.active !== undefined) {
       const isIrr = /irrigation|rain_inhibit/.test(irr.name || "");
       st = irr.active ? "inhibit" : "allow";
-      d.className = "big " + st;
+      dEl.className = "big " + st;
       const suffix = isIrr ? (irr.active ? " — do NOT water" : " — watering allowed")
                            : (irr.active ? " — active" : " — clear");
       setText("directive", irr.current_payload + suffix);
       setText("directive-sub", "topic " + irr.topic + (irr.last_change ? " · changed " + agoText(irr.last_change) : ""));
     } else {
-      d.className = "big unknown"; setText("directive", "UNKNOWN");
+      dEl.className = "big unknown"; setText("directive", "UNKNOWN");
       setText("directive-sub", irr ? "Waiting on data…" : "No rules configured.");
     }
     if (card) card.className = "card state-" + st;
@@ -137,15 +190,23 @@ function agoText(iso) {
     const alerts = m.active_alerts.length ? m.active_alerts.join(", ") : "none";
     setText("forecast", m.short_forecast + " · alerts: " + alerts);
 
+    renderVars(s.variables || [], !!s.manual_control);
+
     const tb = document.getElementById("rulebody");
     tb.innerHTML = "";
-    for (const r of s.rules) {
-      const pill = r.enabled === false ? '<span class="pill na">disabled</span>'
-        : (r.active ? '<span class="pill on">active</span>' : '<span class="pill off">clear</span>');
+    for (const r of rules) {
+      let pill;
+      if (r.enabled === false) pill = '<span class="pill na">disabled</span>';
+      else if (r.active === null || r.active === undefined) pill = '<span class="pill na">n/a</span>';
+      else if (r.active) pill = '<span class="pill on">active</span>';
+      else pill = '<span class="pill off">clear</span>';
+      if (r.manual && r.manual !== "auto") pill += ' <span class="pill na">manual ' + esc(r.manual) + "</span>";
+      if (s.manual_control && r.enabled !== false) pill += ctlButtons(r);
       const tr = document.createElement("tr");
       tr.innerHTML = "<td>" + esc(r.name) + '<div class="muted">' + esc(r.description) + "</div></td>" +
         "<td><code>" + esc(r.topic) + "</code></td><td>" + pill + "</td>" +
-        "<td>" + esc(r.current_payload) + '</td><td class="muted">' + esc(agoText(r.last_change)) + "</td>";
+        "<td>" + (r.current_payload != null ? esc(r.current_payload) : "—") + '</td>' +
+        '<td class="muted">' + esc(agoText(r.last_change)) + "</td>";
       tb.appendChild(tr);
     }
     const dash = document.getElementById("dash");
@@ -153,6 +214,28 @@ function agoText(iso) {
   }
 
   function tick() { render(buildState()); }
+
+  // Demo control wiring: manual device buttons + variable toggles mutate the
+  // mock state in place (no network) and re-render.
+  document.getElementById("rulebody").addEventListener("click", e => {
+    const b = e.target.closest("button[data-state]"); if (!b) return;
+    const wrap = b.closest(".ctl"); if (!wrap) return;
+    manual[wrap.getAttribute("data-device")] = b.getAttribute("data-state");
+    tick(); toast("Manual: " + wrap.getAttribute("data-device") + " → " + b.getAttribute("data-state"));
+  });
+  const vb = document.getElementById("vars-body");
+  if (vb) {
+    vb.addEventListener("click", e => {
+      const b = e.target.closest("button[data-var]"); if (!b) return;
+      const v = variables.find(x => x.name === b.getAttribute("data-var"));
+      if (v) { v.value = b.getAttribute("data-next") === "true"; tick(); toast(v.name + " = " + v.value); }
+    });
+    vb.addEventListener("change", e => {
+      const i = e.target.closest("input.var-num[data-var]"); if (!i) return;
+      const v = variables.find(x => x.name === i.getAttribute("data-var"));
+      if (v) { v.value = Number(i.value); toast(v.name + " = " + v.value); }
+    });
+  }
 
   document.querySelectorAll(".chip[data-scn]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -176,14 +259,11 @@ function agoText(iso) {
   if (!form) return;
 
   function validateField(el) {
-    // scope to THIS field's own error box (direct child of its wrapper), not the
-    // first .field-err in an ancestor card
     const errBox = el.parentElement.querySelector(":scope > .field-err");
     const raw = (el.value || "").trim();
     const type = el.dataset.type;          // "num" | "int" | undefined
     let err = "";
     if (raw === "") {
-      // numeric fields and explicitly-required text fields can't be blank
       if (type || el.dataset.required) err = "Required.";
     } else if (type) {
       const n = Number(raw);
@@ -202,6 +282,16 @@ function agoText(iso) {
     el.addEventListener("blur", () => validateField(el));
   });
 
+  // Manual control requires a login — mirror the server's fail-closed refusal.
+  function manualGuard() {
+    const amc = form.querySelector("[name=web_allow_manual_control]");
+    if (!amc) return true;
+    if (amc.value !== "true") return true;
+    const u = (form.querySelector("[name=web_username]") || {}).value || "";
+    const p = (form.querySelector("[name=web_password]") || {}).value || "";
+    return !!(u.trim() && p.trim());
+  }
+
   form.addEventListener("submit", e => {
     e.preventDefault();
     let ok = true;
@@ -209,6 +299,7 @@ function agoText(iso) {
       if (!validateField(el)) ok = false;
     });
     if (!ok) { toast("Could not save: fix the highlighted fields.", true); return; }
+    if (!manualGuard()) { toast("Manual control needs a web login (set a username and password).", true); return; }
     toast("Settings saved (demo — nothing was written).");
   });
 })();
@@ -221,121 +312,147 @@ function agoText(iso) {
   const form = document.getElementById("rules-form");
   if (!form) return;
 
+  const NUM = ["<", "<=", ">", ">=", "==", "!=", "between", "in", "changed"];
+  const BOOLO = ["==", "!=", "changed"];
+  const TXT = ["contains", "equals", "in", "changed"];
+  // Built-ins + schedule metrics + a few "discovered" dynamic metrics (as if a
+  // config declared variables / mqtt_in / http_poll), so the dropdowns show the
+  // same dynamic discovery the live builder does.
   const METRICS = {
-    is_raining:                {type:"bool",   ops:["==","!="]},
-    precip_accum_in:           {type:"number", ops:["<","<=",">",">=","==","!="]},
-    precipitation_probability: {type:"number", ops:["<","<=",">",">=","==","!="]},
-    temperature:               {type:"number", ops:["<","<=",">",">=","==","!="]},
-    wind_speed_mph:            {type:"number", ops:["<","<=",">",">=","==","!="]},
-    humidity:                  {type:"number", ops:["<","<=",">",">=","==","!="]},
-    short_forecast:            {type:"text",   ops:["contains","equals"]},
-    active_alert:              {type:"alert",  ops:["any","contains","equals"]},
+    is_raining:                { type: "bool",   ops: ["==", "!=", "changed"] },
+    precip_accum_in:           { type: "number", ops: NUM },
+    precipitation_probability: { type: "number", ops: NUM },
+    temperature:               { type: "number", ops: NUM },
+    wind_speed_mph:            { type: "number", ops: NUM },
+    humidity:                  { type: "number", ops: NUM },
+    short_forecast:            { type: "text",   ops: TXT },
+    active_alert:              { type: "alert",  ops: ["any", "contains", "equals"] },
+    time_hour:                 { type: "number", ops: NUM },
+    time_minute:               { type: "number", ops: NUM },
+    time_weekday:              { type: "text",   ops: TXT },
+    time_is_weekend:           { type: "bool",   ops: BOOLO },
+    time_is_daytime:           { type: "bool",   ops: BOOLO },
+    var_maintenance_mode:      { type: "bool",   ops: BOOLO },
+    var_temp_setpoint:         { type: "number", ops: NUM },
+    tank_level:                { type: "number", ops: NUM },
+    power_kw:                  { type: "number", ops: NUM },
   };
   const METRIC_NAMES = Object.keys(METRICS);
   const builder = document.getElementById("builder");
 
-  /* ---- builder ---------------------------------------------------------- */
-  function el(tag, cls, html){ const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }
-  function opt(v, label, sel){ const o=document.createElement("option"); o.value=v; o.textContent=label||v; if(sel)o.selected=true; return o; }
+  function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+  function opt(v, label, sel) { const o = document.createElement("option"); o.value = v; o.textContent = label || v; if (sel) o.selected = true; return o; }
 
-  function valueControl(metric, value){
-    const meta = METRICS[metric] || {type:"text"};
+  function valueControl(metric, operator, value) {
+    const meta = METRICS[metric] || { type: "text" };
     let c;
-    if(meta.type==="bool"){
-      c=document.createElement("select"); c.className="c-val";
-      c.appendChild(opt("true","true", String(value)==="true"));
-      c.appendChild(opt("false","false", String(value)!=="true"));
-    } else if(meta.type==="number"){
-      c=document.createElement("input"); c.className="c-val"; c.type="number"; c.step="any";
-      c.value = value!=null ? value : ""; c.placeholder="number";
+    if (operator === "between") {
+      c = document.createElement("input"); c.className = "c-val"; c.type = "text";
+      c.value = value != null ? value : ""; c.placeholder = "low, high";
+    } else if (operator === "in") {
+      c = document.createElement("input"); c.className = "c-val"; c.type = "text";
+      c.value = value != null ? value : ""; c.placeholder = meta.type === "number" ? "e.g. 30, 50, 70" : "a, b, c";
+    } else if (meta.type === "bool") {
+      c = document.createElement("select"); c.className = "c-val";
+      c.appendChild(opt("true", "true", String(value) === "true"));
+      c.appendChild(opt("false", "false", String(value) !== "true"));
+    } else if (meta.type === "number") {
+      c = document.createElement("input"); c.className = "c-val"; c.type = "number"; c.step = "any";
+      c.value = value != null ? value : ""; c.placeholder = "number";
     } else {
-      c=document.createElement("input"); c.className="c-val"; c.type="text";
-      c.value = value!=null ? value : ""; c.placeholder="text";
+      c = document.createElement("input"); c.className = "c-val"; c.type = "text";
+      c.value = value != null ? value : ""; c.placeholder = "text";
     }
-    c.setAttribute("aria-label","condition value");
+    c.setAttribute("aria-label", "condition value");
     return c;
   }
-  function fillOps(sel, metric, chosen){
-    sel.innerHTML="";
-    const ops=(METRICS[metric]||{ops:[]}).ops;
-    ops.forEach(o=> sel.appendChild(opt(o,o, o===chosen)));
-    if(!ops.includes(chosen) && ops.length) sel.value=ops[0];
+  function fillOps(sel, metric, chosen) {
+    sel.innerHTML = "";
+    const ops = (METRICS[metric] || { ops: [] }).ops;
+    ops.forEach(o => sel.appendChild(opt(o, o, o === chosen)));
+    if (!ops.includes(chosen) && ops.length) sel.value = ops[0];
   }
-  function condRow(cond){
-    cond = cond || {metric:METRIC_NAMES[0], operator:"", value:""};
-    const row = el("div","cond row");
-    const metricWrap = el("div"); const m=document.createElement("select"); m.className="c-metric";
-    m.setAttribute("aria-label","metric");
-    METRIC_NAMES.forEach(n=> m.appendChild(opt(n,n, n===cond.metric)));
-    if(!METRICS[cond.metric]) m.value=METRIC_NAMES[0];
+  function condRow(cond) {
+    cond = cond || { metric: METRIC_NAMES[0], operator: "", value: "", for: "" };
+    const row = el("div", "cond row");
+    const metricWrap = el("div"); const m = document.createElement("select"); m.className = "c-metric";
+    m.setAttribute("aria-label", "metric");
+    METRIC_NAMES.forEach(n => m.appendChild(opt(n, n, n === cond.metric)));
+    if (!METRICS[cond.metric]) m.value = METRIC_NAMES[0];
     metricWrap.appendChild(m);
-    const opWrap = el("div"); const o=document.createElement("select"); o.className="c-op";
-    o.setAttribute("aria-label","operator");
+    const opWrap = el("div"); const o = document.createElement("select"); o.className = "c-op";
+    o.setAttribute("aria-label", "operator");
     fillOps(o, m.value, cond.operator); opWrap.appendChild(o);
-    const valWrap = el("div","c-val-wrap"); valWrap.appendChild(valueControl(m.value, cond.value));
-    const rmWrap = el("div","rm"); const rm=el("button","secondary danger mini","×"); rm.type="button"; rmWrap.appendChild(rm);
-    function syncValVisible(){
-      const meta=METRICS[m.value]||{};
-      valWrap.style.display = (meta.type==="alert" && o.value==="any") ? "none" : "";
-    }
-    m.addEventListener("change", ()=>{ fillOps(o, m.value, o.value);
-      valWrap.innerHTML=""; valWrap.appendChild(valueControl(m.value, null)); syncValVisible(); });
-    o.addEventListener("change", syncValVisible);
-    rm.addEventListener("click", ()=>{ const card=row.closest(".rule-card"); row.remove(); refreshCombine(card); });
+    const valWrap = el("div", "c-val-wrap"); valWrap.appendChild(valueControl(m.value, o.value, cond.value));
+    const forWrap = el("div", "c-for-wrap"); const f = document.createElement("input"); f.className = "c-for"; f.type = "text";
+    f.placeholder = "for (e.g. 10m)"; f.value = cond.for || ""; f.setAttribute("aria-label", "sustain duration");
+    f.title = "optional: the condition must hold continuously this long (e.g. 30s, 10m, 2h)";
+    forWrap.appendChild(f);
+    const rmWrap = el("div", "rm"); const rm = el("button", "secondary danger mini", "×"); rm.type = "button"; rmWrap.appendChild(rm);
+    function noValue() { const meta = METRICS[m.value] || {}; return o.value === "changed" || (meta.type === "alert" && o.value === "any"); }
+    function syncValVisible() { valWrap.style.display = noValue() ? "none" : ""; }
+    function rebuildVal(keep) { valWrap.innerHTML = ""; valWrap.appendChild(valueControl(m.value, o.value, keep)); syncValVisible(); }
+    m.addEventListener("change", () => { fillOps(o, m.value, o.value); rebuildVal(null); });
+    o.addEventListener("change", () => rebuildVal(null));
+    rm.addEventListener("click", () => { const card = row.closest(".rule-card"); row.remove(); refreshCombine(card); });
     syncValVisible();
-    row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(rmWrap);
+    row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
     return row;
   }
-  function refreshCombine(card){
-    if(!card) return;
-    card.querySelector(".combine-wrap").style.display = card.querySelectorAll(".cond").length>1 ? "" : "none";
+  function refreshCombine(card) {
+    if (!card) return;
+    card.querySelector(".combine-wrap").style.display = card.querySelectorAll(".cond").length > 1 ? "" : "none";
   }
-  function ruleCard(rule){
-    rule = rule || {name:"",description:"",topic:"",on_match:"",on_clear:"",combine:"any",conditions:[]};
-    const card = el("div","rule-card");
+  function ruleCard(rule) {
+    rule = rule || { name: "", description: "", topic: "", on_match: "", on_clear: "", enabled: true, combine: "any", conditions: [] };
+    const card = el("div", "rule-card");
     card.innerHTML =
-      '<div class="rhead"><span class="idx"></span></div>'+
-      '<div class="row"><div><label>Name <input class="f-name"></label></div>'+
-      '<div><label>Topic <input class="f-topic"></label></div></div>'+
-      '<label>Description <span class="hint">(optional)</span> <input class="f-desc"></label>'+
-      '<div class="row"><div><label>Payload when matched <span class="hint">(on_match)</span> <input class="f-onmatch"></label></div>'+
-      '<div><label>Payload when cleared <span class="hint">(on_clear, optional)</span> <input class="f-onclear"></label></div></div>'+
-      '<div class="combine-wrap"><label>When there are multiple conditions, match'+
-      ' <select class="f-combine"></select></label></div>'+
-      '<label style="margin-top:14px">Conditions</label><div class="conds"></div>'+
-      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button>'+
+      '<div class="rhead"><span class="idx"></span>' +
+      '<label class="enabled-lbl" style="display:flex;align-items:center;gap:7px;margin:0;font-weight:600" ' +
+      'title="Disabled rules are not evaluated and publish nothing">' +
+      '<input type="checkbox" class="f-enabled" style="width:auto;margin:0"> enabled</label></div>' +
+      '<div class="row"><div><label>Name <input class="f-name"></label></div>' +
+      '<div><label>Topic <input class="f-topic"></label></div></div>' +
+      '<label>Description <span class="hint">(optional)</span> <input class="f-desc"></label>' +
+      '<div class="row"><div><label>Payload when matched <span class="hint">(on_match)</span> <input class="f-onmatch"></label></div>' +
+      '<div><label>Payload when cleared <span class="hint">(on_clear, optional)</span> <input class="f-onclear"></label></div></div>' +
+      '<div class="combine-wrap"><label>When there are multiple conditions, match' +
+      ' <select class="f-combine"></select></label></div>' +
+      '<label style="margin-top:14px">Conditions</label><div class="conds"></div>' +
+      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button>' +
       '<button type="button" class="danger mini remove-rule">Remove rule</button></div>';
-    card.querySelector(".f-name").value = rule.name||"";
-    card.querySelector(".f-topic").value = rule.topic||"";
-    card.querySelector(".f-desc").value = rule.description||"";
-    card.querySelector(".f-onmatch").value = rule.on_match||"";
-    card.querySelector(".f-onclear").value = rule.on_clear||"";
+    card.querySelector(".f-name").value = rule.name || "";
+    card.querySelector(".f-topic").value = rule.topic || "";
+    card.querySelector(".f-desc").value = rule.description || "";
+    card.querySelector(".f-onmatch").value = rule.on_match || "";
+    card.querySelector(".f-onclear").value = rule.on_clear || "";
+    card.querySelector(".f-enabled").checked = rule.enabled !== false;
     const comb = card.querySelector(".f-combine");
-    comb.appendChild(opt("any","ANY is true (OR)", rule.combine!=="all"));
-    comb.appendChild(opt("all","ALL are true (AND)", rule.combine==="all"));
+    comb.appendChild(opt("any", "ANY is true (OR)", rule.combine !== "all"));
+    comb.appendChild(opt("all", "ALL are true (AND)", rule.combine === "all"));
     const conds = card.querySelector(".conds");
-    (rule.conditions && rule.conditions.length ? rule.conditions : [null]).forEach(c=> conds.appendChild(condRow(c)));
-    card.querySelector(".add-cond").addEventListener("click", ()=>{ conds.appendChild(condRow()); refreshCombine(card); });
-    card.querySelector(".remove-rule").addEventListener("click", ()=>{ card.remove(); reindex(); });
+    (rule.conditions && rule.conditions.length ? rule.conditions : [null]).forEach(c => conds.appendChild(condRow(c)));
+    card.querySelector(".add-cond").addEventListener("click", () => { conds.appendChild(condRow()); refreshCombine(card); });
+    card.querySelector(".remove-rule").addEventListener("click", () => { card.remove(); reindex(); });
     refreshCombine(card);
     return card;
   }
-  function reindex(){
-    [...builder.querySelectorAll(".rule-card")].forEach((c,i)=>{
-      c.querySelector(".idx").textContent = "Rule "+(i+1)+(i===0?" · irrigation":"");
+  function reindex() {
+    [...builder.querySelectorAll(".rule-card")].forEach((c, i) => {
+      c.querySelector(".idx").textContent = "Rule " + (i + 1) + (i === 0 ? " · headline" : "");
     });
   }
-  function collect(){
-    return [...builder.querySelectorAll(".rule-card")].map(card=>{
-      const conds = [...card.querySelectorAll(".cond")].map(row=>{
-        const metric=row.querySelector(".c-metric").value;
-        const operator=row.querySelector(".c-op").value;
-        const meta=METRICS[metric]||{};
-        let value="";
-        if(!(meta.type==="alert" && operator==="any")){
-          const ctrl=row.querySelector(".c-val-wrap .c-val"); value=ctrl?ctrl.value:"";
-        }
-        return {metric, operator, value};
+  function collect() {
+    return [...builder.querySelectorAll(".rule-card")].map(card => {
+      const conds = [...card.querySelectorAll(".cond")].map(row => {
+        const metric = row.querySelector(".c-metric").value;
+        const operator = row.querySelector(".c-op").value;
+        const meta = METRICS[metric] || {};
+        const noVal = operator === "changed" || (meta.type === "alert" && operator === "any");
+        let value = "";
+        if (!noVal) { const ctrl = row.querySelector(".c-val"); value = ctrl ? ctrl.value : ""; }
+        const forv = (row.querySelector(".c-for").value || "").trim();
+        return { metric, operator, value, for: forv };
       });
       return {
         name: card.querySelector(".f-name").value.trim(),
@@ -343,94 +460,111 @@ function agoText(iso) {
         topic: card.querySelector(".f-topic").value.trim(),
         on_match: card.querySelector(".f-onmatch").value,
         on_clear: card.querySelector(".f-onclear").value,
+        enabled: card.querySelector(".f-enabled").checked,
         combine: card.querySelector(".f-combine").value,
         conditions: conds,
       };
     });
   }
-  function validateForm(data){
-    if(!data.length) return "Add at least one rule.";
-    for(let i=0;i<data.length;i++){
-      const r=data[i], label="Rule "+(i+1);
-      if(!r.name) return label+": name is required.";
-      if(!r.topic) return "Rule '"+r.name+"': topic is required.";
-      if(r.on_match==="") return "Rule '"+r.name+"': the on_match payload is required.";
-      if(!r.conditions.length) return "Rule '"+r.name+"': add at least one condition.";
-      for(const c of r.conditions){
-        const meta=METRICS[c.metric]||{};
-        if(meta.type==="alert" && c.operator==="any") continue;
-        if(c.value==="") return "Rule '"+r.name+"': the "+c.metric+" condition needs a value.";
-        if(meta.type==="number" && isNaN(Number(c.value))) return "Rule '"+r.name+"': "+c.metric+" needs a numeric value.";
+  function validateForm(data) {
+    if (!data.length) return "Add at least one rule.";
+    const durRe = /^\d+(\.\d+)?\s*[smh]?$/;
+    for (let i = 0; i < data.length; i++) {
+      const r = data[i], label = "Rule " + (i + 1);
+      if (!r.name) return label + ": name is required.";
+      if (!r.topic) return "Rule '" + r.name + "': topic is required.";
+      if (r.on_match === "") return "Rule '" + r.name + "': the on_match payload is required.";
+      if (!r.conditions.length) return "Rule '" + r.name + "': add at least one condition.";
+      for (const c of r.conditions) {
+        const meta = METRICS[c.metric] || {};
+        if (c.for && !durRe.test(c.for.trim())) return "Rule '" + r.name + "': '" + c.metric + "' for must be a duration like 10m, 30s, 2h.";
+        if (c.operator === "changed") continue;
+        if (meta.type === "alert" && c.operator === "any") continue;
+        if (c.operator === "between") {
+          const ps = c.value.split(",").map(s => s.trim()).filter(s => s !== "");
+          if (ps.length !== 2 || ps.some(p => isNaN(Number(p)))) return "Rule '" + r.name + "': " + c.metric + " between needs two numbers 'low, high'.";
+          continue;
+        }
+        if (c.operator === "in") {
+          const ps = c.value.split(",").map(s => s.trim()).filter(s => s !== "");
+          if (!ps.length) return "Rule '" + r.name + "': " + c.metric + " in needs at least one value.";
+          if (meta.type === "number" && ps.some(p => isNaN(Number(p)))) return "Rule '" + r.name + "': " + c.metric + " in needs numeric values.";
+          continue;
+        }
+        if (c.value === "") return "Rule '" + r.name + "': the " + c.metric + " condition needs a value.";
+        if (meta.type === "number" && isNaN(Number(c.value))) return "Rule '" + r.name + "': " + c.metric + " needs a numeric value.";
       }
     }
     return "";
   }
 
-  document.getElementById("add-rule").addEventListener("click", ()=>{ builder.appendChild(ruleCard()); reindex(); });
-  document.querySelectorAll(".tab").forEach(t=> t.addEventListener("click", ()=>{
-    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  document.getElementById("add-rule").addEventListener("click", () => { builder.appendChild(ruleCard()); reindex(); });
+  document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
     t.classList.add("active");
-    document.getElementById("tab-form").style.display = t.dataset.tab==="form"?"":"none";
-    document.getElementById("tab-yaml").style.display = t.dataset.tab==="yaml"?"":"none";
+    document.getElementById("tab-form").style.display = t.dataset.tab === "form" ? "" : "none";
+    document.getElementById("tab-yaml").style.display = t.dataset.tab === "yaml" ? "" : "none";
   }));
 
   /* ---- YAML tab (heuristic shape check) --------------------------------- */
   const ta = document.getElementById("rules_yaml");
   const errBox = document.getElementById("rules-err");
-  function validateYaml(text){
+  function validateYaml(text) {
     if (!text.trim()) return "Rules list is empty.";
     const lines = text.replace(/\t/g, "  ").split("\n");
-    const items = []; let cur=null, startLine=0;
-    lines.forEach((ln,i)=>{
-      if(/^- /.test(ln)){ if(cur!==null) items.push({text:cur,line:startLine}); cur=ln+"\n"; startLine=i+1; }
-      else if(cur!==null){ cur+=ln+"\n"; }
+    const items = []; let cur = null, startLine = 0;
+    lines.forEach((ln, i) => {
+      if (/^- /.test(ln)) { if (cur !== null) items.push({ text: cur, line: startLine }); cur = ln + "\n"; startLine = i + 1; }
+      else if (cur !== null) { cur += ln + "\n"; }
     });
-    if(cur!==null) items.push({text:cur,line:startLine});
-    if(!items.length) return "Expected a YAML list (each rule starts with '- ').";
-    for(let k=0;k<items.length;k++){
-      const blk=items[k].text.replace(/^- /,"  ");
-      const label="rule #"+(k+1)+" (line "+items[k].line+")";
-      for(const key of ["name","when","topic","on_match"])
-        if(!new RegExp("(^|\\n)\\s*"+key+":").test(blk)) return label+": missing '"+key+"'.";
-      const mm=blk.match(/metric:\s*([A-Za-z_]+)/g)||[];
-      if(!mm.length) return label+": needs at least one 'metric:' under 'when'.";
-      for(const x of mm){ const n=x.split(":")[1].trim(); if(!METRIC_NAMES.includes(n)) return label+": unknown metric '"+n+"'."; }
-      const pl=blk.match(/(on_match|on_clear):\s*([^\n#]*)/g)||[];
-      for(const p of pl){ const v=p.split(":").slice(1).join(":").trim();
-        if(/^(on|off|yes|no|true|false)$/i.test(v)) return label+": quote the payload \""+v+"\" (unquoted it becomes a boolean)."; }
+    if (cur !== null) items.push({ text: cur, line: startLine });
+    if (!items.length) return "Expected a YAML list (each rule starts with '- ').";
+    for (let k = 0; k < items.length; k++) {
+      const blk = items[k].text.replace(/^- /, "  ");
+      const label = "rule #" + (k + 1) + " (line " + items[k].line + ")";
+      for (const key of ["name", "when", "topic", "on_match"])
+        if (!new RegExp("(^|\\n)\\s*" + key + ":").test(blk)) return label + ": missing '" + key + "'.";
+      const mm = blk.match(/metric:\s*([A-Za-z_0-9]+)/g) || [];
+      if (!mm.length) return label + ": needs at least one 'metric:' under 'when'.";
+      for (const x of mm) { const n = x.split(":")[1].trim(); if (!METRIC_NAMES.includes(n)) return label + ": unknown metric '" + n + "'."; }
+      const pl = blk.match(/(on_match|on_clear):\s*([^\n#]*)/g) || [];
+      for (const p of pl) {
+        const v = p.split(":").slice(1).join(":").trim();
+        if (/^(on|off|yes|no|true|false)$/i.test(v)) return label + ": quote the payload \"" + v + "\" (unquoted it becomes a boolean).";
+      }
     }
     return "";
   }
-  function checkYaml(showOk){
-    const err=validateYaml(ta.value); errBox.textContent=err; errBox.style.color=err?"#fda4a4":"#86efac";
-    if(!err && showOk) errBox.textContent="Looks valid ✓"; return !err;
+  function checkYaml(showOk) {
+    const err = validateYaml(ta.value); errBox.textContent = err; errBox.style.color = err ? "#fda4a4" : "#86efac";
+    if (!err && showOk) errBox.textContent = "Looks valid ✓"; return !err;
   }
-  const EXAMPLE = "\n- name: high_wind_hold\n  description: \"Pause watering in high wind\"\n  when:\n    metric: wind_speed_mph\n    operator: \">=\"\n    value: 25\n  topic: \"facility/weather/high_wind\"\n  on_match: \"1\"\n  on_clear: \"0\"\n";
-  document.getElementById("add-example").addEventListener("click", ()=>{ ta.value=ta.value.replace(/\s*$/,"")+"\n"+EXAMPLE; ta.focus(); checkYaml(true); });
-  document.getElementById("check").addEventListener("click", ()=> checkYaml(true));
-  ta.addEventListener("input", ()=>{ errBox.textContent=""; });
+  const EXAMPLE = "\n- name: vent_fan\n  enabled: true\n  when:\n    all:\n      - { metric: temperature, operator: \">\", value: 85, for: \"10m\" }\n      - { metric: time_is_daytime, operator: \"==\", value: true }\n  topic: \"facility/vent_fan\"\n  on_match: \"ON\"\n  on_clear: \"OFF\"\n";
+  document.getElementById("add-example").addEventListener("click", () => { ta.value = ta.value.replace(/\s*$/, "") + "\n" + EXAMPLE; ta.focus(); checkYaml(true); });
+  document.getElementById("check").addEventListener("click", () => checkYaml(true));
+  ta.addEventListener("input", () => { errBox.textContent = ""; });
 
   /* ---- submit (mode depends on which Save was clicked) ------------------ */
   let mode = "form";
-  document.getElementById("save-form").addEventListener("click", ()=> mode="form");
-  document.getElementById("save-yaml").addEventListener("click", ()=> mode="yaml");
-  form.addEventListener("submit", e=>{
+  document.getElementById("save-form").addEventListener("click", () => mode = "form");
+  document.getElementById("save-yaml").addEventListener("click", () => mode = "yaml");
+  form.addEventListener("submit", e => {
     e.preventDefault();
-    if(mode==="form"){
-      const data=collect(); const err=validateForm(data);
-      const box=document.getElementById("form-err");
-      box.textContent=err; box.style.color="#fda4a4";
-      if(err){ toast("Could not save: "+err, true); return; }
+    if (mode === "form") {
+      const data = collect(); const err = validateForm(data);
+      const box = document.getElementById("form-err");
+      box.textContent = err; box.style.color = "#fda4a4";
+      if (err) { toast("Could not save: " + err, true); return; }
       toast("Rules saved (demo — nothing was written).");
     } else {
-      if(checkYaml(false)) toast("Rules saved (demo — nothing was written).");
-      else toast("Could not save: "+errBox.textContent, true);
+      if (checkYaml(false)) toast("Rules saved (demo — nothing was written).");
+      else toast("Could not save: " + errBox.textContent, true);
     }
   });
 
   /* ---- initial render --------------------------------------------------- */
   const INITIAL = window.DEMO_RULES || [];
-  (INITIAL.length ? INITIAL : [null]).forEach(r=> builder.appendChild(ruleCard(r)));
+  (INITIAL.length ? INITIAL : [null]).forEach(r => builder.appendChild(ruleCard(r)));
   reindex();
   document.querySelector('.tab[data-tab="form"]').click();
 })();

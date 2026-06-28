@@ -9,13 +9,21 @@ ordinary web host (e.g. cPanel) without installing Python, Flask, or MQTT.
 
 ```
 demo/
-├── index.html      Dashboard  — live-style conditions + irrigation directive
+├── index.html      Dashboard  — conditions, device states, a Variables card,
+│                                and manual Auto/On/Off controls
 ├── settings.html   Settings   — full config form with in-browser validation
+│                                (incl. Slack, remote status, manual control)
 ├── rules.html      Rules      — form rule builder + YAML editor (both validated)
 └── assets/
     ├── style.css   Shared theme (mirrors the live app)
     └── app.js      Mock data + interactivity (no backend, no dependencies)
 ```
+
+It mirrors the current `webui.py`: the rule builder offers the full operator set
+(`between`/`in`/`changed`, a per-condition `for`, the `enabled` toggle) and
+discovers schedule, variable, and input metrics; the dashboard has a Variables
+card and per-device manual controls. Everything is mock — clicks update local
+state and show a toast; nothing is published or saved.
 
 No build step, no external CDNs, no cookies — just static files.
 
