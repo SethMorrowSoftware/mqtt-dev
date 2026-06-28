@@ -14,6 +14,7 @@ demo/
 ├── settings.html   Settings   — full config form with in-browser validation
 │                                (incl. Slack, remote status, manual control)
 ├── rules.html      Rules      — form rule builder + YAML editor (both validated)
+├── activity.html   Activity   — read-only audit log of state changes (sample data)
 └── assets/
     ├── style.css   Shared theme (mirrors the live app)
     └── app.js      Mock data + interactivity (no backend, no dependencies)

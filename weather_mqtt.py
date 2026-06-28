@@ -1390,6 +1390,26 @@ def audit(path, **event):
         LOG.warning("Could not write audit log %s: %s", path, e)
 
 
+def read_audit(path, limit=200):
+    """Return the most recent audit events (newest first), up to `limit`.
+    Robust to a missing file or unparseable lines."""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except Exception:
+        return []
+    out = []
+    for ln in lines[-limit:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            continue
+    out.reverse()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------

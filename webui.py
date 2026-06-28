@@ -290,6 +290,7 @@ BASE = """
   <a href="{{ url_for('dashboard') }}" class="{{ 'active' if page=='dash' }}">Dashboard</a>
   <a href="{{ url_for('settings') }}" class="{{ 'active' if page=='settings' }}">Settings</a>
   <a href="{{ url_for('rules') }}" class="{{ 'active' if page=='rules' }}">Rules</a>
+  <a href="{{ url_for('activity') }}" class="{{ 'active' if page=='activity' }}">Activity</a>
  </nav>
  <span class="spacer"></span>
  <span class="conn" id="connstate"><span class="dot idle"></span>weather-mqtt</span>
@@ -622,6 +623,17 @@ def api_variable():
     return jsonify({"ok": True, "variable": name, "value": coerced})
 
 
+@app.route("/api/audit")
+@require_auth
+def api_audit():
+    """Recent audit events (newest first) for the Activity page."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    return jsonify({"events": core.read_audit(cfg.get("audit_file", "audit.log"), 200)})
+
+
 @app.route("/healthz")
 def healthz():
     """Unauthenticated liveness + freshness probe for systemd/monitoring."""
@@ -648,6 +660,76 @@ def healthz():
 @app.route("/favicon.ico")
 def favicon():
     return Response(status=204)
+
+
+# ---------------------------------------------------------------------------
+# Activity (audit log viewer)
+# ---------------------------------------------------------------------------
+ACTIVITY = """
+<div class="card">
+  <div class="toprow">
+    <div><h3 style="margin:0">Activity</h3>
+      <p class="muted" style="margin:4px 0 0">Every device state change (automatic or manual) and operator
+       action, newest first. Read-only.</p></div>
+    <div class="muted" id="act-count">—</div>
+  </div>
+  <div class="table-wrap" style="margin-top:12px">
+    <table>
+      <thead><tr><th>When</th><th>What</th><th>Action</th><th>Detail</th><th>By</th></tr></thead>
+      <tbody id="actbody"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <p class="muted" style="margin-top:12px">Refreshes every {{ refresh }}s · source: <code>audit.log</code>.
+   Activity is recorded only when a device's committed state changes or an operator acts.</p>
+</div>
+<script>
+const REFRESH = {{ refresh }} * 1000;
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function agoText(iso){
+  if(!iso) return "—"; const t=Date.parse(iso); if(isNaN(t)) return iso;
+  const s=Math.max(0,Math.round((Date.now()-t)/1000));
+  if(s<5) return "just now"; if(s<60) return s+"s ago";
+  if(s<3600) return Math.round(s/60)+"m ago"; return Math.round(s/3600)+"h ago";
+}
+function describe(e){
+  // Normalize the monitor's and the web UI's event shapes into one readable row.
+  if(e.action==="manual_set")   return {what:e.device, action:"manual override", detail:String(e.state).toUpperCase()};
+  if(e.action==="variable_set") return {what:e.variable, action:"variable set", detail:String(e.value)};
+  const src = e.source==="manual" ? "manual" : "automatic";
+  return {what:e.device, action:src+" state change", detail:String(e.state).toUpperCase()};
+}
+function pillFor(d){
+  if(d.action==="manual override") return '<span class="pill on">'+esc(d.action)+'</span>';
+  if(d.action==="variable set")    return '<span class="pill na">'+esc(d.action)+'</span>';
+  if(/^manual/.test(d.action))     return '<span class="pill on">'+esc(d.action)+'</span>';
+  return '<span class="pill off">'+esc(d.action)+'</span>';
+}
+async function tick(){
+  let events=[];
+  try{ const r=await fetch("api/audit",{cache:"no-store"}); if(r.ok) events=(await r.json()).events||[]; }
+  catch(e){ /* keep last render */ return; }
+  const tb=document.getElementById("actbody");
+  document.getElementById("act-count").textContent = events.length ? (events.length+" recent") : "";
+  if(!events.length){ tb.innerHTML='<tr><td colspan="5" class="muted">No activity yet — changes appear here as devices switch or an operator acts.</td></tr>'; return; }
+  tb.innerHTML="";
+  for(const e of events){
+    const d=describe(e); const tr=document.createElement("tr");
+    tr.innerHTML='<td class="muted" title="'+esc(e.ts||"")+'">'+esc(agoText(e.ts))+'</td>'+
+      '<td>'+esc(d.what||"—")+'</td><td>'+pillFor(d)+'</td>'+
+      '<td>'+esc(d.detail||"—")+'</td><td class="muted">'+esc(e.by||"—")+'</td>';
+    tb.appendChild(tr);
+  }
+}
+tick(); setInterval(tick, REFRESH);
+</script>
+"""
+
+
+@app.route("/activity")
+@require_auth
+def activity():
+    return page(render_template_string(ACTIVITY, refresh=DASH_REFRESH_SECONDS),
+                page="activity", title="Activity · Precipitation → MQTT")
 
 
 # ---------------------------------------------------------------------------
