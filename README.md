@@ -345,6 +345,26 @@ Available metrics:
 | `humidity` | relative humidity, 0–100% | `< <= > >= == != between in` |
 | `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in` |
 | `active_alert` | NWS watches/warnings | `any`, `contains`, `equals` |
+| `time_hour` | local hour, 0–23 | `< <= > >= == != between in` |
+| `time_minute` | local minute, 0–59 | `< <= > >= == != between in` |
+| `time_weekday` | `mon`…`sun` (local) | `equals`, `in`, `contains` |
+| `time_is_weekend` | Sat/Sun (true/false) | `== !=` |
+
+The `time_*` metrics are computed locally each cycle (no external calls), so
+rules can combine weather with the time of day — e.g. only hold irrigation
+during daytime hours, or skip a rule on weekends:
+
+```yaml
+- name: daytime_weekday_hold
+  when:
+    all:
+      - { metric: is_raining,      operator: "==",      value: true }
+      - { metric: time_hour,       operator: "between", value: [6, 20] }
+      - { metric: time_is_weekend, operator: "==",      value: false }
+  topic: "irrigation/rain_inhibit"
+  on_match: "INHIBIT"
+  on_clear: "ALLOW"
+```
 
 `between` takes an inclusive `[low, high]` pair; `in` takes a list of allowed
 values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).

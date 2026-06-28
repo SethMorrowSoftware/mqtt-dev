@@ -69,6 +69,11 @@ METRIC_SPECS = {
     "humidity":                  {"type": "number", "ops": NUMBER_OPS},
     "short_forecast":            {"type": "text",   "ops": TEXT_OPS},
     "active_alert":              {"type": "alert",  "ops": ("any", "contains", "equals")},
+    # --- schedule / clock inputs (ROADMAP Phase 3, no external calls) ---
+    "time_hour":                 {"type": "number", "ops": NUMBER_OPS},   # 0..23 local
+    "time_minute":               {"type": "number", "ops": NUMBER_OPS},   # 0..59
+    "time_weekday":              {"type": "text",   "ops": TEXT_OPS},     # mon..sun
+    "time_is_weekend":           {"type": "bool",   "ops": ("==", "!=")},
 }
 
 
@@ -681,9 +686,10 @@ def _eval_base(cond, metrics, rule_name, state):
         LOG.warning("Rule '%s': unknown alert operator '%s'", rule_name, op)
         return False
 
-    # Text metric: short forecast
-    if metric == "short_forecast":
-        text = metrics.get("short_forecast", "") or ""
+    # Text metrics (short_forecast, time_weekday, ...): case-insensitive ops.
+    spec = METRIC_SPECS.get(metric)
+    if spec and spec["type"] == "text":
+        text = str(metrics.get(metric, "") or "")
         if op == "contains":
             return str(value).lower() in text.lower()
         if op == "equals":
@@ -929,6 +935,19 @@ def _parse_iso(s):
         return datetime.fromisoformat(str(s))
     except (ValueError, TypeError):
         return None
+
+
+def schedule_metrics(now):
+    """Clock-derived metrics for time-of-day rules, from local civil time `now`.
+    Pure (no clock read here) so it's unit-testable. Merged into the metric
+    context each cycle alongside the weather metrics."""
+    wd = WEEKDAYS[now.weekday()]
+    return {
+        "time_hour": now.hour,
+        "time_minute": now.minute,
+        "time_weekday": wd,
+        "time_is_weekend": wd in ("sat", "sun"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1246,6 +1265,7 @@ def main():
 
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone()    # system local civil time for windows
+            m.update(schedule_metrics(now_local))   # time_* inputs into the context
             rule_rows = []
             for rule in rules:
               try:

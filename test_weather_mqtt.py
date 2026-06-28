@@ -459,6 +459,33 @@ def test_webui_manual_control_endpoint():
                 except OSError: pass
 
 
+def test_schedule_metrics():
+    from datetime import datetime
+    sat = w.schedule_metrics(datetime(2026, 6, 27, 9, 30))   # Saturday 09:30
+    assert sat == {"time_hour": 9, "time_minute": 30,
+                   "time_weekday": "sat", "time_is_weekend": True}
+    mon = w.schedule_metrics(datetime(2026, 6, 29, 14, 5))   # Monday 14:05
+    assert mon["time_weekday"] == "mon" and mon["time_is_weekend"] is False
+    assert mon["time_hour"] == 14
+
+
+def test_schedule_rules_validate_and_evaluate():
+    # a rule combining weather + time validates and evaluates against the merged context
+    cfg = w.validate_config(_min_cfg(rules=[{
+        "name": "daytime_weekday_hold", "topic": "t", "on_match": "1",
+        "when": {"all": [
+            {"metric": "is_raining", "operator": "==", "value": True},
+            {"metric": "time_hour", "operator": "between", "value": [6, 20]},
+            {"metric": "time_is_weekend", "operator": "==", "value": False},
+            {"metric": "time_weekday", "operator": "in", "value": ["mon", "fri"]},
+        ]}}]))
+    rule = cfg["rules"][0]
+    ctx = dict({"is_raining": True}, **w.schedule_metrics(__import__("datetime").datetime(2026, 6, 29, 10, 0)))
+    assert w.evaluate_rule(rule, ctx) is True            # Mon 10:00, raining
+    ctx2 = dict({"is_raining": True}, **w.schedule_metrics(__import__("datetime").datetime(2026, 6, 27, 10, 0)))
+    assert w.evaluate_rule(rule, ctx2) is False          # Saturday -> weekend, not in [mon,fri]
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}
