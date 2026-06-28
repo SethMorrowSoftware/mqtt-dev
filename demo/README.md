@@ -14,6 +14,8 @@ demo/
 ├── settings.html   Settings   — full config form with in-browser validation
 │                                (incl. Slack, remote status, manual control)
 ├── rules.html      Rules      — form rule builder + YAML editor (both validated)
+├── inputs.html     Inputs     — sources editor: operator variables, MQTT sensor
+│                                inputs, and HTTP JSON inputs (add/remove + validate)
 ├── activity.html   Activity   — read-only audit log of state changes (sample data)
 └── assets/
     ├── style.css   Shared theme (mirrors the live app)
@@ -22,9 +24,11 @@ demo/
 
 It mirrors the current `webui.py`: the rule builder offers the full operator set
 (`between`/`in`/`changed`, a per-condition `for`, the `enabled` toggle) and
-discovers schedule, variable, and input metrics; the dashboard has a Variables
-card and per-device manual controls. Everything is mock — clicks update local
-state and show a toast; nothing is published or saved.
+discovers schedule, variable, and input metrics; the **Inputs** page manages the
+sources those metrics come from (operator variables, MQTT sensor inputs, HTTP
+JSON inputs) with add/remove rows and collision checks; the dashboard has a
+Variables card and per-device manual controls. Everything is mock — clicks
+update local state and show a toast; nothing is published or saved.
 
 No build step, no external CDNs, no cookies — just static files.
 
@@ -47,8 +51,8 @@ to mimic a live feed.
 1. In **File Manager**, open the folder you want to serve from — usually
    `public_html` (or a subfolder like `public_html/weather-demo`).
 2. Upload the **contents** of this `demo/` folder (`index.html`,
-   `settings.html`, `rules.html`, and the `assets/` folder), keeping the
-   structure intact.
+   `settings.html`, `rules.html`, `inputs.html`, `activity.html`, and the
+   `assets/` folder), keeping the structure intact.
 3. Visit `https://yourdomain.com/` (or `/weather-demo/` if you used a
    subfolder). `index.html` is served automatically as the landing page.
 

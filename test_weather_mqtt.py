@@ -733,6 +733,61 @@ def test_read_audit_newest_first_and_robust():
         except OSError: pass
 
 
+def test_webui_inputs_editor():
+    """The Inputs page saves variables / mqtt_inputs / http_inputs to config and
+    the new metrics become available to rules; collisions are rejected."""
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_inputs_editor ({e})")
+        return
+    import tempfile, os, yaml, json
+    p = tempfile.mktemp(suffix=".yaml")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+        "precipitation": {"lookback_hours": 24},
+        "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+        "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+        "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                   "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        assert b'href="/inputs"' in c.get("/").data        # nav link
+        assert c.get("/inputs").status_code == 200
+        payload = {
+            "variables": [{"name": "maintenance_mode", "type": "bool", "default": "true"},
+                          {"name": "setpoint", "type": "number", "default": "72"}],
+            "mqtt_inputs": [{"topic": "sensors/tank", "metric": "tank_level", "parse": "number"}],
+            "http_inputs": [{"url": "https://meter.local/api", "interval_minutes": "5",
+                             "timeout": "10", "map": [{"metric": "power_kw", "path": "current_kw",
+                                                       "type": "number"}]}],
+        }
+        r = c.post("/inputs", data={"inputs_json": json.dumps(payload)})
+        assert b"Inputs saved" in r.data
+        saved = yaml.safe_load(open(p))
+        assert saved["variables"] == {"maintenance_mode": {"type": "bool", "default": True},
+                                      "setpoint": {"type": "number", "default": 72}}
+        assert saved["mqtt_inputs"][0]["metric"] == "tank_level"
+        assert saved["http_inputs"][0]["map"][0] == {"metric": "power_kw", "path": "current_kw",
+                                                     "type": "number"}
+        # the monitor accepts what the UI wrote, and the new metrics are in the catalogue
+        w.validate_config(yaml.safe_load(open(p)))
+        assert "var_maintenance_mode" in w.metric_catalogue(saved)
+        assert "tank_level" in w.metric_catalogue(saved)
+        # a metric-name collision with a built-in is rejected
+        bad = {"mqtt_inputs": [{"topic": "t", "metric": "temperature", "parse": "number"}]}
+        assert b"collides" in c.post("/inputs", data={"inputs_json": json.dumps(bad)}).data
+    finally:
+        for s in ("", ".bak", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
+
+
 def test_webui_activity_page_and_audit_api():
     try:
         import webui

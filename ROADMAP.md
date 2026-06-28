@@ -249,6 +249,12 @@ system "as customizable as possible" without engine changes.
   - **Delivered (cont.):** **`time_is_daytime`** — a dependency‑free sunrise/sunset
     flag from the site lat/long (handles polar day/night). **Phase 3 input sources
     are complete.**
+  - **Delivered (cont.):** a web **Inputs editor** (`/inputs`) — manage operator
+    variables, `mqtt_in` sensors, and `http_poll` inputs from the UI (add/remove
+    rows, typed defaults/parsing, dotted‑path field mappings) instead of
+    hand‑editing `config.yaml`; saved through the monitor's own validator
+    (name‑collision checks, clear errors) so new metrics appear in the Rules
+    builder immediately. Mirrored in the static demo.
   - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
     read each poll cycle).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
