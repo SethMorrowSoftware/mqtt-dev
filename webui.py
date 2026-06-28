@@ -314,6 +314,17 @@ def page(body, **kw):
 # ---------------------------------------------------------------------------
 DASH = """
 <div id="dash" class="loading" data-state-file="{{ state_file }}">
+  <div class="card" id="getstarted" style="display:none">
+    <h3 style="margin:0 0 6px">Getting started</h3>
+    <p class="muted" style="margin:0 0 8px">No data yet — the monitor hasn't written a status snapshot.
+     Three steps to go live:</p>
+    <ol class="muted" style="margin:0;padding-left:20px;line-height:1.7">
+      <li>Set your location &amp; NWS contact on the <a href="{{ url_for('settings') }}">Settings</a> page.</li>
+      <li>Tune your devices on the <a href="{{ url_for('rules') }}">Rules</a> page.</li>
+      <li>Start the monitor service — it writes a snapshot each poll cycle and this page fills in.</li>
+    </ol>
+  </div>
+
   <div class="card" id="directive-card">
     <div class="eyebrow">Irrigation directive</div>
     <div class="big unknown" id="directive">…</div>
@@ -342,14 +353,15 @@ DASH = """
   </div>
 
   <div class="card">
-    <div class="eyebrow" style="margin-bottom:10px">Rules</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Rule</th><th>Topic</th><th>State</th><th>Payload</th><th>Last change</th></tr></thead>
-        <tbody id="rulebody">
-          <tr><td colspan="5" class="muted">Loading…</td></tr>
-        </tbody>
-      </table>
+    <div class="toprow" style="align-items:center">
+      <div class="eyebrow">Devices</div>
+      <div class="muted" style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+        <span class="pill on">active</span><span class="pill off">clear</span>
+        <span class="pill na">disabled / n/a</span>
+      </div>
+    </div>
+    <div class="grid" id="devicegrid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr));margin-top:12px">
+      <div class="muted">Loading…</div>
     </div>
   </div>
   <p class="muted">Live — updates every {{ refresh }}s. <span id="staleness"></span></p>
@@ -370,17 +382,20 @@ function agoText(iso){
 function render(s){
   const conn = document.getElementById("connstate");
   const card = document.getElementById("directive-card");
+  const gs = document.getElementById("getstarted");
   if(!s){
     document.getElementById("directive").className = "big unknown";
     if(card) card.className = "card state-unknown";
     setText("directive","NO DATA");
-    setText("directive-sub","No snapshot yet. Start the monitor (weather_mqtt.py); it writes one each poll cycle.");
+    setText("directive-sub","No snapshot yet — see Getting started above.");
     conn.innerHTML = '<span class="dot idle"></span>no monitor data';
-    const tb = document.getElementById("rulebody");
-    if(tb) tb.innerHTML = '<tr><td colspan="5" class="muted">Waiting on the monitor…</td></tr>';
+    if(gs) gs.style.display = "";
+    const grid = document.getElementById("devicegrid");
+    if(grid) grid.innerHTML = '<div class="muted">Waiting on the monitor…</div>';
     document.getElementById("dash").classList.remove("loading");
     return;
   }
+  if(gs) gs.style.display = "none";
   // connection badge
   const up = !!s.mqtt_connected;
   conn.innerHTML = '<span class="dot '+(up?'up':'down')+'"></span>MQTT '+(up?'connected':'offline');
@@ -423,24 +438,27 @@ function render(s){
   setText("forecast", (m.short_forecast || "—") + " · alerts: " + alerts);
 
   const manualControl = !!s.manual_control;
-  const tb = document.getElementById("rulebody");
-  tb.innerHTML = "";
+  const grid = document.getElementById("devicegrid");
+  grid.innerHTML = "";
   for(const r of rules){
-    const tr = document.createElement("tr");
     let pill;
     if(r.enabled === false) pill = '<span class="pill na">disabled</span>';
     else if(r.active === null || r.active === undefined) pill = '<span class="pill na">n/a</span>';
     else if(r.active) pill = '<span class="pill on">active</span>';
     else pill = '<span class="pill off">clear</span>';
     if(r.manual && r.manual !== "auto") pill += ' <span class="pill na">manual '+esc(r.manual)+'</span>';
-    if(manualControl && r.enabled !== false) pill += ctlButtons(r);
-    tr.innerHTML = '<td>'+esc(r.name)+'<div class="muted">'+esc(r.description||"")+'</div></td>'+
-      '<td><code>'+esc(r.topic)+'</code></td><td>'+pill+'</td>'+
-      '<td>'+(r.current_payload!=null?esc(r.current_payload):"—")+'</td>'+
-      '<td class="muted">'+esc(agoText(r.last_change))+'</td>';
-    tb.appendChild(tr);
+    const cell = document.createElement("div");
+    cell.className = "metric"; cell.style.cssText = "display:flex;flex-direction:column;gap:6px";
+    let html = '<div class="toprow" style="align-items:center"><strong>'+esc(r.name)+'</strong><span>'+pill+'</span></div>';
+    if(r.description) html += '<div class="muted" style="font-size:12px">'+esc(r.description)+'</div>';
+    html += '<div class="muted" style="font-size:12px">topic <code>'+esc(r.topic)+'</code></div>';
+    html += '<div class="muted" style="font-size:12px">payload '+(r.current_payload!=null?esc(r.current_payload):"—")+
+            ' · changed '+esc(agoText(r.last_change))+'</div>';
+    if(manualControl && r.enabled !== false) html += ctlButtons(r);
+    cell.innerHTML = html;
+    grid.appendChild(cell);
   }
-  if(!rules.length) tb.innerHTML = '<tr><td colspan="5" class="muted">No rules.</td></tr>';
+  if(!rules.length) grid.innerHTML = '<div class="muted">No devices configured yet — add rules on the Rules page.</div>';
   renderVars(s.variables || [], manualControl);
   document.getElementById("dash").classList.remove("loading");
 }
@@ -499,7 +517,7 @@ async function setManual(device, state){
   }catch(e){ alert("control request failed"); }
   tick();
 }
-document.getElementById("rulebody").addEventListener("click", e=>{
+document.getElementById("devicegrid").addEventListener("click", e=>{
   const b = e.target.closest("button[data-state]"); if(!b) return;
   const wrap = b.closest(".ctl"); if(!wrap) return;
   b.disabled = true;

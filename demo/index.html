@@ -65,14 +65,17 @@
   </div>
 
   <div class="card">
-    <div class="eyebrow" style="margin-bottom:10px">Rules</div>
-    <p class="muted" style="margin-top:0">Manual control is <b>on</b> in this demo — use the
+    <div class="toprow" style="align-items:center">
+      <div class="eyebrow">Devices</div>
+      <div class="muted" style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+        <span class="pill on">active</span><span class="pill off">clear</span>
+        <span class="pill na">disabled / n/a</span>
+      </div>
+    </div>
+    <p class="muted" style="margin:6px 0 0">Manual control is <b>on</b> in this demo — use the
       <b>Auto / On / Off</b> buttons to override a device, or toggle a variable above.</p>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Rule</th><th>Topic</th><th>State</th><th>Payload</th><th>Last change</th></tr></thead>
-        <tbody id="rulebody"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
-      </table>
+    <div class="grid" id="devicegrid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr));margin-top:12px">
+      <div class="muted">Loading…</div>
     </div>
   </div>
 
