@@ -781,8 +781,18 @@ def settings():
 # Derived from the monitor's canonical METRIC_SPECS so the builder, this server,
 # and the monitor's own validator can never disagree about valid metrics/ops.
 # Serialized into the page for the browser-side builder.
+def _builder_ops(name, spec):
+    """Operators the form builder offers for a metric. `changed` (value-less) is
+    universally valid, but only meaningful for metrics whose value is tracked
+    cycle-to-cycle -- the NWS alert set isn't, so it's omitted there."""
+    ops = list(spec["ops"])
+    if spec["type"] != "alert":
+        ops.append("changed")
+    return ops
+
+
 RULE_METRICS = {
-    name: {"type": spec["type"], "ops": list(spec["ops"])}
+    name: {"type": spec["type"], "ops": _builder_ops(name, spec)}
     for name, spec in core.METRIC_SPECS.items()
 }
 
@@ -798,8 +808,28 @@ def _coerce_cond_value(metric, operator, raw):
         raise ValueError(f"unknown metric '{metric}'")
     if operator not in meta["ops"]:
         raise ValueError(f"operator '{operator}' is not valid for metric '{metric}'")
+    if operator == "changed":
+        return None                       # value-less: true when the metric moves
     if meta["type"] == "alert" and operator == "any":
         return None
+    if operator == "between":             # value is a "low, high" pair of numbers
+        parts = [p for p in (x.strip() for x in str(raw).split(",")) if p]
+        if len(parts) != 2:
+            raise ValueError(f"metric '{metric}' between needs two numbers 'low, high'")
+        try:
+            return [_num(parts[0]), _num(parts[1])]
+        except ValueError:
+            raise ValueError(f"metric '{metric}' between needs numeric bounds")
+    if operator == "in":                  # value is a comma-separated list
+        parts = [p for p in (x.strip() for x in str(raw).split(",")) if p]
+        if not parts:
+            raise ValueError(f"metric '{metric}' in needs at least one value")
+        if meta["type"] == "number":
+            try:
+                return [_num(p) for p in parts]
+            except ValueError:
+                raise ValueError(f"metric '{metric}' in needs numeric values")
+        return parts
     if meta["type"] == "bool":
         return str(raw).strip().lower() in ("true", "1", "yes", "on")
     if meta["type"] == "number":
@@ -846,7 +876,16 @@ def _rules_from_structured(items):
                 raise ValueError(f"rule '{name}': {e}")
             cond = {"metric": metric, "operator": _qstr(operator)}
             if val is not None:
-                cond["value"] = _qstr(val) if isinstance(val, str) else val
+                if isinstance(val, list):     # between/in -> protect any string items
+                    cond["value"] = [_qstr(x) if isinstance(x, str) else x for x in val]
+                else:
+                    cond["value"] = _qstr(val) if isinstance(val, str) else val
+            forr = str(c.get("for", "") or "").strip()
+            if forr:
+                if core.parse_duration(forr, None) is None:
+                    raise ValueError(f"rule '{name}': condition '{metric}' for: "
+                                     f"'{forr}' is not a valid duration")
+                cond["for"] = _qstr(forr)
             conds.append(cond)
         if not conds:
             raise ValueError(f"rule '{name}': add at least one condition")
@@ -869,6 +908,10 @@ def _rules_from_structured(items):
         on_clear = it.get("on_clear")
         if on_clear not in (None, ""):
             rule["on_clear"] = _qstr(str(on_clear))
+        # Only write enabled when off, so normal rules stay uncluttered (the
+        # monitor defaults a missing `enabled` to true).
+        if it.get("enabled") is False:
+            rule["enabled"] = False
         out.append(rule)
     return out
 
@@ -878,6 +921,8 @@ def _value_to_str(v):
         return ""
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, (list, tuple)):       # between/in -> "low, high" / "a, b, c"
+        return ", ".join(_value_to_str(x) for x in v)
     return str(v)
 
 
@@ -901,6 +946,7 @@ def _rule_to_structured(rule):
             "metric": str(c.get("metric", "")),
             "operator": "" if op is None else str(op),
             "value": _value_to_str(c.get("value")),
+            "for": str(c.get("for", "") or ""),
         })
     return {
         "name": str(rule.get("name", "")),
@@ -908,6 +954,7 @@ def _rule_to_structured(rule):
         "topic": str(rule.get("topic", "")),
         "on_match": _value_to_str(rule.get("on_match")),
         "on_clear": _value_to_str(rule.get("on_clear")),
+        "enabled": rule.get("enabled", True) is not False,
         "combine": combine,
         "conditions": conds,
     }
@@ -957,16 +1004,22 @@ RULES = """
       <table style="margin-top:10px">
         <thead><tr><th>Metric</th><th>Meaning</th><th>Operators</th></tr></thead>
         <tbody>
-          <tr><td><code>is_raining</code></td><td>precipitating right now</td><td><code>== !=</code></td></tr>
-          <tr><td><code>precip_accum_in</code></td><td>measured rain over lookback (in)</td><td><code>&lt; &lt;= &gt; &gt;= == !=</code></td></tr>
-          <tr><td><code>precipitation_probability</code></td><td>forecast chance (%)</td><td><code>&lt; &lt;= &gt; &gt;= == !=</code></td></tr>
-          <tr><td><code>temperature</code></td><td>air temp (°F)</td><td><code>&lt; &lt;= &gt; &gt;= == !=</code></td></tr>
-          <tr><td><code>wind_speed_mph</code></td><td>wind speed (mph)</td><td><code>&lt; &lt;= &gt; &gt;= == !=</code></td></tr>
-          <tr><td><code>humidity</code></td><td>relative humidity (%)</td><td><code>&lt; &lt;= &gt; &gt;= == !=</code></td></tr>
-          <tr><td><code>short_forecast</code></td><td>text e.g. "Light Rain"</td><td><code>contains equals</code></td></tr>
+          <tr><td><code>is_raining</code></td><td>precipitating right now</td><td><code>== != changed</code></td></tr>
+          <tr><td><code>precip_accum_in</code></td><td>measured rain over lookback (in)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>precipitation_probability</code></td><td>forecast chance (%)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>temperature</code></td><td>air temp (°F)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>wind_speed_mph</code></td><td>wind speed (mph)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>humidity</code></td><td>relative humidity (%)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>short_forecast</code></td><td>text e.g. "Light Rain"</td><td><code>contains equals in changed</code></td></tr>
           <tr><td><code>active_alert</code></td><td>NWS watches/warnings</td><td><code>any contains equals</code></td></tr>
         </tbody>
       </table>
+      <p class="muted" style="margin-top:8px"><code>between</code> takes a
+       <code>low, high</code> pair; <code>in</code> a comma-separated list;
+       <code>changed</code> fires when the value moves (no value). The optional
+       <b>for</b> box requires the condition to hold that long (e.g. <code>10m</code>).
+       Nested groups, <code>not</code>, time windows and hysteresis are edited in
+       the YAML tab.</p>
     </details>
   </div>
 </form>
@@ -980,10 +1033,16 @@ const builder = document.getElementById("builder");
 function el(tag, cls, html){ const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }
 function opt(v, label, sel){ const o=document.createElement("option"); o.value=v; o.textContent=label||v; if(sel)o.selected=true; return o; }
 
-function valueControl(metric, value){
+function valueControl(metric, operator, value){
   const meta = METRICS[metric] || {type:"text"};
   let c;
-  if(meta.type==="bool"){
+  if(operator==="between"){
+    c=document.createElement("input"); c.className="c-val"; c.type="text";
+    c.value = value!=null ? value : ""; c.placeholder="low, high";
+  } else if(operator==="in"){
+    c=document.createElement("input"); c.className="c-val"; c.type="text";
+    c.value = value!=null ? value : ""; c.placeholder = meta.type==="number" ? "e.g. 30, 50, 70" : "a, b, c";
+  } else if(meta.type==="bool"){
     c=document.createElement("select"); c.className="c-val";
     c.appendChild(opt("true","true", String(value)==="true"));
     c.appendChild(opt("false","false", String(value)!=="true"));
@@ -1006,7 +1065,7 @@ function fillOps(sel, metric, chosen){
 }
 
 function condRow(cond){
-  cond = cond || {metric:METRIC_NAMES[0], operator:"", value:""};
+  cond = cond || {metric:METRIC_NAMES[0], operator:"", value:"", for:""};
   const row = el("div","cond row");
   const metricWrap = el("div"); const m = document.createElement("select"); m.className="c-metric";
   m.setAttribute("aria-label","metric");
@@ -1016,20 +1075,22 @@ function condRow(cond){
   const opWrap = el("div"); const o=document.createElement("select"); o.className="c-op";
   o.setAttribute("aria-label","operator");
   fillOps(o, m.value, cond.operator); opWrap.appendChild(o);
-  const valWrap = el("div","c-val-wrap"); valWrap.appendChild(valueControl(m.value, cond.value));
+  const valWrap = el("div","c-val-wrap"); valWrap.appendChild(valueControl(m.value, o.value, cond.value));
+  const forWrap = el("div","c-for-wrap"); const f=document.createElement("input"); f.className="c-for"; f.type="text";
+  f.placeholder="for (e.g. 10m)"; f.value=cond.for||""; f.setAttribute("aria-label","sustain duration");
+  f.title="optional: the condition must hold continuously this long (e.g. 30s, 10m, 2h)";
+  forWrap.appendChild(f);
   const rmWrap = el("div","rm"); const rm=el("button","secondary danger mini","×"); rm.type="button";
   rmWrap.appendChild(rm);
 
-  function syncValVisible(){
-    const meta=METRICS[m.value]||{};
-    valWrap.style.display = (meta.type==="alert" && o.value==="any") ? "none" : "";
-  }
-  m.addEventListener("change", ()=>{ fillOps(o, m.value, o.value);
-    valWrap.innerHTML=""; valWrap.appendChild(valueControl(m.value, null)); syncValVisible(); });
-  o.addEventListener("change", syncValVisible);
+  function noValue(){ const meta=METRICS[m.value]||{}; return o.value==="changed" || (meta.type==="alert" && o.value==="any"); }
+  function syncValVisible(){ valWrap.style.display = noValue() ? "none" : ""; }
+  function rebuildVal(keep){ valWrap.innerHTML=""; valWrap.appendChild(valueControl(m.value, o.value, keep)); syncValVisible(); }
+  m.addEventListener("change", ()=>{ fillOps(o, m.value, o.value); rebuildVal(null); });
+  o.addEventListener("change", ()=> rebuildVal(null));
   rm.addEventListener("click", ()=>{ const card=row.closest(".rule-card"); row.remove(); refreshCombine(card); });
   syncValVisible();
-  row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(rmWrap);
+  row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
   return row;
 }
 
@@ -1039,10 +1100,13 @@ function refreshCombine(card){
 }
 
 function ruleCard(rule){
-  rule = rule || {name:"",description:"",topic:"",on_match:"",on_clear:"",combine:"any",conditions:[]};
+  rule = rule || {name:"",description:"",topic:"",on_match:"",on_clear:"",enabled:true,combine:"any",conditions:[]};
   const card = el("div","rule-card");
   card.innerHTML =
-    '<div class="rhead"><span class="idx"></span></div>'+
+    '<div class="rhead"><span class="idx"></span>'+
+    '<label class="enabled-lbl" style="display:flex;align-items:center;gap:7px;margin:0;font-weight:600" '+
+    'title="Disabled rules are not evaluated and publish nothing">'+
+    '<input type="checkbox" class="f-enabled" style="width:auto;margin:0"> enabled</label></div>'+
     '<div class="row"><div><label>Name <input class="f-name"></label></div>'+
     '<div><label>Topic <input class="f-topic"></label></div></div>'+
     '<label>Description <span class="hint">(optional)</span> <input class="f-desc"></label>'+
@@ -1058,6 +1122,7 @@ function ruleCard(rule){
   card.querySelector(".f-desc").value = rule.description||"";
   card.querySelector(".f-onmatch").value = rule.on_match||"";
   card.querySelector(".f-onclear").value = rule.on_clear||"";
+  card.querySelector(".f-enabled").checked = rule.enabled !== false;
   const comb = card.querySelector(".f-combine");
   comb.appendChild(opt("any","ANY is true (OR)", rule.combine!=="all"));
   comb.appendChild(opt("all","ALL are true (AND)", rule.combine==="all"));
@@ -1081,12 +1146,11 @@ function collect(){
       const metric=row.querySelector(".c-metric").value;
       const operator=row.querySelector(".c-op").value;
       const meta=METRICS[metric]||{};
-      const valWrap=row.querySelector(".c-val-wrap");
+      const noVal = operator==="changed" || (meta.type==="alert" && operator==="any");
       let value="";
-      if(!(meta.type==="alert" && operator==="any")){
-        const ctrl=valWrap.querySelector(".c-val"); value=ctrl?ctrl.value:"";
-      }
-      return {metric, operator, value};
+      if(!noVal){ const ctrl=row.querySelector(".c-val"); value=ctrl?ctrl.value:""; }
+      const forv=(row.querySelector(".c-for").value||"").trim();
+      return {metric, operator, value, for:forv};
     });
     return {
       name: card.querySelector(".f-name").value.trim(),
@@ -1094,6 +1158,7 @@ function collect(){
       topic: card.querySelector(".f-topic").value.trim(),
       on_match: card.querySelector(".f-onmatch").value,
       on_clear: card.querySelector(".f-onclear").value,
+      enabled: card.querySelector(".f-enabled").checked,
       combine: card.querySelector(".f-combine").value,
       conditions: conds,
     };
@@ -1102,6 +1167,7 @@ function collect(){
 
 function validate(data){
   if(!data.length) return "Add at least one rule.";
+  const durRe=/^\d+(\.\d+)?\s*[smh]?$/;
   for(let i=0;i<data.length;i++){
     const r=data[i], label="Rule "+(i+1);
     if(!r.name) return label+": name is required.";
@@ -1110,7 +1176,20 @@ function validate(data){
     if(!r.conditions.length) return "Rule '"+r.name+"': add at least one condition.";
     for(const c of r.conditions){
       const meta=METRICS[c.metric]||{};
+      if(c.for && !durRe.test(c.for.trim())) return "Rule '"+r.name+"': '"+c.metric+"' for must be a duration like 10m, 30s, 2h.";
+      if(c.operator==="changed") continue;
       if(meta.type==="alert" && c.operator==="any") continue;
+      if(c.operator==="between"){
+        const ps=c.value.split(",").map(s=>s.trim()).filter(s=>s!=="");
+        if(ps.length!==2 || ps.some(p=>isNaN(Number(p)))) return "Rule '"+r.name+"': "+c.metric+" between needs two numbers 'low, high'.";
+        continue;
+      }
+      if(c.operator==="in"){
+        const ps=c.value.split(",").map(s=>s.trim()).filter(s=>s!=="");
+        if(!ps.length) return "Rule '"+r.name+"': "+c.metric+" in needs at least one value.";
+        if(meta.type==="number" && ps.some(p=>isNaN(Number(p)))) return "Rule '"+r.name+"': "+c.metric+" in needs numeric values.";
+        continue;
+      }
       if(c.value==="") return "Rule '"+r.name+"': the "+c.metric+" condition needs a value.";
       if(meta.type==="number" && isNaN(Number(c.value))) return "Rule '"+r.name+"': "+c.metric+" needs a numeric value.";
     }
@@ -1215,15 +1294,13 @@ def rules():
 
 def _rule_is_flat(rule):
     """True if the form builder can faithfully represent this rule (a single
-    leaf condition, or one any/all group of leaf conditions, with no advanced
-    fields). Nested groups, `not`, time windows, hysteresis, and a disabled
-    flag are YAML-editor only -- a rule using any of them opens the YAML tab so
-    a form save can't silently drop it."""
+    leaf condition, or one any/all group of leaf conditions). Nested groups,
+    `not`, time windows, and hysteresis are YAML-editor only -- a rule using
+    any of them opens the YAML tab so a form save can't silently drop it. The
+    builder does handle enabled, between/in, changed, and per-condition for."""
     if not isinstance(rule, dict):
         return False
     if rule.get("window") is not None or rule.get("hysteresis") is not None:
-        return False
-    if rule.get("enabled") is False:
         return False
     when = rule.get("when")
     if not isinstance(when, dict):
@@ -1238,10 +1315,10 @@ def _rule_is_flat(rule):
 
 
 def _leaf_is_simple(c):
-    """A leaf the flat form builder can edit: a plain metric condition with no
-    `for:` sustain and not the value-less `changed` operator."""
-    return (isinstance(c, dict) and "metric" in c
-            and c.get("for") is None and c.get("operator") != "changed")
+    """A leaf the flat form builder can edit: a plain metric condition (any
+    operator, optional `for:`). A nested group dict is not metric-keyed, so it
+    is not simple and routes the rule to the YAML editor."""
+    return isinstance(c, dict) and "metric" in c
 
 
 def _to_plain(obj):

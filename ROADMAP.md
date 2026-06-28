@@ -211,9 +211,13 @@ system "as customizable as possible" without engine changes.
     `enabled`, **time windows**, **hysteresis (min‑on/min‑off/cooldown)**, and the
     stateful **`changed`** operator + **`for:` sustain** modifier (engine +
     validation + tests + docs; back‑compatible). **Phase 1 engine is complete.**
-  - **Still to come (own PRs):** a form‑builder UI for the advanced constructs
-    (nested/`not`, windows, hysteresis, `changed`/`for` — today edited in the YAML
-    tab). Then **Phase 2** (device model + manual control).
+  - **Builder UI:** the form builder now edits single‑level rules end‑to‑end —
+    `enabled`, `between`/`in`, the `changed` operator, and per‑condition `for:`.
+    Nested/`not`, time windows, and hysteresis remain YAML‑tab only (the Rules
+    page auto‑opens the YAML editor when a rule uses them).
+  - **Still to come (own PRs):** a builder UI for the remaining nested/`not`/
+    window/hysteresis constructs (optional polish). Then **Phase 2** (device
+    model + manual control).
 - **Phase 2 — Devices + manual control:** device/channel model; generalized device‑grid
   dashboard; **manual Auto/On/Off** (opt‑in, persisted, audited) with the security gating
   above. (Actions still MQTT.)
