@@ -291,6 +291,7 @@ BASE = """
   <a href="{{ url_for('settings') }}" class="{{ 'active' if page=='settings' }}">Settings</a>
   <a href="{{ url_for('rules') }}" class="{{ 'active' if page=='rules' }}">Rules</a>
   <a href="{{ url_for('activity') }}" class="{{ 'active' if page=='activity' }}">Activity</a>
+  <a href="{{ url_for('system') }}" class="{{ 'active' if page=='system' }}">System</a>
  </nav>
  <span class="spacer"></span>
  <span class="conn" id="connstate"><span class="dot idle"></span>weather-mqtt</span>
@@ -658,6 +659,100 @@ def api_audit():
     return jsonify({"events": core.read_audit(cfg.get("audit_file", "audit.log"), 200)})
 
 
+def _system_snapshot():
+    """Assemble the System page's health + config summary. Never raises -- on a
+    bad config it reports config_ok=False with a generic message."""
+    from datetime import datetime, timezone
+    out = {"monitor": "unknown", "config_ok": False, "mqtt_connected": None,
+           "last_update": None, "age_seconds": None}
+    try:
+        cfg = load_raw()
+    except Exception:
+        out["error"] = "config invalid or unreadable"
+        return out
+    try:
+        core_check(cfg)
+        out["config_ok"] = True
+    except Exception:
+        out["error"] = "config invalid"
+
+    poll = 15
+    try:
+        poll = max(1, int(cfg.get("poll_interval_minutes", 15)))
+    except Exception:
+        pass
+    # Two missed cycles plus a small grace before we call the monitor stale.
+    stale_after = poll * 60 * 2 + 90
+    out["poll_interval_minutes"] = poll
+    out["stale_after_seconds"] = stale_after
+
+    state = load_state(cfg)
+    if state and state.get("updated"):
+        out["last_update"] = state["updated"]
+        out["mqtt_connected"] = bool(state.get("mqtt_connected"))
+        out["manual_control"] = bool(state.get("manual_control"))
+        try:
+            upd = datetime.fromisoformat(state["updated"])
+            if upd.tzinfo is None:
+                upd = upd.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - upd).total_seconds()
+            out["age_seconds"] = int(age)
+            out["monitor"] = "ok" if age <= stale_after else "stale"
+        except Exception:
+            out["monitor"] = "ok"
+    else:
+        out["monitor"] = "no_data"
+
+    rules = [r for r in (cfg.get("rules") or []) if isinstance(r, dict)]
+    try:
+        metrics = len(core.metric_catalogue(cfg))
+    except Exception:
+        metrics = None
+    out["summary"] = {
+        "rules_total": len(rules),
+        "rules_enabled": sum(1 for r in rules if r.get("enabled", True)),
+        "variables": len(cfg.get("variables") or {}),
+        "mqtt_inputs": len(cfg.get("mqtt_inputs") or []),
+        "http_inputs": len(cfg.get("http_inputs") or []),
+        "metrics": metrics,
+    }
+    log_file = cfg.get("log_file") or ""
+    out["files"] = {
+        "config": CONFIG_PATH,
+        "state": cfg.get("state_file", "weather_state.json"),
+        "audit": cfg.get("audit_file", "audit.log"),
+        "log": log_file or None,
+    }
+    out["log_enabled"] = bool(log_file)
+    out["log_present"] = bool(log_file) and Path(log_file).exists()
+    return out
+
+
+@app.route("/api/system")
+@require_auth
+def api_system():
+    """Health + config summary for the System page (auto-refreshed)."""
+    return jsonify(_system_snapshot())
+
+
+@app.route("/api/logs")
+@require_auth
+def api_logs():
+    """Tail the monitor's runtime log (newest first). Empty when no log_file is
+    configured or the file doesn't exist yet."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    log_file = cfg.get("log_file") or ""
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 300))))
+    except Exception:
+        limit = 300
+    return jsonify({"enabled": bool(log_file),
+                    "lines": core.read_log(log_file, limit) if log_file else []})
+
+
 @app.route("/healthz")
 def healthz():
     """Unauthenticated liveness + freshness probe for systemd/monitoring."""
@@ -754,6 +849,143 @@ tick(); setInterval(tick, REFRESH);
 def activity():
     return page(render_template_string(ACTIVITY, refresh=DASH_REFRESH_SECONDS),
                 page="activity", title="Activity · The Castle Fun Center")
+
+
+# ---------------------------------------------------------------------------
+# System (health + live runtime log)
+# ---------------------------------------------------------------------------
+SYSTEM = """
+<div class="card">
+  <div class="toprow" style="align-items:center">
+    <div><h3 style="margin:0">System</h3>
+      <p class="muted" style="margin:4px 0 0">Live health of the monitor and web UI, a snapshot of your
+       configuration, and the controller's runtime log.</p></div>
+    <span class="conn" id="sys-conn"><span class="dot idle"></span>checking…</span>
+  </div>
+  <div class="grid" id="health" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr));margin-top:14px">
+    <div class="metric"><div class="v" id="h_monitor">—</div><div class="k">monitor</div></div>
+    <div class="metric"><div class="v" id="h_mqtt">—</div><div class="k">MQTT broker</div></div>
+    <div class="metric"><div class="v" id="h_config">—</div><div class="k">config</div></div>
+    <div class="metric"><div class="v" id="h_update">—</div><div class="k">last poll</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="eyebrow" style="margin-bottom:10px">Configuration summary</div>
+  <div class="grid" id="summary" style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">
+    <div class="metric"><div class="v" id="s_rules">—</div><div class="k">rules (enabled)</div></div>
+    <div class="metric"><div class="v" id="s_metrics">—</div><div class="k">metrics available</div></div>
+    <div class="metric"><div class="v" id="s_vars">—</div><div class="k">variables</div></div>
+    <div class="metric"><div class="v" id="s_mqtt">—</div><div class="k">MQTT inputs</div></div>
+    <div class="metric"><div class="v" id="s_http">—</div><div class="k">HTTP inputs</div></div>
+  </div>
+  <p class="muted" id="files" style="margin-top:14px">—</p>
+</div>
+
+<div class="card">
+  <div class="toprow" style="align-items:center">
+    <div><h3 style="margin:0">Runtime log</h3>
+      <p class="muted" style="margin:4px 0 0">The monitor's recent log, newest first.</p></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="lvl" style="margin:0;width:auto">
+        <option value="">all levels</option>
+        <option value="INFO">info & up</option>
+        <option value="WARNING">warnings & up</option>
+        <option value="ERROR">errors only</option>
+      </select>
+      <label class="muted" style="margin:0;display:flex;align-items:center;gap:6px;font-weight:500">
+        <input type="checkbox" id="follow" checked style="width:auto;margin:0"> auto-refresh</label>
+    </div>
+  </div>
+  <div id="lognote" class="muted" style="margin-top:10px;display:none"></div>
+  <pre id="logbox" style="margin-top:12px;max-height:460px;overflow:auto;background:#0a1322;border:1px solid var(--line);
+   border-radius:10px;padding:14px 16px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
+   line-height:1.6;white-space:pre-wrap;word-break:break-word">Loading…</pre>
+  <p class="muted" style="margin-top:10px">Source: <code id="logpath">log_file</code> · rolls at ~1 MB (3 backups).
+   Configure it as <code>log_file:</code> in <code>config.yaml</code>.</p>
+</div>
+<script>
+const REFRESH = {{ refresh }} * 1000;
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function setText(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
+function agoText(iso){
+  if(!iso) return "never"; const t=Date.parse(iso); if(isNaN(t)) return iso;
+  const s=Math.max(0,Math.round((Date.now()-t)/1000));
+  if(s<5) return "just now"; if(s<60) return s+"s ago";
+  if(s<3600) return Math.round(s/60)+"m ago"; return Math.round(s/3600)+"h ago";
+}
+const LEVEL_RANK = {DEBUG:0, INFO:1, WARNING:2, ERROR:3, CRITICAL:4};
+
+async function tickHealth(){
+  let d; try{ const r=await fetch("api/system",{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
+  catch(e){ return; }
+  const conn=document.getElementById("sys-conn");
+  const mon=d.monitor;
+  const dot = mon==="ok" ? "up" : (mon==="stale"||mon==="no_data" ? "down" : "idle");
+  conn.innerHTML='<span class="dot '+dot+'"></span>'+(mon==="ok"?"healthy":mon==="stale"?"monitor stale":mon==="no_data"?"no data yet":"unknown");
+  const monLabel = {ok:"running", stale:"stale", no_data:"no data", unknown:"unknown"}[mon]||mon;
+  setText("h_monitor", monLabel);
+  document.getElementById("h_monitor").className = "v " + (mon==="ok"?"allow":mon==="unknown"?"unknown":"inhibit");
+  const mq = d.mqtt_connected;
+  setText("h_mqtt", mq===null||mq===undefined ? "—" : (mq?"connected":"offline"));
+  document.getElementById("h_mqtt").className = "v " + (mq?"allow":mq===false?"inhibit":"unknown");
+  setText("h_config", d.config_ok ? "valid" : "invalid");
+  document.getElementById("h_config").className = "v " + (d.config_ok?"allow":"inhibit");
+  setText("h_update", agoText(d.last_update));
+  document.getElementById("h_update").title = d.last_update || "";
+
+  const s=d.summary||{};
+  setText("s_rules", (s.rules_enabled!=null?s.rules_enabled:"—")+" / "+(s.rules_total!=null?s.rules_total:"—"));
+  setText("s_metrics", s.metrics!=null?s.metrics:"—");
+  setText("s_vars", s.variables!=null?s.variables:"—");
+  setText("s_mqtt", s.mqtt_inputs!=null?s.mqtt_inputs:"—");
+  setText("s_http", s.http_inputs!=null?s.http_inputs:"—");
+  const f=d.files||{};
+  setText("files", "config "+(f.config||"—")+" · state "+(f.state||"—")+" · audit "+(f.audit||"—")+" · log "+(f.log||"(off)"));
+  setText("logpath", f.log || "log_file (not configured)");
+}
+
+let LINES=[];
+function renderLog(){
+  const min = LEVEL_RANK[document.getElementById("lvl").value];
+  const box=document.getElementById("logbox");
+  const rows = (min==null) ? LINES : LINES.filter(l => (LEVEL_RANK[l.level]==null) || LEVEL_RANK[l.level]>=min);
+  if(!rows.length){ box.textContent = LINES.length ? "No lines at this level." : "No log lines yet."; return; }
+  box.innerHTML = rows.map(l=>{
+    const lv = l.level || "";
+    const color = lv==="ERROR"||lv==="CRITICAL" ? "var(--bad)" : lv==="WARNING" ? "var(--warn)" : lv==="DEBUG" ? "var(--muted2)" : "var(--good)";
+    const tag = lv ? '<span style="color:'+color+';font-weight:700">'+esc(lv.padEnd(7))+'</span> ' : '';
+    const ts = l.ts ? '<span style="color:var(--muted2)">'+esc(l.ts)+'</span> ' : '';
+    return ts+tag+esc(l.msg||l.raw||"");
+  }).join("\\n");
+}
+async function tickLog(){
+  let d; try{ const r=await fetch("api/logs?limit=400",{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
+  catch(e){ return; }
+  const note=document.getElementById("lognote");
+  if(!d.enabled){
+    note.style.display=""; note.innerHTML='Runtime log is off. Set <code>log_file: monitor.log</code> in <code>config.yaml</code> and restart the monitor to capture it here.';
+    LINES=[]; renderLog(); return;
+  }
+  note.style.display="none";
+  LINES = d.lines || [];
+  if(!LINES.length){ document.getElementById("logbox").textContent = "No log lines yet — the monitor writes here as it polls."; return; }
+  renderLog();
+}
+document.getElementById("lvl").addEventListener("change", renderLog);
+
+function tick(){ tickHealth(); if(document.getElementById("follow").checked) tickLog(); }
+tickHealth(); tickLog();
+setInterval(tick, REFRESH);
+</script>
+"""
+
+
+@app.route("/system")
+@require_auth
+def system():
+    return page(render_template_string(SYSTEM, refresh=DASH_REFRESH_SECONDS),
+                page="system", title="System · The Castle Fun Center")
 
 
 # ---------------------------------------------------------------------------

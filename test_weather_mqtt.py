@@ -770,6 +770,89 @@ def test_webui_activity_page_and_audit_api():
                 except OSError: pass
 
 
+def test_read_log_parses_levels_and_continuations():
+    import tempfile, os
+    p = tempfile.mktemp(suffix=".log")
+    open(p, "w").write(
+        "2026-06-28 16:40:01,100 INFO Runtime log mirrored to monitor.log\n"
+        "2026-06-28 16:40:02,200 WARNING Rule 'x' failed this cycle, skipping: boom\n"
+        "Traceback (most recent call last):\n"
+        "  File 'a.py', line 1, in <module>\n"
+        "2026-06-28 16:40:03,300 ERROR Poll cycle failed: nope\n")
+    try:
+        lines = w.read_log(p, 100)
+        assert lines[0]["level"] == "ERROR"            # newest first
+        assert lines[1]["level"] == "WARNING"
+        assert "Traceback" in lines[1]["msg"]          # continuation attached
+        assert lines[2]["level"] == "INFO"
+        assert w.read_log("", 100) == []               # disabled -> empty
+        assert w.read_log(tempfile.mktemp(), 100) == []  # missing -> empty
+    finally:
+        os.unlink(p)
+
+
+def test_webui_system_page_and_apis():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_system_page_and_apis ({e})")
+        return
+    import tempfile, os, json, yaml
+    from datetime import datetime, timezone
+    p = tempfile.mktemp(suffix=".yaml")
+    state = tempfile.mktemp(suffix=".json")
+    log = tempfile.mktemp(suffix=".log")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+        "precipitation": {"lookback_hours": 24},
+        "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+        "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+        "state_file": state, "log_file": log,
+        "variables": {"maintenance_mode": {"type": "bool", "default": False}},
+        "mqtt_inputs": [{"topic": "s/level", "metric": "tank_level", "parse": "number"}],
+        "rules": [
+            {"name": "r1", "topic": "t1", "on_match": "1",
+             "when": {"metric": "is_raining", "operator": "==", "value": True}},
+            {"name": "r2", "enabled": False, "topic": "t2", "on_match": "1",
+             "when": {"metric": "var_maintenance_mode", "operator": "==", "value": True}},
+        ],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg))
+    # Fresh state snapshot so the monitor reads as "ok".
+    open(state, "w").write(json.dumps({
+        "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mqtt_connected": True, "manual_control": False, "metrics": {}, "rules": [],
+    }))
+    open(log, "w").write(
+        "2026-06-28 16:40:01,100 INFO Started.\n"
+        "2026-06-28 16:40:02,200 ERROR Poll cycle failed: boom\n")
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        r = c.get("/system")
+        assert r.status_code == 200 and b"System" in r.data and b"api/system" in r.data
+        assert b'href="/system"' in c.get("/").data          # nav link present
+        sysj = c.get("/api/system").get_json()
+        assert sysj["config_ok"] is True and sysj["monitor"] == "ok"
+        assert sysj["mqtt_connected"] is True
+        s = sysj["summary"]
+        assert s["rules_total"] == 2 and s["rules_enabled"] == 1
+        assert s["variables"] == 1 and s["mqtt_inputs"] == 1
+        assert "var_maintenance_mode" not in (sysj.get("error") or "")  # sanity
+        assert s["metrics"] and s["metrics"] > 10                       # catalogue populated
+        assert sysj["log_enabled"] is True and sysj["log_present"] is True
+        logj = c.get("/api/logs").get_json()
+        assert logj["enabled"] is True
+        assert logj["lines"][0]["level"] == "ERROR"                     # newest first
+    finally:
+        for f in (p, state, log):
+            for sfx in ("", ".bak", ".tmp"):
+                try: os.unlink(f + sfx)
+                except OSError: pass
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

@@ -1,9 +1,10 @@
 /* ===========================================================================
    Automation (Conditions → Actions) · demo behaviour
-   All client-side, no backend. Three pages share this file; each block runs
+   All client-side, no backend. Every page shares this file; each block runs
    only if the elements it needs are present on the page. Mirrors the live
    webui.py UI (dashboard with variables + manual control, the rule builder,
-   settings) but everything is mock data — nothing is published or saved.
+   settings, the activity log, and the System health/log page) but everything
+   is mock data — nothing is published or saved.
    =========================================================================== */
 "use strict";
 
@@ -608,4 +609,77 @@ function agoText(iso) {
       "<td>" + esc(d.detail || "—") + "</td><td class=\"muted\">" + esc(e.by || "—") + "</td>";
     tb.appendChild(tr);
   }
+})();
+
+/* =========================================================================
+   SYSTEM  ·  health + config summary + runtime log (sample data in the demo)
+   Mirrors the live webui.py System page; mock data, no backend.
+   ========================================================================= */
+(function system() {
+  const conn = document.getElementById("sys-conn");
+  if (!conn || !document.getElementById("logbox")) return;
+
+  // Mock health + summary (what /api/system returns in the live app).
+  const SYS = {
+    monitor: "ok", mqtt_connected: true, config_ok: true,
+    last_update: isoNow(),
+    summary: { rules_total: 3, rules_enabled: 3, metrics: 18, variables: 2, mqtt_inputs: 1, http_inputs: 1 },
+    files: { config: "config.yaml", state: "weather_state.json", audit: "audit.log", log: "monitor.log" },
+  };
+  // Sample runtime log lines (newest first), as the live /api/logs returns.
+  const mins = m => new Date(Date.now() - m * 60000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  const LINES = [
+    { ts: mins(0),  level: "INFO",    msg: "facility/vent_fan -> ON (temperature sustained > 85 for 10m)" },
+    { ts: mins(2),  level: "INFO",    msg: "irrigation/rain_inhibit unchanged (INHIBIT)" },
+    { ts: mins(6),  level: "WARNING", msg: "http_poll meter.local timed out; holding last value (fail-safe)" },
+    { ts: mins(9),  level: "INFO",    msg: "Poll cycle complete: 3 rules evaluated, 1 published" },
+    { ts: mins(14), level: "ERROR",   msg: "Rule 'broken_demo' failed this cycle, skipping: unknown metric 'foo'" },
+    { ts: mins(15), level: "INFO",    msg: "MQTT connected to localhost:1883" },
+    { ts: mins(15), level: "INFO",    msg: "Runtime log mirrored to monitor.log" },
+  ];
+  const LEVEL_RANK = { DEBUG: 0, INFO: 1, WARNING: 2, ERROR: 3, CRITICAL: 4 };
+
+  function renderHealth() {
+    SYS.last_update = isoNow();          // demo: monitor stays fresh between ticks
+    const mon = SYS.monitor;
+    const dot = mon === "ok" ? "up" : (mon === "stale" || mon === "no_data" ? "down" : "idle");
+    conn.innerHTML = '<span class="dot ' + dot + '"></span>' + (mon === "ok" ? "healthy" : mon === "stale" ? "monitor stale" : mon === "no_data" ? "no data yet" : "unknown");
+    setText("h_monitor", { ok: "running", stale: "stale", no_data: "no data", unknown: "unknown" }[mon] || mon);
+    document.getElementById("h_monitor").className = "v " + (mon === "ok" ? "allow" : mon === "unknown" ? "unknown" : "inhibit");
+    const mq = SYS.mqtt_connected;
+    setText("h_mqtt", mq == null ? "—" : (mq ? "connected" : "offline"));
+    document.getElementById("h_mqtt").className = "v " + (mq ? "allow" : mq === false ? "inhibit" : "unknown");
+    setText("h_config", SYS.config_ok ? "valid" : "invalid");
+    document.getElementById("h_config").className = "v " + (SYS.config_ok ? "allow" : "inhibit");
+    const u = document.getElementById("h_update");
+    setText("h_update", agoText(SYS.last_update)); u.title = SYS.last_update || "";
+
+    const s = SYS.summary;
+    setText("s_rules", s.rules_enabled + " / " + s.rules_total);
+    setText("s_metrics", s.metrics);
+    setText("s_vars", s.variables);
+    setText("s_mqtt", s.mqtt_inputs);
+    setText("s_http", s.http_inputs);
+    const f = SYS.files;
+    setText("files", "config " + f.config + " · state " + f.state + " · audit " + f.audit + " · log " + f.log);
+  }
+
+  function renderLog() {
+    const min = LEVEL_RANK[document.getElementById("lvl").value];
+    const box = document.getElementById("logbox");
+    const rows = (min == null) ? LINES : LINES.filter(l => LEVEL_RANK[l.level] == null || LEVEL_RANK[l.level] >= min);
+    if (!rows.length) { box.textContent = "No lines at this level."; return; }
+    box.innerHTML = rows.map(l => {
+      const lv = l.level || "";
+      const color = lv === "ERROR" || lv === "CRITICAL" ? "var(--bad)" : lv === "WARNING" ? "var(--warn)" : lv === "DEBUG" ? "var(--muted2)" : "var(--good)";
+      const tag = lv ? '<span style="color:' + color + ';font-weight:700">' + esc(lv.padEnd(7)) + "</span> " : "";
+      const ts = l.ts ? '<span style="color:var(--muted2)">' + esc(l.ts) + "</span> " : "";
+      return ts + tag + esc(l.msg || "");
+    }).join("\n");
+  }
+  document.getElementById("lvl").addEventListener("change", renderLog);
+
+  // "last poll" drifts so agoText stays lively, like the auto-refresh in the live page.
+  renderHealth(); renderLog();
+  setInterval(renderHealth, 4000);
 })();

@@ -23,6 +23,7 @@ Test:  python weather_mqtt.py --config config.yaml --once --dry-run --verbose
 import argparse
 import json
 import logging
+import logging.handlers
 import math
 import os
 import re
@@ -585,6 +586,9 @@ def validate_config(cfg):
     cfg.setdefault("overrides_file", "overrides.json")
     cfg.setdefault("audit_file", "audit.log")
     cfg.setdefault("variables_file", "variables.json")   # operator-set variables (Phase 3)
+    # Rolling runtime log the monitor mirrors its logging to, so the web UI's
+    # System page can tail it (the two run as separate processes). Blank = off.
+    cfg.setdefault("log_file", "monitor.log")
 
     precip = cfg.setdefault("precipitation", {})
     lb = _as_number(precip.get("lookback_hours", 24), 24, "precipitation.lookback_hours")
@@ -1410,6 +1414,39 @@ def read_audit(path, limit=200):
     return out
 
 
+# Lines like: "2026-06-28 16:40:01,234 INFO Published ..." -- pull the level out
+# so the UI can colour-code without re-parsing on every render.
+_LOG_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[.,]?\d*\s+"
+    r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+(?P<msg>.*)$")
+
+
+def read_log(path, limit=300):
+    """Tail the runtime log file. Returns the most recent lines (newest first),
+    each a dict {ts, level, msg, raw}. Robust to a missing file; continuation
+    lines (e.g. tracebacks) are attached to the preceding entry."""
+    if not path:
+        return []
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+    out = []
+    for ln in lines[-(limit * 4):]:        # headroom for multi-line entries
+        m = _LOG_LINE_RE.match(ln)
+        if m:
+            out.append({"ts": m.group("ts"), "level": m.group("level"),
+                        "msg": m.group("msg"), "raw": ln})
+        elif out and ln.strip():
+            out[-1]["msg"] += "\n" + ln
+            out[-1]["raw"] += "\n" + ln
+        elif ln.strip():
+            out.append({"ts": None, "level": None, "msg": ln, "raw": ln})
+    out = out[-limit:]
+    out.reverse()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
@@ -1593,6 +1630,20 @@ def main():
     )
 
     cfg = load_config(args.config)
+
+    # Mirror the log to a rolling file so the web UI's System page can tail it
+    # (monitor and web UI are separate processes). Best-effort: a write failure
+    # must never stop the controller -- it just means no in-UI log.
+    log_file = cfg.get("log_file")
+    if log_file:
+        try:
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=1_000_000, backupCount=3)
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logging.getLogger().addHandler(fh)
+            LOG.info("Runtime log mirrored to %s", log_file)
+        except Exception as e:
+            LOG.warning("Could not open log file %s: %s", log_file, e)
     ua = cfg["user_agent"]
     lat = cfg["location"]["latitude"]
     lon = cfg["location"]["longitude"]
