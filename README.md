@@ -188,6 +188,28 @@ password); credentials are compared in constant time, and the UI fails **closed*
 unauthenticated. Saved passwords are never echoed back into the page; leave a
 password field blank to keep the stored value.
 
+## Manual control (opt-in)
+
+By default the dashboard is **display-only** — it shows state but issues no
+commands. You can optionally let an authenticated operator force any device
+**On**/**Off** from the dashboard (handy for maintenance or overriding the
+weather):
+
+- Enable **Settings → Web interface → Manual device control** (or set
+  `web.allow_manual_control: true`). It is **fail-closed**: it only takes effect
+  when a web **login is set**, and the control endpoint always requires that
+  login — if no username/password is configured, manual control stays off.
+- Each device then shows **Auto / On / Off** buttons. **On**/**Off** force the
+  state (overriding the rules and bypassing hysteresis — the intent is
+  explicit); **Auto** hands control back to the rules.
+- Overrides are **persisted** to `overrides.json`, so they survive a restart and
+  apply on the next poll (no restart needed). They're an overlay on top of
+  `config.yaml`, so editing rules never wipes an override.
+- Every manual change and every automatic state change is appended to an
+  **audit log** (`audit.log`) with a timestamp and the acting user.
+- The remote status page stays **strictly read-only** — it can never issue a
+  command; it only shows a "manual" indicator when a device is overridden.
+
 ## Slack alerts
 
 If the MQTT broker becomes unreachable and **stays** down past a threshold

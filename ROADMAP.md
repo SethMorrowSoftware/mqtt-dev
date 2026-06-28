@@ -221,6 +221,14 @@ system "as customizable as possible" without engine changes.
 - **Phase 2 — Devices + manual control:** device/channel model; generalized device‑grid
   dashboard; **manual Auto/On/Off** (opt‑in, persisted, audited) with the security gating
   above. (Actions still MQTT.)
+  - **Delivered:** **manual Auto/On/Off** — `web.allow_manual_control` (fail‑closed,
+    requires a login), per‑device override persisted to `overrides.json` (overlay on
+    config; manual wins and bypasses hysteresis), an append‑only `audit.log` of manual
+    and automatic changes, an authenticated `POST /api/control` endpoint, dashboard
+    Auto/On/Off buttons, and a read‑only "manual" indicator on the cloud status page.
+  - **Still to come (own PRs):** the generalized device‑grid dashboard refresh + an
+    in‑UI audit‑log viewer + neutral branding (today's rule table already carries the
+    controls).
 - **Phase 3 — Inputs:** `schedule`, `manual` variables, `mqtt_in` sensors, `http_poll`;
   dynamic metric discovery in the builder; optional event‑driven re‑eval on MQTT input.
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;

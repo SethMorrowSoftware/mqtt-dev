@@ -48,6 +48,10 @@ web:
   # trusted, isolated control network.
   username: ""
   password: ""
+  # Allow forcing devices On/Off from the dashboard (Auto/On/Off buttons).
+  # Default false = display-only. Fail-closed: only works when a login is set.
+  # Overrides persist in overrides.json; changes are written to audit.log.
+  allow_manual_control: false
 
 # --- MQTT broker -----------------------------------------------------------
 mqtt:

@@ -15,6 +15,9 @@ env/
 # Cached NWS grid/station resolution and the per-cycle state snapshot.
 nws_location_cache.json
 weather_state.json
+# Manual-override overlay + audit trail (Phase 2).
+overrides.json
+audit.log
 # Atomic-write temp + backup files left by the web UI's config saves.
 *.tmp
 *.bak

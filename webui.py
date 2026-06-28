@@ -416,6 +416,7 @@ function render(s){
   const alerts = (m.active_alerts && m.active_alerts.length) ? m.active_alerts.join(", ") : "none";
   setText("forecast", (m.short_forecast || "—") + " · alerts: " + alerts);
 
+  const manualControl = !!s.manual_control;
   const tb = document.getElementById("rulebody");
   tb.innerHTML = "";
   for(const r of rules){
@@ -425,6 +426,8 @@ function render(s){
     else if(r.active === null || r.active === undefined) pill = '<span class="pill na">n/a</span>';
     else if(r.active) pill = '<span class="pill on">active</span>';
     else pill = '<span class="pill off">clear</span>';
+    if(r.manual && r.manual !== "auto") pill += ' <span class="pill na">manual '+esc(r.manual)+'</span>';
+    if(manualControl && r.enabled !== false) pill += ctlButtons(r);
     tr.innerHTML = '<td>'+esc(r.name)+'<div class="muted">'+esc(r.description||"")+'</div></td>'+
       '<td><code>'+esc(r.topic)+'</code></td><td>'+pill+'</td>'+
       '<td>'+(r.current_payload!=null?esc(r.current_payload):"—")+'</td>'+
@@ -435,6 +438,27 @@ function render(s){
   document.getElementById("dash").classList.remove("loading");
 }
 function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function ctlButtons(r){
+  const cur = r.manual || "auto";
+  const mk = (st,lbl)=> '<button type="button" class="mini '+(cur===st?"":"secondary")+
+    '" data-state="'+st+'" style="margin:0;padding:5px 11px;font-size:12px">'+lbl+'</button>';
+  return '<div class="ctl" data-device="'+esc(r.name)+
+    '" style="display:flex;gap:5px;margin-top:8px">'+mk("auto","Auto")+mk("on","On")+mk("off","Off")+'</div>';
+}
+async function setManual(device, state){
+  try{
+    const r = await fetch("api/control", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({device, state})});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); alert(j.error || ("control failed ("+r.status+")")); }
+  }catch(e){ alert("control request failed"); }
+  tick();
+}
+document.getElementById("rulebody").addEventListener("click", e=>{
+  const b = e.target.closest("button[data-state]"); if(!b) return;
+  const wrap = b.closest(".ctl"); if(!wrap) return;
+  b.disabled = true;
+  setManual(wrap.getAttribute("data-device"), b.getAttribute("data-state"));
+});
 
 async function tick(){
   try{
@@ -477,6 +501,44 @@ def api_state():
     if state is None:
         return jsonify({"error": "no state yet"}), 503
     return jsonify(state)
+
+
+@app.route("/api/control", methods=["POST"])
+@require_auth
+def api_control():
+    """Set a device's manual override (auto|on|off). Fails closed: only works
+    when web.allow_manual_control is on AND a web login is configured (so this
+    control surface is always authenticated). Persists to overrides.json and
+    appends to the audit log with the authenticated user."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    web = cfg.get("web", {}) or {}
+    user = str(web.get("username") or "")
+    pw = str(web.get("password") or "")
+    if not (bool(web.get("allow_manual_control", False)) and user and pw):
+        return jsonify({"error": "manual control is disabled "
+                        "(enable it and set a web login in Settings)"}), 403
+
+    data = request.get_json(silent=True) or request.form
+    device = str(data.get("device", "")).strip()
+    state = str(data.get("state", "")).strip().lower()
+    names = {str(r.get("name")) for r in (cfg.get("rules") or []) if isinstance(r, dict)}
+    if device not in names:
+        return jsonify({"error": f"unknown device '{device}'"}), 404
+    if state not in core.MANUAL_STATES:
+        return jsonify({"error": f"state must be one of {core.MANUAL_STATES}"}), 400
+
+    try:
+        core.set_override(cfg.get("overrides_file", "overrides.json"), device, state)
+    except Exception as e:
+        return jsonify({"error": f"could not save override: {e}"}), 500
+    auth = request.authorization
+    core.audit(cfg.get("audit_file", "audit.log"), device=device,
+               action="manual_set", state=state,
+               by=(auth.username if auth and auth.username else user or "local"))
+    return jsonify({"ok": True, "device": device, "manual": state})
 
 
 @app.route("/healthz")
@@ -620,6 +682,16 @@ SETTINGS = """
       <input name="web_password" type="password" value="" autocomplete="new-password"
         placeholder="{{ '•••••• — leave blank to keep' if c.web.password else 'set to enable login' }}"></div>
   </div>
+  <div class="row">
+    <div><label>Manual device control <span class="hint">(Auto/On/Off buttons on the dashboard)</span></label>
+      <select name="web_allow_manual_control">
+        <option value="false" {{ 'selected' if not c.web.allow_manual_control }}>off (display only)</option>
+        <option value="true" {{ 'selected' if c.web.allow_manual_control }}>on (requires a login)</option>
+      </select></div>
+    <div></div>
+  </div>
+  <p class="muted">Manual control lets an authenticated operator force a device ON/OFF from the
+   dashboard (LAN-only, audited). It requires a login to be set; the remote status page stays read-only.</p>
   <p class="muted">⚠ Changing <b>location</b>, the <b>MQTT connection</b> (host/port/credentials/client id),
    or any <b>web interface</b> setting needs a restart of the corresponding service.
    Thresholds, lookback, poll interval, QoS, retain, status topic and rules apply on the next poll automatically.</p>
@@ -736,6 +808,11 @@ def settings():
             if web["username"] and not str(web.get("password") or ""):
                 raise ValueError("set a login password too (or clear the username "
                                  "to disable the login)")
+            amc = f.get("web_allow_manual_control") == "true"
+            if amc and not (str(web.get("username") or "") and str(web.get("password") or "")):
+                raise ValueError("manual device control needs a web login "
+                                 "(set a username and password first)")
+            web["allow_manual_control"] = amc
 
             save_config(cfg)
             msg, msgclass = ("Settings saved. Thresholds/MQTT-publish/rules apply on the "
@@ -761,6 +838,7 @@ def settings():
     webd.setdefault("port", 8080)
     webd.setdefault("username", "")
     webd.setdefault("password", "")
+    webd.setdefault("allow_manual_control", False)
     sld = cfg.setdefault("slack", {})
     sld.setdefault("enabled", False)
     sld.setdefault("channel", "")
