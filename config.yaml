@@ -122,6 +122,9 @@ status_push:
 #   humidity                   relative humidity, 0-100 (%)
 #   short_forecast             text e.g. "Light Rain"  (operators: contains, equals, in)
 #   active_alert               NWS watches/warnings    (operators: any | contains | equals)
+#   time_hour / time_minute    local clock, numbers (0-23 / 0-59)
+#   time_weekday               mon..sun (local)        (operators: equals, in, contains)
+#   time_is_weekend            Sat/Sun (true/false)    [== !=]
 #
 # Numeric operators:  <  <=  >  >=  ==  !=  between  in
 #   between -> inclusive [low, high] pair;   in -> list of allowed values

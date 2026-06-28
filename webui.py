@@ -1090,6 +1090,10 @@ RULES = """
           <tr><td><code>humidity</code></td><td>relative humidity (%)</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
           <tr><td><code>short_forecast</code></td><td>text e.g. "Light Rain"</td><td><code>contains equals in changed</code></td></tr>
           <tr><td><code>active_alert</code></td><td>NWS watches/warnings</td><td><code>any contains equals</code></td></tr>
+          <tr><td><code>time_hour</code></td><td>local hour 0–23</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>time_minute</code></td><td>local minute 0–59</td><td><code>&lt; &lt;= &gt; &gt;= == != between in changed</code></td></tr>
+          <tr><td><code>time_weekday</code></td><td>mon…sun (local)</td><td><code>equals in contains changed</code></td></tr>
+          <tr><td><code>time_is_weekend</code></td><td>Sat/Sun (true/false)</td><td><code>== != changed</code></td></tr>
         </tbody>
       </table>
       <p class="muted" style="margin-top:8px"><code>between</code> takes a
