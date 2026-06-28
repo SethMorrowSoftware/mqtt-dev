@@ -1261,6 +1261,7 @@ HISTORY = """
       </select>
       <label class="muted" style="margin:0;display:flex;align-items:center;gap:6px;font-weight:500">
         <input type="checkbox" id="follow" checked style="width:auto;margin:0"> auto-refresh</label>
+      <button type="button" class="secondary mini" id="export" style="margin:0">Export CSV</button>
     </div>
   </div>
   <div id="hist-note" class="muted" style="margin-top:10px;display:none"></div>
@@ -1294,10 +1295,12 @@ function sparkline(points){
     '<circle cx="'+lastX+'" cy="'+lastY+'" r="2.6" fill="var(--accent)"/></svg>';
 }
 
+let LAST = {series:{}, hours:24};
 async function tick(){
   const hours=document.getElementById("win").value;
   let d; try{ const r=await fetch("api/history?hours="+hours,{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
   catch(e){ return; }
+  LAST = {series:d.series||{}, hours:hours};
   const note=document.getElementById("hist-note");
   const charts=document.getElementById("charts");
   if(!d.enabled){
@@ -1325,6 +1328,23 @@ async function tick(){
     charts.appendChild(card);
   }
 }
+// Export the currently-loaded window as CSV (one column per metric, rows by
+// timestamp). All metrics share the cycle timestamps, so they line up.
+function exportCsv(){
+  const names=Object.keys(LAST.series).sort();
+  if(!names.length){ return; }
+  const rows={};   // ts -> {metric: value}
+  for(const name of names){ for(const [ts,v] of LAST.series[name]){ (rows[ts]=rows[ts]||{})[name]=v; } }
+  const tss=Object.keys(rows).sort();
+  const esc2=s=>{ s=String(s); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
+  let csv="ts,"+names.map(esc2).join(",")+"\n";
+  for(const ts of tss){ csv+=esc2(ts)+","+names.map(n=> rows[ts][n]==null?"":rows[ts][n]).join(",")+"\n"; }
+  const blob=new Blob([csv],{type:"text/csv"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download="history-"+LAST.hours+"h.csv"; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+document.getElementById("export").addEventListener("click", exportCsv);
 document.getElementById("win").addEventListener("change", tick);
 tick();
 setInterval(()=>{ if(document.getElementById("follow").checked) tick(); }, REFRESH);
@@ -2027,6 +2047,15 @@ def _actions_from_structured(items, rule_name):
             if not topic:
                 continue
             spec = {"topic": _qstr(topic), "payload": _qstr(str(a.get("payload", "")))}
+            if a.get("qos") not in (None, ""):
+                try:
+                    q = int(a["qos"])
+                    if q in (0, 1, 2):
+                        spec["qos"] = q
+                except (TypeError, ValueError):
+                    pass
+            if a.get("retain") is True:
+                spec["retain"] = True
             out.append({"trigger": _qstr(trig), "mqtt": spec})
         elif kind == "webhook":
             url = str(a.get("url", "")).strip()
@@ -2054,8 +2083,10 @@ def _actions_to_structured(actions):
             continue
         on = str(a.get("trigger", "both"))
         if "mqtt" in a and isinstance(a["mqtt"], dict):
-            out.append({"kind": "mqtt", "on": on, "topic": str(a["mqtt"].get("topic", "")),
-                        "payload": _value_to_str(a["mqtt"].get("payload"))})
+            mq = a["mqtt"]
+            out.append({"kind": "mqtt", "on": on, "topic": str(mq.get("topic", "")),
+                        "payload": _value_to_str(mq.get("payload")),
+                        "qos": mq.get("qos"), "retain": mq.get("retain") is True})
         elif "webhook" in a and isinstance(a["webhook"], dict):
             out.append({"kind": "webhook", "on": on, "url": str(a["webhook"].get("url", "")),
                         "method": str(a["webhook"].get("method", "POST")),
@@ -2288,9 +2319,14 @@ function actionFields(kind, a){
     wrap.innerHTML='<input class="a-text" placeholder="Slack message (supports {{metric}})" style="flex:1;min-width:200px">';
     wrap.querySelector(".a-text").value=a.text||"";
   } else {
-    wrap.innerHTML='<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:150px">'+
-      '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:150px">';
+    wrap.innerHTML='<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:140px">'+
+      '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:140px">'+
+      '<select class="a-qos" title="QoS" style="flex:0 0 70px"></select>'+
+      '<label class="muted" style="margin:0;display:flex;align-items:center;gap:5px;font-weight:500;white-space:nowrap">'+
+      '<input type="checkbox" class="a-retain" style="width:auto;margin:0"> retain</label>';
     wrap.querySelector(".a-topic").value=a.topic||""; wrap.querySelector(".a-payload").value=a.payload||"";
+    ["","0","1","2"].forEach(x=> wrap.querySelector(".a-qos").appendChild(opt(x, x===""?"qos —":"qos "+x, String(a.qos==null?"":a.qos)===x)));
+    wrap.querySelector(".a-retain").checked = a.retain===true;
   }
   return wrap;
 }
@@ -2380,7 +2416,9 @@ function collect(){
       if(kind==="webhook") return {kind, on, url:(row.querySelector(".a-url").value||"").trim(),
         method:row.querySelector(".a-method").value, body:row.querySelector(".a-body").value};
       if(kind==="notify") return {kind, on, text:(row.querySelector(".a-text").value||"").trim()};
-      return {kind, on, topic:(row.querySelector(".a-topic").value||"").trim(), payload:row.querySelector(".a-payload").value};
+      const qsel=row.querySelector(".a-qos");
+      return {kind, on, topic:(row.querySelector(".a-topic").value||"").trim(), payload:row.querySelector(".a-payload").value,
+        qos:(qsel&&qsel.value!=="")?Number(qsel.value):null, retain:row.querySelector(".a-retain").checked};
     });
     return {
       name: card.querySelector(".f-name").value.trim(),
