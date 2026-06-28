@@ -356,6 +356,25 @@ def test_validate_rejects_missing_user_agent():
         pass
 
 
+def test_validate_version_default_and_accepts_one():
+    # absent -> defaulted to the current schema version (back-compat)
+    cfg = w.validate_config(_min_cfg())
+    assert cfg["version"] == w.CURRENT_SCHEMA_VERSION == 1
+    # explicit version: 1 is accepted unchanged
+    cfg2 = w.validate_config(_min_cfg(version=1))
+    assert cfg2["version"] == 1
+
+
+def test_validate_rejects_unknown_version():
+    # a future v2 file must be rejected clearly, not mis-parsed as v1
+    for bad in (2, 0, "1", True):
+        try:
+            w.validate_config(_min_cfg(version=bad))
+            raise AssertionError(f"expected ValueError for version={bad!r}")
+        except ValueError:
+            pass
+
+
 def test_validate_rejects_empty_rules():
     try:
         w.validate_config(_min_cfg(rules=[]))

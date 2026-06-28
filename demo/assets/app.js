@@ -102,18 +102,25 @@ function agoText(iso) {
     const up = !!s.mqtt_connected;
     conn.innerHTML = '<span class="dot ' + (up ? "up" : "down") + '"></span>MQTT ' + (up ? "connected" : "offline");
 
-    const irr = s.rules.find(r => /irrigation|rain_inhibit/.test(r.name));
+    // Headline device: prefer the irrigation rule (back-compat), else the first
+    // rule with a known state, else the first rule.
+    const irr = s.rules.find(r => /irrigation|rain_inhibit/.test(r.name || ""))
+             || s.rules.find(r => r.active !== null && r.active !== undefined)
+             || s.rules[0];
     const d = document.getElementById("directive");
     const card = document.getElementById("directive-card");
     let st = "unknown";
     if (irr && irr.active !== null && irr.active !== undefined) {
+      const isIrr = /irrigation|rain_inhibit/.test(irr.name || "");
       st = irr.active ? "inhibit" : "allow";
       d.className = "big " + st;
-      setText("directive", irr.current_payload + (irr.active ? " — do NOT water" : " — watering allowed"));
+      const suffix = isIrr ? (irr.active ? " — do NOT water" : " — watering allowed")
+                           : (irr.active ? " — active" : " — clear");
+      setText("directive", irr.current_payload + suffix);
       setText("directive-sub", "topic " + irr.topic + (irr.last_change ? " · changed " + agoText(irr.last_change) : ""));
     } else {
       d.className = "big unknown"; setText("directive", "UNKNOWN");
-      setText("directive-sub", "Waiting on weather data.");
+      setText("directive-sub", irr ? "Waiting on data…" : "No rules configured.");
     }
     if (card) card.className = "card state-" + st;
 

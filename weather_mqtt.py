@@ -112,6 +112,12 @@ MIN_POLL_MINUTES = 1
 MIN_LOOKBACK_HOURS = 1
 MAX_LOOKBACK_HOURS = 720      # 30 days; NWS observation history is limited anyway
 
+# Config schema version. A missing `version:` is treated as 1 so every existing
+# install keeps loading unchanged. The v2 "Conditions -> Actions" schema (see
+# ROADMAP.md) is not implemented yet; the gate exists now so a v2 file is
+# rejected with a clear message instead of being silently mis-parsed as v1.
+CURRENT_SCHEMA_VERSION = 1
+
 
 def _as_number(value, default, name):
     """Coerce a YAML scalar to int/float, falling back to default with a warn."""
@@ -138,6 +144,18 @@ def validate_config(cfg):
     """
     if not isinstance(cfg, dict):
         raise ValueError("config root must be a mapping")
+
+    # Schema-version gate. Absent == 1 (every current install). Anything other
+    # than 1 is rejected clearly rather than mis-read against the v1 structure.
+    version = cfg.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(f"config 'version' must be an integer (got {version!r})")
+    if version != CURRENT_SCHEMA_VERSION:
+        raise ValueError(
+            f"config version {version} is not supported by this release "
+            f"(expected {CURRENT_SCHEMA_VERSION}). The v2 schema in ROADMAP.md "
+            "is not implemented yet.")
+    cfg["version"] = version
 
     for key in ("location", "user_agent", "mqtt", "rules"):
         if key not in cfg:
