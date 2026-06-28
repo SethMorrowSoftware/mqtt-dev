@@ -57,6 +57,15 @@
     <p class="muted" style="margin:6px 0 0">Poll a JSON endpoint and map fields (dotted path, arrays by
      index) to metrics.</p>
     <div id="https" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <div class="toprow"><h3 style="margin:0">Computed metrics</h3>
+      <button type="button" class="secondary mini" id="add-comp" style="margin:0">+ Add computed</button></div>
+    <p class="muted" style="margin:6px 0 0">Derive a new <b>number</b> metric from others with a small
+     formula: <code>+ - * / // % **</code> and parentheses over any metric defined <i>above</i> it. E.g.
+     <code>power_kw - solar_kw</code>. A missing input yields no value (rules hold, fail-safe).</p>
+    <div id="comps" style="margin-top:10px"></div>
     <div class="field-err" id="inputs-err" style="margin-top:10px"></div>
     <button type="submit" id="save-inputs">Save inputs</button>
   </div>
@@ -74,10 +83,14 @@ window.DEMO_SOURCES = {
   ],
   mqtt_inputs: [
     { topic: "sensors/tank/level", metric: "tank_level", parse: "number" },
+    { topic: "sensors/solar/kw",   metric: "solar_kw",   parse: "number" },
   ],
   http_inputs: [
     { url: "https://meter.local/api", interval_minutes: 5, timeout: 10,
       map: [{ metric: "power_kw", path: "data.current_kw", type: "number" }] },
+  ],
+  computed: [
+    { name: "net_power", expr: "power_kw - solar_kw" },
   ],
 };
 </script>

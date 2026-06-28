@@ -318,8 +318,9 @@ function agoText(iso) {
   if (!form) return;
 
   const NUM = ["<", "<=", ">", ">=", "==", "!=", "between", "in", "changed"];
+  const NUMCMP = ["<", "<=", ">", ">=", "==", "!="];
   const BOOLO = ["==", "!=", "changed"];
-  const TXT = ["contains", "equals", "in", "changed"];
+  const TXT = ["contains", "equals", "in", "regex", "changed"];
   // Built-ins + schedule metrics + a few "discovered" dynamic metrics (as if a
   // config declared variables / mqtt_in / http_poll), so the dropdowns show the
   // same dynamic discovery the live builder does.
@@ -331,7 +332,7 @@ function agoText(iso) {
     wind_speed_mph:            { type: "number", ops: NUM },
     humidity:                  { type: "number", ops: NUM },
     short_forecast:            { type: "text",   ops: TXT },
-    active_alert:              { type: "alert",  ops: ["any", "contains", "equals"] },
+    active_alert:              { type: "alert",  ops: ["any", "contains", "equals", "regex"] },
     time_hour:                 { type: "number", ops: NUM },
     time_minute:               { type: "number", ops: NUM },
     time_weekday:              { type: "text",   ops: TXT },
@@ -341,6 +342,8 @@ function agoText(iso) {
     var_temp_setpoint:         { type: "number", ops: NUM },
     tank_level:                { type: "number", ops: NUM },
     power_kw:                  { type: "number", ops: NUM },
+    solar_kw:                  { type: "number", ops: NUM },
+    net_power:                 { type: "number", ops: NUM },   // computed: power_kw - solar_kw
   };
   const METRIC_NAMES = Object.keys(METRICS);
   const builder = document.getElementById("builder");
@@ -377,8 +380,14 @@ function agoText(iso) {
     ops.forEach(o => sel.appendChild(opt(o, o, o === chosen)));
     if (!ops.includes(chosen) && ops.length) sel.value = ops[0];
   }
+  function cmpMetricNames() { return METRIC_NAMES.filter(n => { const t = (METRICS[n] || {}).type; return t === "number" || t === "bool"; }); }
+  function metricPicker(selected) {
+    const s = document.createElement("select"); s.className = "c-vmetric"; s.setAttribute("aria-label", "comparison metric");
+    cmpMetricNames().forEach(n => s.appendChild(opt(n, n, n === selected)));
+    return s;
+  }
   function condRow(cond) {
-    cond = cond || { metric: METRIC_NAMES[0], operator: "", value: "", for: "" };
+    cond = cond || { metric: METRIC_NAMES[0], operator: "", value: "", value_metric: "", for: "" };
     const row = el("div", "cond row");
     const metricWrap = el("div"); const m = document.createElement("select"); m.className = "c-metric";
     m.setAttribute("aria-label", "metric");
@@ -388,28 +397,73 @@ function agoText(iso) {
     const opWrap = el("div"); const o = document.createElement("select"); o.className = "c-op";
     o.setAttribute("aria-label", "operator");
     fillOps(o, m.value, cond.operator); opWrap.appendChild(o);
-    const valWrap = el("div", "c-val-wrap"); valWrap.appendChild(valueControl(m.value, o.value, cond.value));
+    const modeWrap = el("div", "c-vmode-wrap"); const mode = document.createElement("select"); mode.className = "c-vmode";
+    mode.setAttribute("aria-label", "compare to");
+    mode.appendChild(opt("value", "a value", !cond.value_metric));
+    mode.appendChild(opt("metric", "a metric", !!cond.value_metric));
+    modeWrap.appendChild(mode);
+    const valWrap = el("div", "c-val-wrap");
     const forWrap = el("div", "c-for-wrap"); const f = document.createElement("input"); f.className = "c-for"; f.type = "text";
     f.placeholder = "for (e.g. 10m)"; f.value = cond.for || ""; f.setAttribute("aria-label", "sustain duration");
     f.title = "optional: the condition must hold continuously this long (e.g. 30s, 10m, 2h)";
     forWrap.appendChild(f);
     const rmWrap = el("div", "rm"); const rm = el("button", "secondary danger mini", "×"); rm.type = "button"; rmWrap.appendChild(rm);
     function noValue() { const meta = METRICS[m.value] || {}; return o.value === "changed" || (meta.type === "alert" && o.value === "any"); }
-    function syncValVisible() { valWrap.style.display = noValue() ? "none" : ""; }
-    function rebuildVal(keep) { valWrap.innerHTML = ""; valWrap.appendChild(valueControl(m.value, o.value, keep)); syncValVisible(); }
-    m.addEventListener("change", () => { fillOps(o, m.value, o.value); rebuildVal(null); });
-    o.addEventListener("change", () => rebuildVal(null));
+    function cmpEligible() { const meta = METRICS[m.value] || {}; return (meta.type === "number" || meta.type === "bool") && NUMCMP.includes(o.value); }
+    function syncMode() { modeWrap.style.display = (cmpEligible() && !noValue()) ? "" : "none"; if (!cmpEligible()) mode.value = "value"; }
+    function buildVal(keep) {
+      valWrap.innerHTML = "";
+      if (mode.value === "metric" && cmpEligible()) valWrap.appendChild(metricPicker(cond.value_metric));
+      else valWrap.appendChild(valueControl(m.value, o.value, keep));
+      valWrap.style.display = noValue() ? "none" : "";
+    }
+    m.addEventListener("change", () => { fillOps(o, m.value, o.value); syncMode(); buildVal(null); });
+    o.addEventListener("change", () => { syncMode(); buildVal(null); });
+    mode.addEventListener("change", () => buildVal(null));
     rm.addEventListener("click", () => { const card = row.closest(".rule-card"); row.remove(); refreshCombine(card); });
-    syncValVisible();
-    row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
+    syncMode(); buildVal(cond.value);
+    row.appendChild(metricWrap); row.appendChild(opWrap); row.appendChild(modeWrap); row.appendChild(valWrap); row.appendChild(forWrap); row.appendChild(rmWrap);
     return row;
   }
   function refreshCombine(card) {
     if (!card) return;
     card.querySelector(".combine-wrap").style.display = card.querySelectorAll(".cond").length > 1 ? "" : "none";
   }
+  function actionFields(kind, a) {
+    a = a || {};
+    const wrap = el("div", "a-fields"); wrap.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;flex:1;min-width:240px";
+    if (kind === "webhook") {
+      wrap.innerHTML = '<input class="a-url" placeholder="https://host/hook" style="flex:2;min-width:160px">' +
+        '<select class="a-method" style="flex:0 0 84px"></select>' +
+        '<input class="a-body" placeholder="body (supports {{metric}})" style="flex:2;min-width:160px">';
+      ["POST", "GET", "PUT"].forEach(x => wrap.querySelector(".a-method").appendChild(opt(x, x, x === (a.method || "POST"))));
+      wrap.querySelector(".a-url").value = a.url || ""; wrap.querySelector(".a-body").value = a.body || "";
+    } else if (kind === "notify") {
+      wrap.innerHTML = '<input class="a-text" placeholder="Slack message (supports {{metric}})" style="flex:1;min-width:200px">';
+      wrap.querySelector(".a-text").value = a.text || "";
+    } else {
+      wrap.innerHTML = '<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:150px">' +
+        '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:150px">';
+      wrap.querySelector(".a-topic").value = a.topic || ""; wrap.querySelector(".a-payload").value = a.payload || "";
+    }
+    return wrap;
+  }
+  function actionRow(a) {
+    a = a || { kind: "mqtt", on: "match" };
+    const row = el("div", "action-row row"); row.style.alignItems = "center";
+    const onW = el("div"); onW.style.flex = "0 0 96px"; const on = document.createElement("select"); on.className = "a-on";
+    [["match", "on match"], ["clear", "on clear"], ["both", "on both"]].forEach(x => on.appendChild(opt(x[0], x[1], x[0] === (a.on || "both")))); onW.appendChild(on);
+    const kW = el("div"); kW.style.flex = "0 0 108px"; const k = document.createElement("select"); k.className = "a-kind";
+    [["mqtt", "MQTT"], ["webhook", "Webhook"], ["notify", "Notify"]].forEach(x => k.appendChild(opt(x[0], x[1], x[0] === (a.kind || "mqtt")))); kW.appendChild(k);
+    let fields = actionFields(k.value, a);
+    const rmW = el("div"); rmW.style.flex = "0 0 auto"; const rm = el("button", "secondary danger mini", "×"); rm.type = "button"; rmW.appendChild(rm);
+    k.addEventListener("change", () => { const nf = actionFields(k.value, {}); row.replaceChild(nf, fields); fields = nf; });
+    rm.addEventListener("click", () => row.remove());
+    row.appendChild(onW); row.appendChild(kW); row.appendChild(fields); row.appendChild(rmW);
+    return row;
+  }
   function ruleCard(rule) {
-    rule = rule || { name: "", description: "", topic: "", on_match: "", on_clear: "", enabled: true, combine: "any", conditions: [] };
+    rule = rule || { name: "", description: "", topic: "", on_match: "", on_clear: "", enabled: true, combine: "any", conditions: [], actions: [] };
     const card = el("div", "rule-card");
     card.innerHTML =
       '<div class="rhead"><span class="idx"></span>' +
@@ -424,8 +478,12 @@ function agoText(iso) {
       '<div class="combine-wrap"><label>When there are multiple conditions, match' +
       ' <select class="f-combine"></select></label></div>' +
       '<label style="margin-top:14px">Conditions</label><div class="conds"></div>' +
-      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button>' +
-      '<button type="button" class="danger mini remove-rule">Remove rule</button></div>';
+      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button></div>' +
+      '<details class="actions-wrap" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
+      'Extra actions <span class="hint">(optional — extra publishes, webhooks, Slack on a transition)</span></summary>' +
+      '<div class="actions" style="margin-top:8px;display:flex;flex-direction:column;gap:8px"></div>' +
+      '<div class="btnrow"><button type="button" class="secondary mini add-action">+ Add action</button></div></details>' +
+      '<div class="btnrow"><button type="button" class="danger mini remove-rule">Remove rule</button></div>';
     card.querySelector(".f-name").value = rule.name || "";
     card.querySelector(".f-topic").value = rule.topic || "";
     card.querySelector(".f-desc").value = rule.description || "";
@@ -438,6 +496,10 @@ function agoText(iso) {
     const conds = card.querySelector(".conds");
     (rule.conditions && rule.conditions.length ? rule.conditions : [null]).forEach(c => conds.appendChild(condRow(c)));
     card.querySelector(".add-cond").addEventListener("click", () => { conds.appendChild(condRow()); refreshCombine(card); });
+    const actionsBox = card.querySelector(".actions");
+    (rule.actions || []).forEach(a => actionsBox.appendChild(actionRow(a)));
+    if ((rule.actions || []).length) card.querySelector(".actions-wrap").open = true;
+    card.querySelector(".add-action").addEventListener("click", () => actionsBox.appendChild(actionRow()));
     card.querySelector(".remove-rule").addEventListener("click", () => { card.remove(); reindex(); });
     refreshCombine(card);
     return card;
@@ -454,10 +516,22 @@ function agoText(iso) {
         const operator = row.querySelector(".c-op").value;
         const meta = METRICS[metric] || {};
         const noVal = operator === "changed" || (meta.type === "alert" && operator === "any");
+        const forv = (row.querySelector(".c-for").value || "").trim();
+        const modeSel = row.querySelector(".c-vmode");
+        const vm = row.querySelector(".c-vmetric");
+        if (modeSel && modeSel.value === "metric" && vm) {
+          return { metric, operator, value_metric: vm.value, for: forv };
+        }
         let value = "";
         if (!noVal) { const ctrl = row.querySelector(".c-val"); value = ctrl ? ctrl.value : ""; }
-        const forv = (row.querySelector(".c-for").value || "").trim();
         return { metric, operator, value, for: forv };
+      });
+      const actions = [...card.querySelectorAll(".action-row")].map(row => {
+        const kind = row.querySelector(".a-kind").value;
+        const on = row.querySelector(".a-on").value;
+        if (kind === "webhook") return { kind, on, url: (row.querySelector(".a-url").value || "").trim(), method: row.querySelector(".a-method").value, body: row.querySelector(".a-body").value };
+        if (kind === "notify") return { kind, on, text: (row.querySelector(".a-text").value || "").trim() };
+        return { kind, on, topic: (row.querySelector(".a-topic").value || "").trim(), payload: row.querySelector(".a-payload").value };
       });
       return {
         name: card.querySelector(".f-name").value.trim(),
@@ -468,6 +542,7 @@ function agoText(iso) {
         enabled: card.querySelector(".f-enabled").checked,
         combine: card.querySelector(".f-combine").value,
         conditions: conds,
+        actions: actions,
       };
     });
   }
@@ -483,6 +558,11 @@ function agoText(iso) {
       for (const c of r.conditions) {
         const meta = METRICS[c.metric] || {};
         if (c.for && !durRe.test(c.for.trim())) return "Rule '" + r.name + "': '" + c.metric + "' for must be a duration like 10m, 30s, 2h.";
+        if (c.value_metric) {
+          if (!NUMCMP.includes(c.operator)) return "Rule '" + r.name + "': comparing to a metric needs < <= > >= == != (not " + c.operator + ").";
+          if (!METRICS[c.value_metric]) return "Rule '" + r.name + "': unknown comparison metric '" + c.value_metric + "'.";
+          continue;
+        }
         if (c.operator === "changed") continue;
         if (meta.type === "alert" && c.operator === "any") continue;
         if (c.operator === "between") {
@@ -498,6 +578,11 @@ function agoText(iso) {
         }
         if (c.value === "") return "Rule '" + r.name + "': the " + c.metric + " condition needs a value.";
         if (meta.type === "number" && isNaN(Number(c.value))) return "Rule '" + r.name + "': " + c.metric + " needs a numeric value.";
+      }
+      for (const a of (r.actions || [])) {
+        if (a.kind === "mqtt" && !a.topic) return "Rule '" + r.name + "': an MQTT action needs a topic.";
+        if (a.kind === "webhook" && !a.url) return "Rule '" + r.name + "': a webhook action needs a URL.";
+        if (a.kind === "notify" && !a.text) return "Rule '" + r.name + "': a notify action needs a message.";
       }
     }
     return "";
@@ -584,21 +669,33 @@ function agoText(iso) {
   // Mock events mirroring the two shapes the live app records (monitor + UI).
   const events = [
     { ts: ago(1),   device: "maintenance_hold", action: "manual_set", state: "on", by: "admin" },
+    { ts: ago(2),   device: "vent_fan", action: "action_fired", kind: "notify", target: "slack", trigger: "match", ok: true, by: "monitor" },
+    { ts: ago(2),   device: "vent_fan", action: "action_fired", kind: "webhook", target: "https://hooks.example.com/vent", trigger: "match", ok: true, by: "monitor" },
     { ts: ago(3),   device: "irrigation_rain_inhibit", source: "auto", state: "on", by: "monitor" },
+    { ts: ago(9),   topic: "facility/cmd/relay1", action: "mqtt_publish", qos: 1, retain: false, by: "admin" },
     { ts: ago(18),  variable: "maintenance_mode", action: "variable_set", value: true, by: "admin" },
     { ts: ago(46),  device: "vent_fan", source: "auto", state: "off", by: "monitor" },
+    { ts: ago(47),  device: "vent_fan", action: "action_fired", kind: "webhook", target: "https://hooks.example.com/vent", trigger: "clear", ok: false, by: "monitor" },
     { ts: ago(95),  device: "irrigation_rain_inhibit", source: "auto", state: "off", by: "monitor" },
     { ts: ago(140), device: "vent_fan", source: "manual", state: "on", by: "admin" },
   ];
   function describe(e) {
     if (e.action === "manual_set")   return { what: e.device, action: "manual override", detail: String(e.state).toUpperCase() };
     if (e.action === "variable_set") return { what: e.variable, action: "variable set", detail: String(e.value) };
+    if (e.action === "mqtt_publish") return { what: e.topic, action: "manual publish", detail: "qos " + e.qos + (e.retain ? " · retain" : "") };
+    if (e.action === "action_fired") {
+      const tgt = e.kind === "notify" ? "Slack" : (e.target || "");
+      return { what: e.device, action: e.kind + " action" + (e.ok === false ? " (failed)" : ""),
+               detail: "on " + (e.trigger || "") + (tgt ? " → " + tgt : "") };
+    }
     const src = e.source === "manual" ? "manual" : "automatic";
     return { what: e.device, action: src + " state change", detail: String(e.state).toUpperCase() };
   }
   function pillFor(d) {
-    if (d.action === "manual override" || /^manual/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
+    if (d.action === "manual override" || d.action === "manual publish" || /^manual/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
     if (d.action === "variable set") return '<span class="pill na">' + esc(d.action) + "</span>";
+    if (/\(failed\)/.test(d.action)) return '<span class="pill na">' + esc(d.action) + "</span>";
+    if (/ action$/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
     return '<span class="pill off">' + esc(d.action) + "</span>";
   }
   document.getElementById("act-count").textContent = events.length + " recent";
@@ -683,6 +780,159 @@ function agoText(iso) {
   // "last poll" drifts so agoText stays lively, like the auto-refresh in the live page.
   renderHealth(); renderLog();
   setInterval(renderHealth, 4000);
+})();
+
+/* =========================================================================
+   INPUTS  ·  sources editor: operator variables, MQTT + HTTP inputs, computed
+   Mirrors the live webui.py Inputs page; client-side only (no persistence).
+   ========================================================================= */
+(function inputs() {
+  const form = document.getElementById("inputs-form");
+  if (!form) return;
+
+  const SRC = window.DEMO_SOURCES || {};
+  const PARSE = ["number", "bool", "string"];
+  function el(t, c, h) { const e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; }
+  function opt(v, l, s) { const o = document.createElement("option"); o.value = v; o.textContent = l || v; if (s) o.selected = true; return o; }
+  function rmBtn() { const b = el("button", "secondary danger mini", "×"); b.type = "button"; b.style.margin = "0"; return b; }
+
+  // ---- variables ----
+  const vars = document.getElementById("vars");
+  function varDefault(type, val) {
+    let c;
+    if (type === "number") { c = document.createElement("input"); c.type = "number"; c.step = "any"; c.className = "v-def"; c.value = val != null ? val : ""; c.placeholder = "default"; }
+    else { c = document.createElement("select"); c.className = "v-def"; c.appendChild(opt("true", "true", String(val) === "true")); c.appendChild(opt("false", "false", String(val) !== "true")); }
+    return c;
+  }
+  function varRow(v) {
+    v = v || { name: "", type: "bool", default: "false" };
+    const row = el("div", "row"); row.style.alignItems = "flex-end";
+    const nw = el("div"); nw.innerHTML = '<label style="margin-top:0">Name</label>'; const n = el("input", "v-name"); n.value = v.name || ""; n.placeholder = "maintenance_mode"; nw.appendChild(n);
+    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Type</label>'; const t = document.createElement("select"); t.className = "v-type"; ["bool", "number"].forEach(x => t.appendChild(opt(x, x, x === v.type))); tw.appendChild(t);
+    const dw = el("div"); dw.innerHTML = '<label style="margin-top:0">Default</label>'; const dwrap = el("div", "v-defwrap"); dwrap.appendChild(varDefault(v.type, v.default)); dw.appendChild(dwrap);
+    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm);
+    t.addEventListener("change", () => { dwrap.innerHTML = ""; dwrap.appendChild(varDefault(t.value, null)); });
+    rm.addEventListener("click", () => row.remove());
+    row.appendChild(nw); row.appendChild(tw); row.appendChild(dw); row.appendChild(rw);
+    return row;
+  }
+  document.getElementById("add-var").addEventListener("click", () => vars.appendChild(varRow()));
+
+  // ---- mqtt ----
+  const mqtts = document.getElementById("mqtts");
+  function mqttRow(m) {
+    m = m || { topic: "", metric: "", parse: "number" };
+    const row = el("div", "row"); row.style.alignItems = "flex-end";
+    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Topic</label>'; const t = el("input", "m-topic"); t.value = m.topic || ""; t.placeholder = "sensors/tank/level"; tw.appendChild(t);
+    const me = el("div"); me.innerHTML = '<label style="margin-top:0">Metric name</label>'; const mm = el("input", "m-metric"); mm.value = m.metric || ""; mm.placeholder = "tank_level"; me.appendChild(mm);
+    const pw = el("div"); pw.innerHTML = '<label style="margin-top:0">Parse</label>'; const p = document.createElement("select"); p.className = "m-parse"; PARSE.forEach(x => p.appendChild(opt(x, x, x === m.parse))); pw.appendChild(p);
+    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm); rm.addEventListener("click", () => row.remove());
+    row.appendChild(tw); row.appendChild(me); row.appendChild(pw); row.appendChild(rw);
+    return row;
+  }
+  document.getElementById("add-mqtt").addEventListener("click", () => mqtts.appendChild(mqttRow()));
+
+  // ---- http ----
+  const https = document.getElementById("https");
+  function httpMapRow(mp) {
+    mp = mp || { metric: "", path: "", type: "number" };
+    const row = el("div", "row"); row.style.alignItems = "flex-end";
+    const me = el("div"); me.innerHTML = '<label style="margin-top:0">Metric</label>'; const m = el("input", "h-metric"); m.value = mp.metric || ""; m.placeholder = "power_kw"; me.appendChild(m);
+    const pe = el("div"); pe.innerHTML = '<label style="margin-top:0">JSON path</label>'; const p = el("input", "h-path"); p.value = mp.path || ""; p.placeholder = "data.current_kw"; pe.appendChild(p);
+    const tw = el("div"); tw.innerHTML = '<label style="margin-top:0">Type</label>'; const t = document.createElement("select"); t.className = "h-type"; PARSE.forEach(x => t.appendChild(opt(x, x, x === mp.type))); tw.appendChild(t);
+    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm); rm.addEventListener("click", () => row.remove());
+    row.appendChild(me); row.appendChild(pe); row.appendChild(tw); row.appendChild(rw);
+    return row;
+  }
+  function httpCard(h) {
+    h = h || { url: "", interval_minutes: 5, timeout: 10, map: [] };
+    const card = el("div", "rule-card");
+    card.innerHTML = '<div class="row"><div><label style="margin-top:0">URL</label><input class="h-url"></div>' +
+      '<div style="flex:0 0 130px"><label style="margin-top:0">Every (min)</label><input class="h-iv" type="number" min="1"></div>' +
+      '<div style="flex:0 0 120px"><label style="margin-top:0">Timeout (s)</label><input class="h-to" type="number" min="1"></div></div>' +
+      '<label style="margin-top:10px">Field mappings</label><div class="h-map"></div>' +
+      '<div class="btnrow"><button type="button" class="secondary mini add-map">+ Add mapping</button>' +
+      '<button type="button" class="danger mini rm-http">Remove input</button></div>';
+    card.querySelector(".h-url").value = h.url || ""; card.querySelector(".h-url").placeholder = "https://meter.local/api";
+    card.querySelector(".h-iv").value = h.interval_minutes != null ? h.interval_minutes : 5;
+    card.querySelector(".h-to").value = h.timeout != null ? h.timeout : 10;
+    const mapWrap = card.querySelector(".h-map");
+    (h.map && h.map.length ? h.map : [null]).forEach(mp => mapWrap.appendChild(httpMapRow(mp)));
+    card.querySelector(".add-map").addEventListener("click", () => mapWrap.appendChild(httpMapRow()));
+    card.querySelector(".rm-http").addEventListener("click", () => card.remove());
+    return card;
+  }
+  document.getElementById("add-http").addEventListener("click", () => https.appendChild(httpCard()));
+
+  // ---- computed ----
+  const comps = document.getElementById("comps");
+  function compRow(c) {
+    c = c || { name: "", expr: "" };
+    const row = el("div", "row"); row.style.alignItems = "flex-end";
+    const nw = el("div"); nw.innerHTML = '<label style="margin-top:0">Metric name</label>'; const n = el("input", "co-name"); n.value = c.name || ""; n.placeholder = "net_power"; nw.appendChild(n);
+    const ew = el("div"); ew.style.flex = "2"; ew.innerHTML = '<label style="margin-top:0">Formula</label>'; const ex = el("input", "co-expr"); ex.value = c.expr || ""; ex.placeholder = "power_kw - solar_kw"; ew.appendChild(ex);
+    const rw = el("div"); rw.style.flex = "0 0 auto"; const rm = rmBtn(); rw.appendChild(rm); rm.addEventListener("click", () => row.remove());
+    row.appendChild(nw); row.appendChild(ew); row.appendChild(rw);
+    return row;
+  }
+  document.getElementById("add-comp").addEventListener("click", () => comps.appendChild(compRow()));
+
+  function collect() {
+    const variables = [...vars.querySelectorAll(".row")].map(r => ({
+      name: r.querySelector(".v-name").value.trim(), type: r.querySelector(".v-type").value,
+      default: (r.querySelector(".v-def") || {}).value || "",
+    })).filter(v => v.name);
+    const mqtt_inputs = [...mqtts.querySelectorAll(".row")].map(r => ({
+      topic: r.querySelector(".m-topic").value.trim(), metric: r.querySelector(".m-metric").value.trim(),
+      parse: r.querySelector(".m-parse").value,
+    })).filter(m => m.topic || m.metric);
+    const http_inputs = [...https.querySelectorAll(".rule-card")].map(c => ({
+      url: c.querySelector(".h-url").value.trim(),
+      map: [...c.querySelectorAll(".h-map .row")].map(r => ({ metric: r.querySelector(".h-metric").value.trim() })).filter(m => m.metric),
+    })).filter(h => h.url || h.map.length);
+    const computed = [...comps.querySelectorAll(".row")].map(r => ({
+      name: r.querySelector(".co-name").value.trim(), expr: r.querySelector(".co-expr").value.trim(),
+    })).filter(c => c.name || c.expr);
+    return { variables, mqtt_inputs, http_inputs, computed };
+  }
+
+  const RESERVED = ["is_raining", "precip_accum_in", "precipitation_probability", "temperature",
+    "wind_speed_mph", "humidity", "short_forecast", "active_alert", "time_hour", "time_minute",
+    "time_weekday", "time_is_weekend", "time_is_daytime"];
+  function validate(src) {
+    const seen = {};
+    function claim(name) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return "'" + name + "' is not a valid metric name.";
+      if (RESERVED.includes(name)) return "'" + name + "' collides with a built-in metric.";
+      if (seen[name]) return "'" + name + "' is defined twice (collides).";
+      seen[name] = 1; return "";
+    }
+    for (const v of src.variables) { const e = claim("var_" + v.name); if (e) return e; }
+    for (const m of src.mqtt_inputs) { if (!m.metric) return "Each MQTT input needs a metric name."; const e = claim(m.metric); if (e) return e; }
+    for (const h of src.http_inputs) for (const mp of h.map) { const e = claim(mp.metric); if (e) return e; }
+    for (const c of src.computed) {
+      if (!c.expr) return "Computed metric '" + c.name + "' needs a formula.";
+      const e = claim(c.name); if (e) return e;
+      const refs = (c.expr.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+      for (const r of refs) if (!seen[r] && !RESERVED.includes(r)) return "Computed '" + c.name + "' references unknown metric '" + r + "' (define it above).";
+    }
+    return "";
+  }
+
+  const errBox = document.getElementById("inputs-err");
+  form.addEventListener("submit", e => {
+    e.preventDefault();
+    const src = collect();
+    const err = validate(src);
+    errBox.textContent = err; errBox.style.color = "#fda4a4";
+    if (err) { toast("Could not save: " + err, true); return; }
+    toast("Inputs saved (demo — nothing was written).");
+  });
+
+  (SRC.variables || []).forEach(v => vars.appendChild(varRow(v)));
+  (SRC.mqtt_inputs || []).forEach(m => mqtts.appendChild(mqttRow(m)));
+  (SRC.http_inputs || []).forEach(h => https.appendChild(httpCard(h)));
+  (SRC.computed || []).forEach(c => comps.appendChild(compRow(c)));
 })();
 
 /* =========================================================================

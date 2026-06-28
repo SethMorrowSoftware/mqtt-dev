@@ -27,11 +27,15 @@ publishes on/off MQTT directives, all editable from the web UI:
 
 - **Inputs:** NWS weather, a [schedule / clock](#available-metrics) (incl.
   sunrise/sunset), [operator variables](#operator-variables-optional) you toggle
-  in the UI, [MQTT sensor topics](#mqtt-sensor-inputs-optional), and
-  [HTTP JSON endpoints](#http-json-inputs-optional).
+  in the UI, [MQTT sensor topics](#mqtt-sensor-inputs-optional),
+  [HTTP JSON endpoints](#http-json-inputs-optional), and **computed metrics**
+  derived from any of these with a formula.
 - **Rules:** nested `any`/`all`/`not`, comparison + `between`/`in`/`changed`
-  operators, a `for:` sustain, per-rule `enable`, **time windows**, and
-  **hysteresis** (anti-short-cycle for real loads).
+  operators, `regex` on text, **metric-to-metric** comparison, a `for:` sustain,
+  per-rule `enable`, **time windows**, and **hysteresis** (anti-short-cycle).
+- **Actions:** the built-in MQTT publish, plus optional [extra actions](#extra-actions-beyond-the-built-in-publish)
+  per rule — multiple/templated publishes, **webhooks**, and **Slack notify** on
+  a transition.
 - **Control:** opt-in, audited [manual Auto/On/Off](#manual-control-opt-in) of
   any device from the dashboard; an outbound-only
   [remote status page](#remote-status-page-read-only).
@@ -187,10 +191,11 @@ Run the offline logic tests (no network needed):
 - **Inputs** — manage the **sources** your rules draw on, without hand-editing
   `config.yaml`: declare **operator variables** (`var_<name>` flags/setpoints you
   toggle from the dashboard), subscribe to **MQTT sensor inputs** (another
-  device's topic → a metric), and poll **HTTP JSON inputs** (an endpoint with
-  dotted-path field mappings → metrics). Add/remove rows inline; everything is
-  validated and name-collision-checked before saving, and each new source
-  immediately appears as a metric in the Rules builder.
+  device's topic → a metric), poll **HTTP JSON inputs** (an endpoint with
+  dotted-path field mappings → metrics), and define **computed metrics** (a
+  formula over other metrics). Add/remove rows inline; everything is validated
+  and name-collision-checked before saving, and each new source immediately
+  appears as a metric in the Rules builder.
 - **MQTT** — a live **MQTT console**. The web UI keeps its own broker
   subscription and shows a **live message feed** (filter by topic prefix) and a
   **Topics** view (the latest retained value per topic). A **publish console**
@@ -200,7 +205,9 @@ Run the offline logic tests (no network needed):
   LAN-only and audited). The subscription is configurable
   (`web.mqtt_console_enabled` / `mqtt_console_topics` / `mqtt_console_buffer`).
 - **Activity** — a read-only audit log of every device state change (automatic
-  or manual) and operator action, newest first, in plain language.
+  or manual), operator action, manual MQTT publish, and **extra action that
+  fired** (webhook / notify / extra publish, with an ok/failed indicator),
+  newest first, in plain language.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
   config valid, time since last poll), a configuration summary (rule/metric/
   input counts and the files in use), and a **live runtime log viewer** that
@@ -472,8 +479,8 @@ Available metrics:
 | `temperature` | current air temp, °F (measured if a station is nearby) | `< <= > >= == != between in` |
 | `wind_speed_mph` | current wind speed, mph | `< <= > >= == != between in` |
 | `humidity` | relative humidity, 0–100% | `< <= > >= == != between in` |
-| `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in` |
-| `active_alert` | NWS watches/warnings | `any`, `contains`, `equals` |
+| `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in`, `regex` |
+| `active_alert` | NWS watches/warnings | `any`, `contains`, `equals`, `regex` |
 | `time_hour` | local hour, 0–23 | `< <= > >= == != between in` |
 | `time_minute` | local minute, 0–59 | `< <= > >= == != between in` |
 | `time_weekday` | `mon`…`sun` (local) | `equals`, `in`, `contains` |
@@ -499,6 +506,33 @@ during daytime hours, or skip a rule on weekends:
 `between` takes an inclusive `[low, high]` pair; `in` takes a list of allowed
 values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).
 
+**Richer conditionals** for building a fully custom controller:
+
+- **Compare two metrics** — use `value_metric` instead of `value` to compare a
+  metric against another metric's live value (works with `< <= > >= == !=` on
+  number/bool metrics). Great with operator variables as setpoints:
+  ```yaml
+  - { metric: tank_level, operator: "<", value_metric: var_tank_setpoint }
+  ```
+  If either metric is unavailable that cycle, the rule holds its last state.
+- **Regex on text** — `operator: regex` matches a text metric (or any NWS alert)
+  against a case-insensitive pattern:
+  `{ metric: short_forecast, operator: regex, value: "^(light|heavy) rain" }`.
+- **Computed (derived) metrics** — a top-level `computed:` section defines new
+  number metrics from a small formula (`+ - * / // % **` and parentheses) over
+  other metrics. Each becomes a first-class metric rules can use and the builder
+  discovers automatically:
+  ```yaml
+  computed:
+    net_power:  { expr: "power_kw - solar_kw" }       # references mqtt/http inputs
+    temp_delta: { expr: "temperature - var_temp_setpoint" }
+  ```
+  References must resolve to a metric defined **before** it (built-ins,
+  variables, mqtt/http inputs, or an earlier computed), which makes reference
+  cycles impossible. A missing input — or a divide-by-zero — yields no value, so
+  dependent rules hold their last state (fail-safe). Edit these on the **Inputs**
+  page, alongside variables and sensor inputs.
+
 Two history-aware constructs are also available on any condition:
 
 - **`operator: changed`** (no `value`) — true on the cycle a metric's value
@@ -515,6 +549,37 @@ group), including the `enabled` toggle, `between`/`in`, the `changed` operator,
 and a per-condition `for:`. Rules using nested/`not` conditions, a time window,
 or hysteresis are edited in the **YAML (advanced)** tab, which the Rules page
 opens automatically when it detects them.
+
+### Extra actions (beyond the built-in publish)
+
+Besides the built-in `on_match`/`on_clear` publish to `topic`, a rule can fire
+**extra actions** on a transition via an `actions:` list — drive several devices,
+hit a webhook, or send a Slack message from one rule. Each action has a
+`trigger` (`match` / `clear` / `both`) and is one of three kinds. Payloads,
+URLs, bodies, and text support **`{{metric}}` templating** with the cycle's live
+values:
+
+```yaml
+- name: vent_fan
+  when: { metric: temperature, operator: ">", value: 85 }
+  topic: "facility/vent_fan"
+  on_match: "ON"
+  on_clear: "OFF"
+  actions:
+    - { trigger: match, mqtt: { topic: "facility/fan2", payload: "RUN {{temperature}}", retain: true } }
+    - { trigger: both,  webhook: { url: "https://hooks.example.com/vent", method: POST, body: '{"temp": {{temperature}}}' } }
+    - { trigger: clear, notify: { text: "Vent fan cleared at {{temperature}}°F" } }
+```
+
+- **`mqtt`** — an extra publish (`topic`, `payload`, optional `qos`/`retain`).
+- **`webhook`** — an HTTP request (`url`, `method` GET/POST/PUT, optional `body`,
+  `headers`). Outbound and best-effort.
+- **`notify`** — a Slack message (`text`) via the configured Slack bot.
+
+Use **`trigger`**, not `on` (`on` is a YAML boolean and would be misread). All
+actions are **best-effort** — a failed action is logged and never blocks the
+cycle or changes the committed state. Edit them in the form builder's **Extra
+actions** section per rule, or in the YAML tab.
 
 ### Time windows & hysteresis (anti-short-cycle)
 

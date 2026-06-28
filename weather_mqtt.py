@@ -21,6 +21,7 @@ Test:  python weather_mqtt.py --config config.yaml --once --dry-run --verbose
 """
 
 import argparse
+import ast
 import json
 import logging
 import logging.handlers
@@ -61,7 +62,7 @@ NUMERIC_COMPARE = ("<", "<=", ">", ">=", "==", "!=")
 # [low, high] pair; `in` takes a list of allowed values.
 SET_OPS = ("between", "in")
 NUMBER_OPS = NUMERIC_COMPARE + SET_OPS
-TEXT_OPS = ("contains", "equals", "in")
+TEXT_OPS = ("contains", "equals", "in", "regex")
 METRIC_SPECS = {
     "is_raining":                {"type": "bool",   "ops": ("==", "!=")},
     "precip_accum_in":           {"type": "number", "ops": NUMBER_OPS},
@@ -70,7 +71,7 @@ METRIC_SPECS = {
     "wind_speed_mph":            {"type": "number", "ops": NUMBER_OPS},
     "humidity":                  {"type": "number", "ops": NUMBER_OPS},
     "short_forecast":            {"type": "text",   "ops": TEXT_OPS},
-    "active_alert":              {"type": "alert",  "ops": ("any", "contains", "equals")},
+    "active_alert":              {"type": "alert",  "ops": ("any", "contains", "equals", "regex")},
     # --- schedule / clock inputs (ROADMAP Phase 3, no external calls) ---
     "time_hour":                 {"type": "number", "ops": NUMBER_OPS},   # 0..23 local
     "time_minute":               {"type": "number", "ops": NUMBER_OPS},   # 0..59
@@ -106,6 +107,33 @@ def _validate_condition(cond, rule_name, specs=METRIC_SPECS):
     if op not in spec["ops"]:
         raise ValueError(f"rule '{rule_name}': operator '{op}' is not valid for "
                          f"metric '{metric}' (valid: {', '.join(spec['ops'])})")
+    # Compare against another metric's live value instead of a constant.
+    if cond.get("value_metric"):
+        other = cond["value_metric"]
+        if op not in NUMERIC_COMPARE:
+            raise ValueError(f"rule '{rule_name}': value_metric only works with "
+                             f"{', '.join(NUMERIC_COMPARE)} (not '{op}')")
+        if spec["type"] not in ("number", "bool"):
+            raise ValueError(f"rule '{rule_name}': value_metric needs a number/bool "
+                             f"metric on the left (not '{metric}')")
+        ospec = specs.get(other)
+        if ospec is None:
+            raise ValueError(f"rule '{rule_name}': value_metric '{other}' is not a "
+                             f"known metric (valid: {', '.join(sorted(specs))})")
+        if ospec["type"] not in ("number", "bool"):
+            raise ValueError(f"rule '{rule_name}': value_metric '{other}' must be a "
+                             "number/bool metric")
+        return
+    # `regex` (text/alert): the value must be a compilable pattern.
+    if op == "regex":
+        if "value" not in cond or cond["value"] is None:
+            raise ValueError(f"rule '{rule_name}': '{metric}' regex needs a pattern value")
+        try:
+            re.compile(str(cond["value"]))
+        except re.error as e:
+            raise ValueError(f"rule '{rule_name}': '{metric}' regex {cond['value']!r} "
+                             f"is invalid ({e})")
+        return
     if "value" not in cond or cond["value"] is None:
         raise ValueError(f"rule '{rule_name}': condition on '{metric}' needs a value")
     value = cond["value"]
@@ -187,11 +215,140 @@ def variable_specs(variables):
 
 
 def metric_catalogue(cfg):
-    """The full metric catalogue: built-ins + variables + mqtt_in + http_poll."""
+    """The full metric catalogue: built-ins + variables + mqtt_in + http_poll +
+    computed (derived) metrics."""
     return {**METRIC_SPECS,
             **variable_specs(cfg.get("variables", {})),
             **mqtt_input_specs(cfg.get("mqtt_inputs", [])),
-            **http_input_specs(cfg.get("http_inputs", []))}
+            **http_input_specs(cfg.get("http_inputs", [])),
+            **computed_specs(cfg.get("computed", {}))}
+
+
+# ---------------------------------------------------------------------------
+# Computed (derived) metrics: a tiny, safe arithmetic over other metrics.
+# A `computed:` section maps a new metric name to {expr: "<arithmetic>"} using
+# other metric names, numbers, + - * / // % ** and parentheses. Each becomes a
+# number-typed metric usable in rules and discovered by the builder. Evaluation
+# is fail-safe: a missing input (or a divide-by-zero) yields None, so dependent
+# rules hold their last state exactly like any other unavailable metric.
+# ---------------------------------------------------------------------------
+_EXPR_BINOPS = {
+    ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b,
+    ast.Pow: lambda a, b: a ** b,
+}
+_EXPR_UNARY = {ast.UAdd: lambda a: +a, ast.USub: lambda a: -a}
+
+
+def compile_expr(expr):
+    """Parse an arithmetic expression into an AST, rejecting anything unsafe
+    (calls, attributes, names that aren't bare identifiers, etc). Raises
+    ValueError on a syntax/safety problem; returns (tree, referenced_names)."""
+    try:
+        tree = ast.parse(str(expr), mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"could not parse expression {expr!r}: {e}")
+    names = set()
+
+    def check(node):
+        if isinstance(node, ast.Expression):
+            return check(node.body)
+        if isinstance(node, ast.BinOp) and type(node.op) in _EXPR_BINOPS:
+            check(node.left); check(node.right); return
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _EXPR_UNARY:
+            check(node.operand); return
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            return
+        if isinstance(node, ast.Name):
+            names.add(node.id); return
+        raise ValueError(f"expression {expr!r} uses an unsupported element "
+                         f"({type(node).__name__}); only numbers, metric names and "
+                         "+ - * / // % ** ( ) are allowed")
+    check(tree)
+    return tree, names
+
+
+def _eval_expr(node, metrics):
+    """Evaluate a compiled expression against `metrics`. Returns a number, or
+    None if any referenced metric is missing/None or a math error occurs."""
+    if isinstance(node, ast.Expression):
+        return _eval_expr(node.body, metrics)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        v = metrics.get(node.id)
+        if isinstance(v, bool):
+            return int(v)
+        return v if isinstance(v, (int, float)) else None
+    if isinstance(node, ast.UnaryOp):
+        a = _eval_expr(node.operand, metrics)
+        return None if a is None else _EXPR_UNARY[type(node.op)](a)
+    if isinstance(node, ast.BinOp):
+        a = _eval_expr(node.left, metrics)
+        b = _eval_expr(node.right, metrics)
+        if a is None or b is None:
+            return None
+        try:
+            return _EXPR_BINOPS[type(node.op)](a, b)
+        except (ZeroDivisionError, ValueError, OverflowError):
+            return None
+    return None
+
+
+def computed_specs(computed):
+    """Metric specs for computed metrics: each is a number with the full numeric
+    operator set (so rules can compare/derive freely)."""
+    out = {}
+    for name in (computed or {}):
+        out[str(name)] = {"type": "number", "ops": NUMBER_OPS + ("changed",)}
+    return out
+
+
+def _validate_computed(computed, taken_names):
+    """Validate/normalize the `computed:` section. References must resolve to a
+    metric already known at that point (built-ins/vars/mqtt/http or an *earlier*
+    computed metric), which makes reference cycles structurally impossible.
+    Returns an ordered dict {name: {expr}}."""
+    if not isinstance(computed, dict):
+        raise ValueError("config.computed must be a mapping of name -> { expr }")
+    available = set(taken_names)
+    out = {}
+    for name, spec in computed.items():
+        nm = str(name).strip()
+        if not nm.isidentifier():
+            raise ValueError(f"computed metric '{name}' is not a valid name "
+                             "(letters, digits, underscore; not starting with a digit)")
+        if nm in available:
+            raise ValueError(f"computed metric '{nm}' collides with an existing metric")
+        if not isinstance(spec, dict) or "expr" not in spec:
+            raise ValueError(f"computed metric '{nm}' needs an 'expr'")
+        _tree, refs = compile_expr(spec["expr"])
+        unknown = sorted(r for r in refs if r not in available)
+        if unknown:
+            raise ValueError(f"computed metric '{nm}' references unknown metric(s): "
+                             f"{', '.join(unknown)} (define them, or an earlier "
+                             "computed metric, first)")
+        out[nm] = {"expr": str(spec["expr"])}
+        available.add(nm)
+    return out
+
+
+def compute_metrics(computed, metrics):
+    """Evaluate computed metrics in declared order against `metrics`, returning a
+    dict of the new values. Later expressions can use earlier computed metrics."""
+    out = {}
+    work = dict(metrics)
+    for name, spec in (computed or {}).items():
+        try:
+            tree, _ = compile_expr(spec["expr"])
+            val = _eval_expr(tree, work)
+        except Exception:
+            val = None
+        out[name] = val
+        work[name] = val
+    return out
 
 
 def _ops_for_type(mtype):
@@ -533,6 +690,14 @@ def validate_config(cfg):
         cfg["http_inputs"] = _validate_http_inputs(cfg["http_inputs"], taken)
     else:
         cfg.setdefault("http_inputs", [])
+    # computed (derived) metrics -> reference only metrics defined before them.
+    if "computed" in cfg and cfg["computed"] is not None:
+        taken = (set(METRIC_SPECS) | set(variable_specs(cfg["variables"]))
+                 | set(mqtt_input_specs(cfg["mqtt_inputs"]))
+                 | set(http_input_specs(cfg["http_inputs"])))
+        cfg["computed"] = _validate_computed(cfg["computed"], taken)
+    else:
+        cfg.setdefault("computed", {})
     specs = metric_catalogue(cfg)
 
     if not isinstance(cfg["rules"], list) or not cfg["rules"]:
@@ -562,6 +727,9 @@ def validate_config(cfg):
             _validate_window(r["window"], name)
         if r.get("hysteresis") is not None:
             _validate_hysteresis(r["hysteresis"], name)
+        # Optional extra actions (mqtt/webhook/notify) on transitions.
+        if r.get("actions") is not None:
+            r["actions"] = _validate_actions(r["actions"], name)
         # Config-declared manual state (auto|on|off). The web UI sets runtime
         # overrides in overrides.json instead; this is just the fallback/default.
         man = str(r.get("manual", "auto")).strip().lower()
@@ -962,6 +1130,15 @@ NUMERIC_OPS = {
 }
 
 
+def _regex_search(pattern, text):
+    """Case-insensitive regex search used by the `regex` operator. A bad pattern
+    never raises mid-cycle (validation already rejects it); it just misses."""
+    try:
+        return re.search(str(pattern), str(text), re.IGNORECASE) is not None
+    except re.error:
+        return False
+
+
 def _eval_condition(cond, metrics, rule_name, state=None, now=None):
     """One condition: True/False, or None if its metric is unavailable.
 
@@ -1005,6 +1182,8 @@ def _eval_base(cond, metrics, rule_name, state):
             return any(str(value).lower() in a.lower() for a in alerts)
         if op == "equals":
             return any(a == value for a in alerts)
+        if op == "regex":
+            return any(_regex_search(value, a) for a in alerts)
         LOG.warning("Rule '%s': unknown alert operator '%s'", rule_name, op)
         return False
 
@@ -1018,6 +1197,8 @@ def _eval_base(cond, metrics, rule_name, state):
             return text.lower() == str(value).lower()
         if op == "in":
             return any(text.lower() == str(v).lower() for v in (value or []))
+        if op == "regex":
+            return _regex_search(value, text)
         LOG.warning("Rule '%s': unknown text operator '%s'", rule_name, op)
         return False
 
@@ -1027,6 +1208,15 @@ def _eval_base(cond, metrics, rule_name, state):
         LOG.warning("Rule '%s': metric '%s' unavailable this cycle",
                     rule_name, metric)
         return None
+    # Compare against another metric's live value instead of a constant.
+    if cond.get("value_metric"):
+        rhs = metrics.get(cond["value_metric"])
+        if rhs is None:
+            LOG.warning("Rule '%s': value_metric '%s' unavailable this cycle",
+                        rule_name, cond["value_metric"])
+            return None
+        fn = NUMERIC_OPS.get(op)
+        return None if fn is None else fn(current, rhs)
     if op == "between":
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             return None
@@ -1630,6 +1820,148 @@ def push_status(cfg, snapshot):
 
 
 # ---------------------------------------------------------------------------
+# Rule actions: extra things to do on a device's on/off transition.
+# Beyond the built-in `topic`/`on_match`/`on_clear` publish, a rule may declare
+# an `actions:` list. Each entry fires on the `match`, `clear`, or `both`
+# transition and is one of: mqtt (extra publish), webhook (HTTP request), or
+# notify (Slack). Payloads/URLs/bodies/text support {{metric}} templating with
+# the cycle's live values. All firing is best-effort -- a failed action never
+# stops the cycle or affects the committed state.
+# ---------------------------------------------------------------------------
+ACTION_TYPES = ("mqtt", "webhook", "notify")
+ACTION_TRIGGERS = ("match", "clear", "both")
+_TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def render_template(text, metrics):
+    """Substitute {{metric}} placeholders with live values. Unknown metrics
+    render empty. Non-string input is returned unchanged."""
+    if not isinstance(text, str):
+        return text
+
+    def sub(m):
+        v = metrics.get(m.group(1))
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return str(v)
+    return _TEMPLATE_RE.sub(sub, text)
+
+
+def _validate_actions(actions, rule_name):
+    """Validate/normalize a rule's `actions:` list. Returns the cleaned list."""
+    if not isinstance(actions, list):
+        raise ValueError(f"rule '{rule_name}': actions must be a list")
+    out = []
+    for i, a in enumerate(actions, 1):
+        if not isinstance(a, dict):
+            raise ValueError(f"rule '{rule_name}': action #{i} must be a mapping")
+        kinds = [k for k in ACTION_TYPES if k in a]
+        if len(kinds) != 1:
+            raise ValueError(f"rule '{rule_name}': action #{i} must have exactly one "
+                             f"of {', '.join(ACTION_TYPES)}")
+        kind = kinds[0]
+        spec = a.get(kind)
+        if not isinstance(spec, dict):
+            raise ValueError(f"rule '{rule_name}': action #{i} '{kind}' must be a mapping")
+        # `trigger` (not `on`): "on" is a YAML 1.1 boolean key, so it would load
+        # as True and silently break. trigger: match | clear | both.
+        trig = str(a.get("trigger", "both")).strip().lower()
+        if trig not in ACTION_TRIGGERS:
+            raise ValueError(f"rule '{rule_name}': action #{i} 'trigger' must be one of "
+                             f"{', '.join(ACTION_TRIGGERS)}")
+        if kind == "mqtt":
+            if not str(spec.get("topic", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} mqtt needs a 'topic'")
+            q = spec.get("qos")
+            if q is not None and int(_as_number(q, 0, "action qos")) not in (0, 1, 2):
+                raise ValueError(f"rule '{rule_name}': action #{i} mqtt qos must be 0, 1 or 2")
+        elif kind == "webhook":
+            if not str(spec.get("url", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook needs a 'url'")
+            method = str(spec.get("method", "POST")).strip().upper()
+            if method not in ("GET", "POST", "PUT"):
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook method must be "
+                                 "GET, POST or PUT")
+            if spec.get("headers") is not None and not isinstance(spec["headers"], dict):
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook headers must be a mapping")
+        elif kind == "notify":
+            if not str(spec.get("text", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} notify needs 'text'")
+        out.append(a)
+    return out
+
+
+def _do_webhook(spec, metrics):
+    """Fire one webhook action (best-effort, never raises)."""
+    url = render_template(spec.get("url", ""), metrics)
+    method = str(spec.get("method", "POST")).strip().upper()
+    body = render_template(spec.get("body", ""), metrics)
+    headers = {k: render_template(str(v), metrics) for k, v in (spec.get("headers") or {}).items()}
+    try:
+        if method == "GET":
+            requests.get(url, headers=headers, timeout=10)
+        elif method == "PUT":
+            requests.put(url, data=body, headers=headers, timeout=10)
+        else:
+            requests.post(url, data=body, headers=headers, timeout=10)
+        return True
+    except Exception as e:
+        LOG.warning("webhook %s %s failed: %s", method, url, e)
+        return False
+
+
+def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg, audit_file=None):
+    """Fire a rule's extra actions for an on (result=True) / off (result=False)
+    transition. Best-effort: each action is independent and never raises. Each
+    real (non-dry-run) action is recorded to the audit log so the Activity page
+    can show what fired."""
+    want = "match" if result else "clear"
+
+    def record(kind, target, ok):
+        if audit_file:
+            audit(audit_file, device=rule.get("name", "?"), action="action_fired",
+                  kind=kind, target=target, trigger=want, ok=bool(ok), by="monitor")
+
+    for a in (rule.get("actions") or []):
+        trig = str(a.get("trigger", "both")).strip().lower()
+        if trig not in (want, "both"):
+            continue
+        try:
+            if "mqtt" in a:
+                spec = a["mqtt"]
+                topic = render_template(str(spec.get("topic", "")), metrics)
+                payload = render_template(spec.get("payload", ""), metrics)
+                aqos = int(spec.get("qos", qos))
+                aretain = bool(spec.get("retain", retain))
+                if client is None:
+                    LOG.info("[DRY-RUN] would publish action '%s' -> %s (rule '%s')",
+                             payload, topic, rule["name"])
+                else:
+                    info = client.publish(topic, payload, qos=aqos, retain=aretain)
+                    ok = getattr(info, "rc", 0) == 0
+                    LOG.info("Action published '%s' -> %s (rule '%s')",
+                             payload, topic, rule["name"])
+                    record("mqtt", topic, ok)
+            elif "webhook" in a:
+                if client is None:
+                    LOG.info("[DRY-RUN] would call webhook for rule '%s'", rule["name"])
+                else:
+                    ok = _do_webhook(a["webhook"], metrics)
+                    record("webhook", render_template(str(a["webhook"].get("url", "")), metrics), ok)
+            elif "notify" in a:
+                text = render_template(str(a["notify"].get("text", "")), metrics)
+                if client is None:
+                    LOG.info("[DRY-RUN] would notify: %s", text)
+                else:
+                    ok = notify_slack(slack_cfg, text)
+                    record("notify", "slack", ok)
+        except Exception as e:
+            LOG.warning("Rule '%s' action failed: %s", rule.get("name", "?"), e)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
@@ -1765,6 +2097,7 @@ def main():
             poll_http_inputs(cfg.get("http_inputs", []), http_store, http_last,
                              now_utc, ua)            # GET due http_poll endpoints
             m.update(dict(http_store))               # latest http_poll values
+            m.update(compute_metrics(cfg.get("computed", {}), m))  # derived metrics
             rule_rows = []
             for rule in rules:
               try:
@@ -1821,6 +2154,12 @@ def main():
                                       state="on" if result else "off",
                                       source="manual" if manual in ("on", "off")
                                       else "auto", by="monitor")
+                        # Fire extra actions on a real transition (not on an
+                        # always_publish heartbeat). Independent of the built-in
+                        # publish; best-effort.
+                        if prev != result and rule.get("actions"):
+                            fire_actions(rule, result, m, client, qos, retain,
+                                         cfg.get("slack", {}), audit_file)
                     if commit:
                         last_state[rule["name"]] = result
 

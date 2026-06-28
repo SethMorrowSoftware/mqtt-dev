@@ -267,8 +267,26 @@ system "as customizable as possible" without engine changes.
     hand‑editing `config.yaml`; saved through the monitor's own validator
     (name‑collision checks, clear errors) so new metrics appear in the Rules
     builder immediately. Mirrored in the static demo.
+  - **Delivered (cont.):** **richer conditionals** — compare a metric to *another*
+    metric's live value (`value_metric`, with `< <= > >= == !=`); a `regex`
+    operator for text metrics and NWS alerts; and **computed (derived) metrics**
+    (a `computed:` section with a safe arithmetic expression — `+ - * / // % **` —
+    over earlier metrics, evaluated fail‑safe). All discovered by the builder,
+    editable in the UI (value_metric in the form builder, computed on the Inputs
+    page), and mirrored in the demo.
   - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
     read each poll cycle).
+- **Action layer — multiple action types (delivered):** beyond the built‑in
+  `on_match`/`on_clear` publish, a rule may declare an `actions:` list that fires
+  on a transition (`trigger: match | clear | both`). Three kinds: **mqtt** (extra
+  publish), **webhook** (HTTP GET/POST/PUT, outbound best‑effort), and **notify**
+  (Slack). Payloads/URLs/bodies/text support **`{{metric}}` templating** with live
+  values. Validated, fail‑safe (a failed action never blocks the cycle or changes
+  committed state), editable in the form builder's *Extra actions* section, and
+  mirrored in the demo. Each firing is **audited** (kind/target/trigger/ok) and
+  surfaced on the **Activity** page, so you can see what fired and whether it
+  succeeded. (This delivers the ROADMAP's pluggable action registry — webhooks
+  are no longer out of scope.)
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

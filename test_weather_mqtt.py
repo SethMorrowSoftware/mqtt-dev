@@ -788,6 +788,222 @@ def test_webui_inputs_editor():
             except OSError: pass
 
 
+def test_value_metric_comparison():
+    # Compare a metric to another metric's live value (number and bool).
+    cond = {"metric": "tank_level", "operator": "<", "value_metric": "tank_setpoint"}
+    assert w._eval_condition(cond, {"tank_level": 40, "tank_setpoint": 50}, "r") is True
+    assert w._eval_condition(cond, {"tank_level": 60, "tank_setpoint": 50}, "r") is False
+    # rhs unavailable -> None (fail-safe hold), not a crash
+    assert w._eval_condition(cond, {"tank_level": 60}, "r") is None
+    # validation: only numeric-compare operators, both sides number/bool
+    specs = {**w.METRIC_SPECS,
+             "tank_level": {"type": "number", "ops": w.NUMBER_OPS},
+             "tank_setpoint": {"type": "number", "ops": w.NUMBER_OPS}}
+    w._validate_condition(cond, "r", specs)                      # ok
+    # comparing to a text metric is rejected (it has no numeric-compare op)
+    specs_txt = {**specs, "label": {"type": "text", "ops": w.TEXT_OPS}}
+    for bad, needle in [
+        ({"metric": "tank_level", "operator": "between", "value_metric": "tank_setpoint"}, "only works with"),
+        ({"metric": "tank_level", "operator": "<", "value_metric": "nope"}, "not a known metric"),
+        ({"metric": "tank_level", "operator": "<", "value_metric": "label"}, "must be a number/bool"),
+    ]:
+        try:
+            w._validate_condition(bad, "r", specs_txt)
+            assert False, f"expected rejection: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+
+def test_regex_operator():
+    # Text metric regex (case-insensitive) and alert regex.
+    fc = {"metric": "short_forecast", "operator": "regex", "value": "^(light|heavy) rain"}
+    assert w._eval_condition(fc, {"short_forecast": "Light Rain"}, "r") is True
+    assert w._eval_condition(fc, {"short_forecast": "Sunny"}, "r") is False
+    al = {"metric": "active_alert", "operator": "regex", "value": "flood|tornado"}
+    assert w._eval_condition(al, {"active_alerts": ["Flood Warning"]}, "r") is True
+    assert w._eval_condition(al, {"active_alerts": ["Heat Advisory"]}, "r") is False
+    # regex is offered for text metrics and validated as a pattern
+    assert "regex" in w.METRIC_SPECS["short_forecast"]["ops"]
+    w._validate_condition(fc, "r")                               # ok
+    try:
+        w._validate_condition({"metric": "short_forecast", "operator": "regex",
+                               "value": "([unclosed"}, "r")
+        assert False, "expected invalid-regex rejection"
+    except ValueError as e:
+        assert "invalid" in str(e)
+
+
+def test_computed_metrics_eval_and_validate():
+    # Safe arithmetic: ordered eval, dependency on earlier computed, fail-safe None.
+    computed = {"net_power": {"expr": "power_kw - solar_kw"},
+                "headroom": {"expr": "(net_power) * 2 + 1"}}
+    out = w.compute_metrics(computed, {"power_kw": 5, "solar_kw": 3})
+    assert out == {"net_power": 2, "headroom": 5}
+    assert w.compute_metrics(computed, {"power_kw": 5})["headroom"] is None   # missing input
+    assert w.compute_metrics({"r": {"expr": "a / b"}}, {"a": 1, "b": 0})["r"] is None  # div by zero
+    # bools coerce to 0/1 so flags can drive arithmetic
+    assert w.compute_metrics({"x": {"expr": "is_raining * 10"}}, {"is_raining": True}) == {"x": 10}
+    # unsafe expressions are rejected at compile time
+    for bad in ("__import__('os')", "a.b", "foo(1)", "a if b else c"):
+        try:
+            w.compile_expr(bad); assert False, f"expected rejection of {bad!r}"
+        except ValueError:
+            pass
+    # validation: collision, unknown ref, missing expr, cycle-by-forward-ref
+    taken = set(w.METRIC_SPECS) | {"power_kw", "solar_kw"}
+    w._validate_computed({"net_power": {"expr": "power_kw - solar_kw"}}, taken)
+    for bad, needle in [
+        ({"temperature": {"expr": "1+1"}}, "collides"),
+        ({"x": {"expr": "missing + 1"}}, "unknown metric"),
+        ({"x": {"expr": "power_kw"}, "y": {"expr": "z + 1"}}, "unknown metric"),  # forward ref to later 'z'
+        ({"x": {}}, "needs an 'expr'"),
+    ]:
+        try:
+            w._validate_computed(bad, taken); assert False, f"expected: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+
+def test_rule_actions_template_validate_and_fire():
+    # {{metric}} templating (bools render true/false; unknown renders empty)
+    assert w.render_template("lvl={{tank}} on={{flag}} x={{nope}}",
+                             {"tank": 7, "flag": True}) == "lvl=7 on=true x="
+    # validation: trigger + exactly-one-type + per-type required fields
+    ok = [{"trigger": "match", "mqtt": {"topic": "a/cmd", "payload": "ON", "qos": 1}},
+          {"webhook": {"url": "https://h/", "method": "POST", "body": "{{tank}}"}},
+          {"trigger": "clear", "notify": {"text": "cleared"}}]
+    assert len(w._validate_actions(ok, "r")) == 3
+    for bad, needle in [
+        ([{"trigger": "match"}], "exactly one"),
+        ([{"mqtt": {}}], "needs a 'topic'"),
+        ([{"webhook": {"method": "POST"}}], "needs a 'url'"),
+        ([{"webhook": {"url": "h", "method": "DELETE"}}], "method must be"),
+        ([{"notify": {"text": ""}}], "needs 'text'"),
+        ([{"trigger": "never", "notify": {"text": "x"}}], "'trigger' must be"),
+        ([{"mqtt": {"topic": "t"}, "notify": {"text": "x"}}], "exactly one"),
+    ]:
+        try:
+            w._validate_actions(bad, "r"); assert False, f"expected: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+    # fire_actions: only the matching trigger fires; templating applied; dry-run safe
+    class _Info:  rc = 0
+    class _Fake:
+        def __init__(self): self.pub = []
+        def publish(self, *a, **k): self.pub.append((a, k)); return _Info()
+    fc = _Fake()
+    rule = {"name": "r", "actions": [
+        {"trigger": "match", "mqtt": {"topic": "a/cmd", "payload": "v={{tank}}", "qos": 2, "retain": False}},
+        {"trigger": "clear", "mqtt": {"topic": "a/cmd", "payload": "OFF"}},
+        {"trigger": "both", "mqtt": {"topic": "log", "payload": "x"}}]}
+    w.fire_actions(rule, True, {"tank": 9}, fc, 1, True, {})     # match + both
+    assert [p[0] for p in fc.pub] == [("a/cmd", "v=9"), ("log", "x")]
+    assert fc.pub[0][1] == {"qos": 2, "retain": False}           # action overrides defaults
+    fc.pub.clear()
+    w.fire_actions(rule, False, {"tank": 9}, fc, 1, True, {})    # clear + both
+    assert [p[0][0] for p in fc.pub] == ["a/cmd", "log"]
+    # dry-run (client None) never raises and never publishes
+    w.fire_actions(rule, True, {"tank": 9}, None, 1, True, {})
+
+
+def test_full_config_with_actions_validates():
+    import copy
+    cfg = {"version": 1, "location": {"latitude": 41, "longitude": -74},
+           "user_agent": "x (a@b.com)", "mqtt": {},
+           "rules": [{"name": "r", "topic": "t", "on_match": "ON", "on_clear": "OFF",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True},
+                      "actions": [{"trigger": "match", "webhook": {"url": "https://h/x"}},
+                                  {"notify": {"text": "rain={{is_raining}}"}}]}]}
+    out = w.validate_config(copy.deepcopy(cfg))
+    assert len(out["rules"][0]["actions"]) == 2
+    bad = copy.deepcopy(cfg); bad["rules"][0]["actions"] = [{"webhook": {"method": "POST"}}]
+    try:
+        w.validate_config(bad); assert False
+    except ValueError as e:
+        assert "needs a 'url'" in str(e)
+
+
+def test_fire_actions_audits():
+    # Each fired action is recorded to the audit log (so Activity can show it),
+    # with the kind, target, trigger, and an ok flag.
+    import tempfile, os
+    aud = tempfile.mktemp(suffix=".log")
+    class _Info:  rc = 0
+    class _Fake:
+        def publish(self, *a, **k): return _Info()
+    rule = {"name": "vent", "actions": [
+        {"trigger": "match", "mqtt": {"topic": "facility/fan", "payload": "v={{t}}"}},
+        {"trigger": "clear", "notify": {"text": "off"}}]}
+    try:
+        w.fire_actions(rule, True, {"t": 9}, _Fake(), 1, True, {}, aud)   # match -> mqtt only
+        events = w.read_audit(aud, 50)
+        assert len(events) == 1
+        e = events[0]
+        assert e["action"] == "action_fired" and e["device"] == "vent"
+        assert e["kind"] == "mqtt" and e["target"] == "facility/fan"
+        assert e["trigger"] == "match" and e["ok"] is True
+        # dry-run (client None) records nothing
+        w.fire_actions(rule, True, {"t": 9}, None, 1, True, {}, aud)
+        assert len(w.read_audit(aud, 50)) == 1
+    finally:
+        try: os.unlink(aud)
+        except OSError: pass
+
+
+def test_webui_rule_actions_roundtrip():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_rule_actions_roundtrip ({e})")
+        return
+    import tempfile, os, json, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+           "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        assert b"Extra actions" in c.get("/rules").data        # actions editor present
+        rules = [{"name": "vent", "topic": "facility/vent", "on_match": "ON", "on_clear": "OFF",
+                  "enabled": True, "combine": "any",
+                  "conditions": [{"metric": "temperature", "operator": ">", "value": "85"}],
+                  "actions": [
+                      {"kind": "mqtt", "on": "match", "topic": "facility/fan", "payload": "RUN {{temperature}}"},
+                      {"kind": "webhook", "on": "both", "url": "https://h/x", "method": "POST", "body": "t={{temperature}}"},
+                      {"kind": "notify", "on": "clear", "text": "vent cleared"}]}]
+        c.post("/rules", data={"mode": "form", "rules_json": json.dumps(rules)})
+        saved = yaml.safe_load(open(p))["rules"][0]
+        acts = saved["actions"]
+        # stored with the collision-safe `trigger` key (NOT `on`), correct values
+        assert [a["trigger"] for a in acts] == ["match", "both", "clear"]
+        assert acts[0]["mqtt"]["payload"] == "RUN {{temperature}}"
+        assert acts[1]["webhook"]["url"] == "https://h/x"
+        # the monitor accepts it, and it round-trips back to the builder shape
+        w.validate_config(yaml.safe_load(open(p)))
+        st = webui._rule_to_structured(saved)
+        assert [(a["kind"], a["on"]) for a in st["actions"]] == \
+            [("mqtt", "match"), ("webhook", "both"), ("notify", "clear")]
+        # a malformed action is rejected with a clear message
+        bad = [{"name": "b", "topic": "t", "on_match": "1", "enabled": True, "combine": "any",
+                "conditions": [{"metric": "is_raining", "operator": "==", "value": "true"}],
+                "actions": [{"kind": "notify", "on": "match", "text": "hi"},
+                            {"kind": "mqtt", "on": "match", "topic": ""}]}]  # empty topic -> skipped, ok
+        r = c.post("/rules", data={"mode": "form", "rules_json": json.dumps(bad)})
+        assert b"Rules saved" in r.data or b"saved" in r.data
+    finally:
+        for s in ("", ".bak", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
+
+
 def test_mqtt_console_buffer_and_publish():
     try:
         import webui
@@ -1427,7 +1643,7 @@ def test_webui_structured_rule_builder():
     struct = webui._rule_to_structured(parsed[0])
     assert struct["combine"] == "any" and len(struct["conditions"]) == 2
     assert struct["conditions"][0] == {"metric": "is_raining", "operator": "==",
-                                       "value": "true", "for": ""}
+                                       "value": "true", "value_metric": "", "for": ""}
 
     # rejections
     for bad, needle in [
@@ -1491,7 +1707,7 @@ def test_webui_builder_advanced_constructs():
     # round-trips back to the editable shape
     s0 = webui._rule_to_structured(parsed[0])
     assert s0["conditions"][0] == {"metric": "temperature", "operator": "between",
-                                   "value": "40, 80", "for": "10m"}
+                                   "value": "40, 80", "value_metric": "", "for": "10m"}
     assert webui._rule_to_structured(parsed[2])["enabled"] is False
 
     # rejections surface clearly
