@@ -66,7 +66,15 @@ def _protect(obj):
     return obj
 
 app = Flask(__name__)
+# Cap request bodies so an oversized POST (e.g. a giant MQTT payload or rules
+# blob) can't balloon memory and OOM the dashboard on a small box.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MiB
 CONFIG_PATH = "config.yaml"
+
+# Serialize config writes so two concurrent saves can't interleave the backup +
+# atomic-replace. (Atomic replace already prevents a torn file; this prevents a
+# racy .bak.)
+_SAVE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +110,12 @@ def save_config(data):
     parsed = _y.safe_load(text)
     core_check(parsed)  # raises ValueError on a bad config
     p = Path(CONFIG_PATH)
-    if p.exists():
-        Path(str(p) + ".bak").write_text(p.read_text())
-    tmp = Path(str(p) + ".tmp")
-    tmp.write_text(text)
-    tmp.replace(p)
+    with _SAVE_LOCK:
+        if p.exists():
+            Path(str(p) + ".bak").write_text(p.read_text())
+        # Atomic + fsync so a crash/power-loss can't leave a half-written config
+        # the monitor would fail to load on its next cycle.
+        core._atomic_write(p, text)
 
 
 def core_check(parsed):
@@ -2925,6 +2934,14 @@ def main():
         raise SystemExit(1)
     host = args.host or web.get("host", "0.0.0.0")
     port = args.port or web.get("port", 8080)
+    # Loud warning if we're exposed on a non-loopback interface with no login:
+    # anyone who can reach the port can read config/history and (if manual
+    # control / publish are enabled) drive MQTT. Don't block — just be explicit.
+    if host not in ("127.0.0.1", "localhost", "::1") and not (
+            str(web.get("username") or "") and str(web.get("password") or "")):
+        print(f"WARNING: web UI binding to {host} with NO authentication. "
+              "Set web.username/web.password, or bind web.host to 127.0.0.1, "
+              "before exposing this beyond a trusted host.")
     # Start the live MQTT console subscriber (best-effort; an unreachable broker
     # just means an empty feed until it reconnects).
     console.start(cfg)
