@@ -35,7 +35,7 @@ function agoText(iso) {
    DASHBOARD  ·  conditions + device states + variables + manual control
    ========================================================================= */
 (function dashboard() {
-  if (!document.getElementById("rulebody")) return;
+  if (!document.getElementById("devicegrid")) return;
 
   // Base "weather" the demo nudges around; scenarios override pieces of it.
   const SCENARIOS = {
@@ -192,8 +192,8 @@ function agoText(iso) {
 
     renderVars(s.variables || [], !!s.manual_control);
 
-    const tb = document.getElementById("rulebody");
-    tb.innerHTML = "";
+    const grid = document.getElementById("devicegrid");
+    grid.innerHTML = "";
     for (const r of rules) {
       let pill;
       if (r.enabled === false) pill = '<span class="pill na">disabled</span>';
@@ -201,13 +201,16 @@ function agoText(iso) {
       else if (r.active) pill = '<span class="pill on">active</span>';
       else pill = '<span class="pill off">clear</span>';
       if (r.manual && r.manual !== "auto") pill += ' <span class="pill na">manual ' + esc(r.manual) + "</span>";
-      if (s.manual_control && r.enabled !== false) pill += ctlButtons(r);
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td>" + esc(r.name) + '<div class="muted">' + esc(r.description) + "</div></td>" +
-        "<td><code>" + esc(r.topic) + "</code></td><td>" + pill + "</td>" +
-        "<td>" + (r.current_payload != null ? esc(r.current_payload) : "—") + '</td>' +
-        '<td class="muted">' + esc(agoText(r.last_change)) + "</td>";
-      tb.appendChild(tr);
+      const cell = document.createElement("div");
+      cell.className = "metric"; cell.style.cssText = "display:flex;flex-direction:column;gap:6px";
+      let html = '<div class="toprow" style="align-items:center"><strong>' + esc(r.name) + "</strong><span>" + pill + "</span></div>";
+      if (r.description) html += '<div class="muted" style="font-size:12px">' + esc(r.description) + "</div>";
+      html += '<div class="muted" style="font-size:12px">topic <code>' + esc(r.topic) + "</code></div>";
+      html += '<div class="muted" style="font-size:12px">payload ' + (r.current_payload != null ? esc(r.current_payload) : "—") +
+        " · changed " + esc(agoText(r.last_change)) + "</div>";
+      if (s.manual_control && r.enabled !== false) html += ctlButtons(r);
+      cell.innerHTML = html;
+      grid.appendChild(cell);
     }
     const dash = document.getElementById("dash");
     if (dash) dash.classList.remove("loading");
@@ -217,7 +220,7 @@ function agoText(iso) {
 
   // Demo control wiring: manual device buttons + variable toggles mutate the
   // mock state in place (no network) and re-render.
-  document.getElementById("rulebody").addEventListener("click", e => {
+  document.getElementById("devicegrid").addEventListener("click", e => {
     const b = e.target.closest("button[data-state]"); if (!b) return;
     const wrap = b.closest(".ctl"); if (!wrap) return;
     manual[wrap.getAttribute("data-device")] = b.getAttribute("data-state");
