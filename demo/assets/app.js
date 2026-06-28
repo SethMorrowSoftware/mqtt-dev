@@ -568,3 +568,41 @@ function agoText(iso) {
   reindex();
   document.querySelector('.tab[data-tab="form"]').click();
 })();
+
+/* =========================================================================
+   ACTIVITY  ·  read-only audit-log viewer (sample data in the demo)
+   ========================================================================= */
+(function activity() {
+  const tb = document.getElementById("actbody");
+  if (!tb) return;
+  const ago = m => new Date(Date.now() - m * 60000).toISOString().replace(/\.\d+Z$/, "Z");
+  // Mock events mirroring the two shapes the live app records (monitor + UI).
+  const events = [
+    { ts: ago(1),   device: "maintenance_hold", action: "manual_set", state: "on", by: "admin" },
+    { ts: ago(3),   device: "irrigation_rain_inhibit", source: "auto", state: "on", by: "monitor" },
+    { ts: ago(18),  variable: "maintenance_mode", action: "variable_set", value: true, by: "admin" },
+    { ts: ago(46),  device: "vent_fan", source: "auto", state: "off", by: "monitor" },
+    { ts: ago(95),  device: "irrigation_rain_inhibit", source: "auto", state: "off", by: "monitor" },
+    { ts: ago(140), device: "vent_fan", source: "manual", state: "on", by: "admin" },
+  ];
+  function describe(e) {
+    if (e.action === "manual_set")   return { what: e.device, action: "manual override", detail: String(e.state).toUpperCase() };
+    if (e.action === "variable_set") return { what: e.variable, action: "variable set", detail: String(e.value) };
+    const src = e.source === "manual" ? "manual" : "automatic";
+    return { what: e.device, action: src + " state change", detail: String(e.state).toUpperCase() };
+  }
+  function pillFor(d) {
+    if (d.action === "manual override" || /^manual/.test(d.action)) return '<span class="pill on">' + esc(d.action) + "</span>";
+    if (d.action === "variable set") return '<span class="pill na">' + esc(d.action) + "</span>";
+    return '<span class="pill off">' + esc(d.action) + "</span>";
+  }
+  document.getElementById("act-count").textContent = events.length + " recent";
+  tb.innerHTML = "";
+  for (const e of events) {
+    const d = describe(e); const tr = document.createElement("tr");
+    tr.innerHTML = '<td class="muted" title="' + esc(e.ts || "") + '">' + esc(agoText(e.ts)) + "</td>" +
+      "<td>" + esc(d.what || "—") + "</td><td>" + pillFor(d) + "</td>" +
+      "<td>" + esc(d.detail || "—") + "</td><td class=\"muted\">" + esc(e.by || "—") + "</td>";
+    tb.appendChild(tr);
+  }
+})();

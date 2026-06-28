@@ -714,6 +714,62 @@ def test_is_daytime_and_schedule_inclusion():
     assert w.schedule_metrics(noon, lat, lon)["time_is_daytime"] is True
 
 
+def test_read_audit_newest_first_and_robust():
+    import tempfile, os
+    p = tempfile.mktemp(suffix=".log")
+    try:
+        assert w.read_audit(p) == []                       # missing file
+        w.audit(p, device="pump", state="on", source="auto", by="monitor")
+        w.audit(p, device="pump", action="manual_set", state="off", by="admin")
+        open(p, "a").write("{ not json\n\n")               # junk lines ignored
+        ev = w.read_audit(p, 10)
+        assert len(ev) == 2 and ev[0]["state"] == "off"    # newest first
+        assert ev[1]["device"] == "pump"
+        for i in range(5):
+            w.audit(p, device="d%d" % i, state="on", source="auto", by="monitor")
+        assert len(w.read_audit(p, 3)) == 3                # limit keeps newest
+    finally:
+        try: os.unlink(p)
+        except OSError: pass
+
+
+def test_webui_activity_page_and_audit_api():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_activity_page_and_audit_api ({e})")
+        return
+    import tempfile, os, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    aud = tempfile.mktemp(suffix=".log")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+        "precipitation": {"lookback_hours": 24},
+        "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+        "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+        "audit_file": aud,
+        "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                   "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        w.audit(aud, device="pump", state="on", source="auto", by="monitor")
+        r = c.get("/activity")
+        assert r.status_code == 200 and b"Activity" in r.data and b"api/audit" in r.data
+        assert b'href="/activity"' in c.get("/").data        # nav link present
+        j = c.get("/api/audit").get_json()
+        assert j["events"] and j["events"][0]["device"] == "pump"
+    finally:
+        for f in (p, aud):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

@@ -226,7 +226,8 @@ weather):
   apply on the next poll (no restart needed). They're an overlay on top of
   `config.yaml`, so editing rules never wipes an override.
 - Every manual change and every automatic state change is appended to an
-  **audit log** (`audit.log`) with a timestamp and the acting user.
+  **audit log** (`audit.log`) with a timestamp and the acting user, and is shown
+  in the web UI's **Activity** page in plain language (newest first).
 - The remote status page stays **strictly read-only** — it can never issue a
   command; it only shows a "manual" indicator when a device is overridden.
 
@@ -518,7 +519,7 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 | Path | What it is |
 |---|---|
 | `weather_mqtt.py` | The monitor: gathers inputs (weather, schedule, variables, mqtt_in, http_poll), evaluates rules, publishes MQTT, writes `weather_state.json`. |
-| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules), `/api/state`, `/api/control`, `/api/variable`, `/healthz`. |
+| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Activity), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/healthz`. |
 | `setup_wizard.py` | Interactive first-run config generator (`weather-mqtt-setup`). |
 | `install.sh` | One-command Debian/Ubuntu installer (Mosquitto + venv + services). |
 | `config.yaml` | Example/active configuration (the installer writes a real one from the wizard). |
