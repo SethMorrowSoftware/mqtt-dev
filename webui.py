@@ -1569,6 +1569,14 @@ SETTINGS = """
         <option value="true" {{ 'selected' if c.always_publish }}>true</option>
       </select></div>
   </div>
+  <div class="row">
+    <div><label>Event-driven re-evaluation <span class="hint">(re-run rules the instant an MQTT input changes)</span></label>
+      <select name="event_driven">
+        <option value="true" {{ 'selected' if c.event_driven }}>on (react immediately; needs a restart)</option>
+        <option value="false" {{ 'selected' if not c.event_driven }}>off (only re-evaluate each poll cycle)</option>
+      </select></div>
+    <div></div>
+  </div>
 </div>
 
 <div class="card">
@@ -1742,6 +1750,8 @@ def settings():
             cfg["poll_interval_minutes"] = _ranged(
                 "Poll interval", f.get("poll_interval_minutes"), 1, 1440, integer=True)
             cfg["always_publish"] = f.get("always_publish") == "true"
+            if f.get("event_driven") is not None:
+                cfg["event_driven"] = f.get("event_driven") == "true"
             cfg.setdefault("precipitation", {})["lookback_hours"] = _ranged(
                 "Lookback window", f.get("lookback_hours"), 1, 720, integer=True)
 
@@ -1830,6 +1840,7 @@ def settings():
     # normalize for template access (defaults if a key is absent)
     cfg.setdefault("precipitation", {}).setdefault("lookback_hours", 24)
     cfg.setdefault("location", {}).setdefault("station_id", None)
+    cfg.setdefault("event_driven", True)
     mqd = cfg.setdefault("mqtt", {})
     mqd.setdefault("status_topic", "")
     mqd.setdefault("client_id", "weather-mqtt-controller")

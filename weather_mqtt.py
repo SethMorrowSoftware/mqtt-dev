@@ -30,6 +30,7 @@ import os
 import re
 import signal
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -432,13 +433,18 @@ def coerce_payload(payload, parse):
 def handle_mqtt_input(in_store, topic_map, topic, payload):
     """Route an incoming message to its metric and store the coerced value.
     Pure (no network) so it's unit-testable. A None coercion is ignored so the
-    last good value persists."""
+    last good value persists. Returns True when a known input's value actually
+    changed (so an event-driven loop knows a re-evaluation is worthwhile)."""
     it = topic_map.get(topic)
     if not it:
-        return
+        return False
     val = coerce_payload(payload, it["parse"])
-    if val is not None:
-        in_store[it["metric"]] = val
+    if val is None:
+        return False
+    metric = it["metric"]
+    changed = in_store.get(metric) != val
+    in_store[metric] = val
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +756,11 @@ def validate_config(cfg):
 
     cfg.setdefault("always_publish", False)
     cfg["always_publish"] = bool(cfg["always_publish"])
+    # Event-driven re-evaluation: re-run the rules promptly when an mqtt_in
+    # sensor message arrives, instead of only once per poll cycle. The slow NWS
+    # fetch still runs on poll_interval_minutes; only rule evaluation is woken.
+    cfg.setdefault("event_driven", True)
+    cfg["event_driven"] = bool(cfg["event_driven"])
     cfg.setdefault("state_file", "weather_state.json")
     # Where runtime manual overrides + the audit trail live (Phase 2).
     cfg.setdefault("overrides_file", "overrides.json")
@@ -1761,7 +1772,7 @@ def read_log(path, limit=300):
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
-def make_mqtt_client(mq, mqtt_inputs=None, in_store=None):
+def make_mqtt_client(mq, mqtt_inputs=None, in_store=None, on_input=None):
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=mq["client_id"],
@@ -1789,7 +1800,15 @@ def make_mqtt_client(mq, mqtt_inputs=None, in_store=None):
 
     def on_message(client, userdata, msg):
         if in_store is not None:
-            handle_mqtt_input(in_store, topic_map, msg.topic, msg.payload)
+            changed = handle_mqtt_input(in_store, topic_map, msg.topic, msg.payload)
+            # Wake the main loop for a prompt re-evaluation when a *known* input
+            # actually changed (event-driven mode). Runs on the network thread, so
+            # on_input must be cheap and thread-safe (an Event.set()).
+            if changed and on_input is not None:
+                try:
+                    on_input()
+                except Exception as e:
+                    LOG.debug("on_input hook failed: %s", e)
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
@@ -2105,9 +2124,14 @@ def main():
 
     stop = {"flag": False}
 
+    # Set by an incoming mqtt_in message (event-driven re-eval) or a signal, to
+    # break the between-cycle wait early.
+    wake = threading.Event()
+
     def handle_sig(signum, frame):
         LOG.info("Signal %s received, shutting down ...", signum)
         stop["flag"] = True
+        wake.set()
 
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
@@ -2140,8 +2164,10 @@ def main():
     # topic change needs a restart, like other connection settings).
     mqtt_in_store = {}
     client = None
+    event_driven = cfg.get("event_driven", True)
     if not args.dry_run:
-        client = make_mqtt_client(mq, cfg.get("mqtt_inputs", []), mqtt_in_store)
+        client = make_mqtt_client(mq, cfg.get("mqtt_inputs", []), mqtt_in_store,
+                                  on_input=(wake.set if event_driven else None))
         client.connect_async(mq["host"], int(mq["port"]), keepalive=60)
         client.loop_start()
 
@@ -2150,6 +2176,11 @@ def main():
     engine_state = EngineState()   # history for `changed` / `for:` across cycles
     http_store, http_last = {}, {}  # latest http_poll values + per-url last fetch
     broker_watch = BrokerWatch(cfg["slack"]["broker_unreachable_minutes"])
+    # Cache the slow NWS weather between poll cycles so an input-triggered
+    # re-evaluation reuses it instead of re-fetching (and hammering the API).
+    weather_cache = None
+    next_weather_at = 0.0      # monotonic deadline for the next weather fetch
+    EVENT_DEBOUNCE = 0.4       # s: coalesce a burst of messages into one re-eval
 
     while not stop["flag"]:
         # Reload config each cycle so web-UI edits to rules / thresholds /
@@ -2178,18 +2209,25 @@ def main():
         status_topic = mq_live.get("status_topic", "")
 
         try:
-            m = fetch_conditions(loc, ua, lookback)
-            LOG.info("Conditions: temp=%s F  humidity=%s%%  wind=%s mph  "
-                     "raining=%s  precip_%dh=%s in  precip_prob=%s%%  '%s'  "
-                     "alerts=%s",
-                     m["temperature"], m["humidity"], m["wind_speed_mph"],
-                     m["is_raining"], lookback, m["precip_accum_in"],
-                     m["precipitation_probability"], m["short_forecast"],
-                     m["active_alerts"] or "none")
-
-            if client is not None and status_topic:
-                client.publish(status_topic, json.dumps(m),
-                               qos=qos, retain=retain)
+            # Fetch the slow NWS weather at most once per poll interval; an
+            # input-triggered re-eval between fetches reuses the cached weather.
+            do_fetch = weather_cache is None or time.monotonic() >= next_weather_at
+            if do_fetch:
+                m = fetch_conditions(loc, ua, lookback)
+                weather_cache = dict(m)
+                next_weather_at = time.monotonic() + interval
+                LOG.info("Conditions: temp=%s F  humidity=%s%%  wind=%s mph  "
+                         "raining=%s  precip_%dh=%s in  precip_prob=%s%%  '%s'  "
+                         "alerts=%s",
+                         m["temperature"], m["humidity"], m["wind_speed_mph"],
+                         m["is_raining"], lookback, m["precip_accum_in"],
+                         m["precipitation_probability"], m["short_forecast"],
+                         m["active_alerts"] or "none")
+                if client is not None and status_topic:
+                    client.publish(status_topic, json.dumps(m),
+                                   qos=qos, retain=retain)
+            else:
+                m = dict(weather_cache)
 
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone()    # system local civil time for windows
@@ -2201,7 +2239,7 @@ def main():
             m.update(dict(http_store))               # latest http_poll values
             m.update(compute_metrics(cfg.get("computed", {}), m))  # derived metrics
             hist = cfg.get("history", {}) or {}
-            if hist.get("enabled", True):
+            if do_fetch and hist.get("enabled", True):
                 record_history(hist.get("file", "history.db"), m,
                                ts=now_utc.isoformat(timespec="seconds"),
                                retention_days=int(hist.get("retention_days", 14)))
@@ -2227,7 +2265,10 @@ def main():
                             rule.get("hysteresis"), prev, desired,
                             _parse_iso(last_change.get(rule["name"])), now_utc)
                 if enabled and result is not None:
-                    changed = (prev is None) or (prev != result) or cfg["always_publish"]
+                    # always_publish heartbeat only on a real poll tick, so an
+                    # input-triggered re-eval doesn't re-broadcast every rule.
+                    changed = ((prev is None) or (prev != result)
+                               or (cfg["always_publish"] and do_fetch))
                     # Assume committed unless a real publish fails below. A failed
                     # publish leaves last_state unchanged so the next cycle retries
                     # the directive instead of silently dropping a state change.
@@ -2297,8 +2338,11 @@ def main():
                          "value": var_values.get(n)} for n in declared_vars]
             snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual,
                                       var_rows)
-            write_state(state_file, snapshot)
-            push_status(cfg.get("status_push", {}), snapshot)
+            write_state(state_file, snapshot)        # local: refresh every re-eval
+            if do_fetch:
+                # Outbound remote push stays at poll cadence so a chatty sensor
+                # in event-driven mode can't spam the external dashboard.
+                push_status(cfg.get("status_push", {}), snapshot)
 
         except Exception as e:
             LOG.error("Poll cycle failed: %s", e)
@@ -2326,7 +2370,16 @@ def main():
         if args.once:
             break
 
-        interruptible_sleep(interval)  # so SIGTERM is handled promptly
+        # Wait until the next weather fetch is due, or until an mqtt_in message
+        # wakes us early (event-driven). A burst of messages is coalesced into a
+        # single re-evaluation via a short debounce. When event_driven is off,
+        # nothing but a signal sets `wake`, so this is a plain timer sleep.
+        timeout = max(0.0, next_weather_at - time.monotonic())
+        woke = wake.wait(timeout)
+        if woke and not stop["flag"] and event_driven:
+            time.sleep(EVENT_DEBOUNCE)   # let a burst settle before re-evaluating
+            LOG.debug("Input event woke the loop; re-evaluating with cached weather")
+        wake.clear()
 
     if client is not None:
         client.loop_stop()

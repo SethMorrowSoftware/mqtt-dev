@@ -591,12 +591,98 @@ def test_mqtt_in_coerce_and_routing():
     # routing: store updates only for known topics; None coercion keeps last value
     store, tmap = {}, {"sensors/tank": {"topic": "sensors/tank", "metric": "tank_level",
                                         "parse": "number"}}
-    w.handle_mqtt_input(store, tmap, "sensors/tank", b"42")
+    assert w.handle_mqtt_input(store, tmap, "sensors/tank", b"42") is True   # new value
     assert store == {"tank_level": 42}
-    w.handle_mqtt_input(store, tmap, "sensors/tank", b"bad")        # ignored
-    assert store == {"tank_level": 42}
-    w.handle_mqtt_input(store, tmap, "other/topic", b"9")           # unknown topic
-    assert store == {"tank_level": 42}
+    assert w.handle_mqtt_input(store, tmap, "sensors/tank", b"42") is False  # unchanged
+    assert w.handle_mqtt_input(store, tmap, "sensors/tank", b"43") is True   # changed
+    assert store == {"tank_level": 43}
+    assert w.handle_mqtt_input(store, tmap, "sensors/tank", b"bad") is False  # junk ignored
+    assert store == {"tank_level": 43}
+    assert w.handle_mqtt_input(store, tmap, "other/topic", b"9") is False    # unknown topic
+    assert store == {"tank_level": 43}
+
+
+def test_event_driven_wake_hook():
+    # The mqtt client wakes the loop only when a known input actually changes.
+    try:
+        import weather_mqtt as _w
+        mq = {"client_id": "test-evt", "host": "localhost", "port": 1883}
+        woke = []
+        client = _w.make_mqtt_client(
+            mq, [{"topic": "s/tank", "metric": "tank_level", "parse": "number"}],
+            {}, on_input=lambda: woke.append(1))
+    except Exception as e:
+        print(f"  SKIP  test_event_driven_wake_hook ({e})")
+        return
+
+    class _Msg:
+        def __init__(self, t, p): self.topic, self.payload, self.qos, self.retain = t, p, 0, False
+    client.on_message(client, None, _Msg("s/tank", b"10"))   # new -> wake
+    client.on_message(client, None, _Msg("s/tank", b"10"))   # same -> no wake
+    client.on_message(client, None, _Msg("s/tank", b"11"))   # changed -> wake
+    client.on_message(client, None, _Msg("other", b"1"))     # unknown -> no wake
+    assert len(woke) == 2
+    # event_driven defaults on, and is a clean bool
+    import copy
+    cfg = w.validate_config(copy.deepcopy({
+        "location": {"latitude": 1, "longitude": 2}, "user_agent": "x (a@b.com)",
+        "mqtt": {}, "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                               "when": {"metric": "is_raining", "operator": "==", "value": True}}]}))
+    assert cfg["event_driven"] is True
+
+
+def test_main_once_cycle_offline():
+    # Run one full poll cycle through main() with the network mocked, exercising
+    # the refactored weather-cache / publish / state / history path end-to-end.
+    import tempfile, os, sys, json, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    state = tempfile.mktemp(suffix=".json"); db = tempfile.mktemp(suffix=".db")
+    aud = tempfile.mktemp(suffix=".log"); logf = tempfile.mktemp(suffix=".log")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "state_file": state, "audit_file": aud, "log_file": logf,
+           "history": {"enabled": True, "file": db, "retention_days": 14},
+           "rules": [{"name": "rainflag", "topic": "facility/rain", "on_match": "ON",
+                      "on_clear": "OFF",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+
+    orig = (w.resolve_location, w.fetch_conditions, w.make_mqtt_client, sys.argv)
+    calls = {"fetch": 0, "pub": []}
+
+    class _Info:  rc = 0
+    class _Fake:
+        def publish(self, topic, payload, **k): calls["pub"].append((topic, payload)); return _Info()
+        def is_connected(self): return True
+        def connect_async(self, *a, **k): pass
+        def loop_start(self): pass
+        def loop_stop(self): pass
+        def disconnect(self): pass
+    try:
+        w.resolve_location = lambda *a, **k: {"office": "x"}
+        def _fetch(loc, ua, lookback):
+            calls["fetch"] += 1
+            return {"temperature": 60.0, "humidity": 80.0, "wind_speed_mph": 5.0,
+                    "is_raining": True, "precip_accum_in": 0.3,
+                    "precipitation_probability": 90.0, "short_forecast": "Rain",
+                    "active_alerts": []}
+        w.fetch_conditions = _fetch
+        w.make_mqtt_client = lambda *a, **k: _Fake()
+        sys.argv = ["weather_mqtt", "--config", p, "--once"]
+        w.main()
+        assert calls["fetch"] == 1                                   # one weather fetch
+        assert ("facility/rain", "ON") in calls["pub"]              # rule published ON
+        st = json.loads(open(state).read())
+        assert st["metrics"]["is_raining"] is True and st["rules"]
+        assert "temperature" in w.read_history(db, hours=24)        # history recorded
+    finally:
+        w.resolve_location, w.fetch_conditions, w.make_mqtt_client, sys.argv = orig
+        for f in (p, state, db, aud, logf):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
 
 
 def test_mqtt_in_validation_catalogue_and_rules():

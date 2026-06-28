@@ -274,8 +274,12 @@ system "as customizable as possible" without engine changes.
     over earlier metrics, evaluated fail‑safe). All discovered by the builder,
     editable in the UI (value_metric in the form builder, computed on the Inputs
     page), and mirrored in the demo.
-  - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
-    read each poll cycle).
+  - **Delivered (cont.):** **event‑driven re‑evaluation** (`event_driven`, default
+    on) — an incoming `mqtt_in` message that changes a value wakes the loop for an
+    immediate re‑eval instead of waiting for the next poll. The slow NWS fetch
+    stays on `poll_interval_minutes` (cached weather is reused in between), bursts
+    are debounced, and the outbound status push stays at poll cadence. Toggle in
+    Settings. **Phase 3 is complete.**
 - **Action layer — multiple action types (delivered):** beyond the built‑in
   `on_match`/`on_clear` publish, a rule may declare an `actions:` list that fires
   on a transition (`trigger: match | clear | both`). Three kinds: **mqtt** (extra

@@ -32,6 +32,12 @@ poll_interval_minutes: 15
 # Set true if your broker may restart and you depend on retained values.
 always_publish: false
 
+# Event-driven re-evaluation (default true): re-run the rules the instant an
+# mqtt_in sensor message changes a value, instead of waiting for the next poll.
+# The slow NWS weather fetch still runs on poll_interval_minutes; only rule
+# evaluation is woken (debounced). Set false for strict poll-cadence behavior.
+event_driven: true
+
 # --- Operator variables (optional) -----------------------------------------
 # Virtual flags/setpoints you can toggle from the dashboard (when manual control
 # is enabled). Each becomes a metric named var_<name> that rules can reference,
