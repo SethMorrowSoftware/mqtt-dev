@@ -727,6 +727,9 @@ def validate_config(cfg):
             _validate_window(r["window"], name)
         if r.get("hysteresis") is not None:
             _validate_hysteresis(r["hysteresis"], name)
+        # Optional extra actions (mqtt/webhook/notify) on transitions.
+        if r.get("actions") is not None:
+            r["actions"] = _validate_actions(r["actions"], name)
         # Config-declared manual state (auto|on|off). The web UI sets runtime
         # overrides in overrides.json instead; this is just the fallback/default.
         man = str(r.get("manual", "auto")).strip().lower()
@@ -1798,6 +1801,136 @@ def push_status(cfg, snapshot):
 
 
 # ---------------------------------------------------------------------------
+# Rule actions: extra things to do on a device's on/off transition.
+# Beyond the built-in `topic`/`on_match`/`on_clear` publish, a rule may declare
+# an `actions:` list. Each entry fires on the `match`, `clear`, or `both`
+# transition and is one of: mqtt (extra publish), webhook (HTTP request), or
+# notify (Slack). Payloads/URLs/bodies/text support {{metric}} templating with
+# the cycle's live values. All firing is best-effort -- a failed action never
+# stops the cycle or affects the committed state.
+# ---------------------------------------------------------------------------
+ACTION_TYPES = ("mqtt", "webhook", "notify")
+ACTION_TRIGGERS = ("match", "clear", "both")
+_TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def render_template(text, metrics):
+    """Substitute {{metric}} placeholders with live values. Unknown metrics
+    render empty. Non-string input is returned unchanged."""
+    if not isinstance(text, str):
+        return text
+
+    def sub(m):
+        v = metrics.get(m.group(1))
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return str(v)
+    return _TEMPLATE_RE.sub(sub, text)
+
+
+def _validate_actions(actions, rule_name):
+    """Validate/normalize a rule's `actions:` list. Returns the cleaned list."""
+    if not isinstance(actions, list):
+        raise ValueError(f"rule '{rule_name}': actions must be a list")
+    out = []
+    for i, a in enumerate(actions, 1):
+        if not isinstance(a, dict):
+            raise ValueError(f"rule '{rule_name}': action #{i} must be a mapping")
+        kinds = [k for k in ACTION_TYPES if k in a]
+        if len(kinds) != 1:
+            raise ValueError(f"rule '{rule_name}': action #{i} must have exactly one "
+                             f"of {', '.join(ACTION_TYPES)}")
+        kind = kinds[0]
+        spec = a.get(kind)
+        if not isinstance(spec, dict):
+            raise ValueError(f"rule '{rule_name}': action #{i} '{kind}' must be a mapping")
+        # `trigger` (not `on`): "on" is a YAML 1.1 boolean key, so it would load
+        # as True and silently break. trigger: match | clear | both.
+        trig = str(a.get("trigger", "both")).strip().lower()
+        if trig not in ACTION_TRIGGERS:
+            raise ValueError(f"rule '{rule_name}': action #{i} 'trigger' must be one of "
+                             f"{', '.join(ACTION_TRIGGERS)}")
+        if kind == "mqtt":
+            if not str(spec.get("topic", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} mqtt needs a 'topic'")
+            q = spec.get("qos")
+            if q is not None and int(_as_number(q, 0, "action qos")) not in (0, 1, 2):
+                raise ValueError(f"rule '{rule_name}': action #{i} mqtt qos must be 0, 1 or 2")
+        elif kind == "webhook":
+            if not str(spec.get("url", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook needs a 'url'")
+            method = str(spec.get("method", "POST")).strip().upper()
+            if method not in ("GET", "POST", "PUT"):
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook method must be "
+                                 "GET, POST or PUT")
+            if spec.get("headers") is not None and not isinstance(spec["headers"], dict):
+                raise ValueError(f"rule '{rule_name}': action #{i} webhook headers must be a mapping")
+        elif kind == "notify":
+            if not str(spec.get("text", "")).strip():
+                raise ValueError(f"rule '{rule_name}': action #{i} notify needs 'text'")
+        out.append(a)
+    return out
+
+
+def _do_webhook(spec, metrics):
+    """Fire one webhook action (best-effort, never raises)."""
+    url = render_template(spec.get("url", ""), metrics)
+    method = str(spec.get("method", "POST")).strip().upper()
+    body = render_template(spec.get("body", ""), metrics)
+    headers = {k: render_template(str(v), metrics) for k, v in (spec.get("headers") or {}).items()}
+    try:
+        if method == "GET":
+            requests.get(url, headers=headers, timeout=10)
+        elif method == "PUT":
+            requests.put(url, data=body, headers=headers, timeout=10)
+        else:
+            requests.post(url, data=body, headers=headers, timeout=10)
+        return True
+    except Exception as e:
+        LOG.warning("webhook %s %s failed: %s", method, url, e)
+        return False
+
+
+def fire_actions(rule, result, metrics, client, qos, retain, slack_cfg):
+    """Fire a rule's extra actions for an on (result=True) / off (result=False)
+    transition. Best-effort: each action is independent and never raises."""
+    want = "match" if result else "clear"
+    for a in (rule.get("actions") or []):
+        trig = str(a.get("trigger", "both")).strip().lower()
+        if trig not in (want, "both"):
+            continue
+        try:
+            if "mqtt" in a:
+                spec = a["mqtt"]
+                topic = render_template(str(spec.get("topic", "")), metrics)
+                payload = render_template(spec.get("payload", ""), metrics)
+                aqos = int(spec.get("qos", qos))
+                aretain = bool(spec.get("retain", retain))
+                if client is None:
+                    LOG.info("[DRY-RUN] would publish action '%s' -> %s (rule '%s')",
+                             payload, topic, rule["name"])
+                else:
+                    client.publish(topic, payload, qos=aqos, retain=aretain)
+                    LOG.info("Action published '%s' -> %s (rule '%s')",
+                             payload, topic, rule["name"])
+            elif "webhook" in a:
+                if client is None:
+                    LOG.info("[DRY-RUN] would call webhook for rule '%s'", rule["name"])
+                else:
+                    _do_webhook(a["webhook"], metrics)
+            elif "notify" in a:
+                text = render_template(str(a["notify"].get("text", "")), metrics)
+                if client is None:
+                    LOG.info("[DRY-RUN] would notify: %s", text)
+                else:
+                    notify_slack(slack_cfg, text)
+        except Exception as e:
+            LOG.warning("Rule '%s' action failed: %s", rule.get("name", "?"), e)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
@@ -1990,6 +2123,12 @@ def main():
                                       state="on" if result else "off",
                                       source="manual" if manual in ("on", "off")
                                       else "auto", by="monitor")
+                        # Fire extra actions on a real transition (not on an
+                        # always_publish heartbeat). Independent of the built-in
+                        # publish; best-effort.
+                        if prev != result and rule.get("actions"):
+                            fire_actions(rule, result, m, client, qos, retain,
+                                         cfg.get("slack", {}))
                     if commit:
                         last_state[rule["name"]] = result
 

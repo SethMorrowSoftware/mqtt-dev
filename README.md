@@ -33,6 +33,9 @@ publishes on/off MQTT directives, all editable from the web UI:
 - **Rules:** nested `any`/`all`/`not`, comparison + `between`/`in`/`changed`
   operators, `regex` on text, **metric-to-metric** comparison, a `for:` sustain,
   per-rule `enable`, **time windows**, and **hysteresis** (anti-short-cycle).
+- **Actions:** the built-in MQTT publish, plus optional [extra actions](#extra-actions-beyond-the-built-in-publish)
+  per rule — multiple/templated publishes, **webhooks**, and **Slack notify** on
+  a transition.
 - **Control:** opt-in, audited [manual Auto/On/Off](#manual-control-opt-in) of
   any device from the dashboard; an outbound-only
   [remote status page](#remote-status-page-read-only).
@@ -532,6 +535,37 @@ group), including the `enabled` toggle, `between`/`in`, the `changed` operator,
 and a per-condition `for:`. Rules using nested/`not` conditions, a time window,
 or hysteresis are edited in the **YAML (advanced)** tab, which the Rules page
 opens automatically when it detects them.
+
+### Extra actions (beyond the built-in publish)
+
+Besides the built-in `on_match`/`on_clear` publish to `topic`, a rule can fire
+**extra actions** on a transition via an `actions:` list — drive several devices,
+hit a webhook, or send a Slack message from one rule. Each action has a
+`trigger` (`match` / `clear` / `both`) and is one of three kinds. Payloads,
+URLs, bodies, and text support **`{{metric}}` templating** with the cycle's live
+values:
+
+```yaml
+- name: vent_fan
+  when: { metric: temperature, operator: ">", value: 85 }
+  topic: "facility/vent_fan"
+  on_match: "ON"
+  on_clear: "OFF"
+  actions:
+    - { trigger: match, mqtt: { topic: "facility/fan2", payload: "RUN {{temperature}}", retain: true } }
+    - { trigger: both,  webhook: { url: "https://hooks.example.com/vent", method: POST, body: '{"temp": {{temperature}}}' } }
+    - { trigger: clear, notify: { text: "Vent fan cleared at {{temperature}}°F" } }
+```
+
+- **`mqtt`** — an extra publish (`topic`, `payload`, optional `qos`/`retain`).
+- **`webhook`** — an HTTP request (`url`, `method` GET/POST/PUT, optional `body`,
+  `headers`). Outbound and best-effort.
+- **`notify`** — a Slack message (`text`) via the configured Slack bot.
+
+Use **`trigger`**, not `on` (`on` is a YAML boolean and would be misread). All
+actions are **best-effort** — a failed action is logged and never blocks the
+cycle or changes the committed state. Edit them in the form builder's **Extra
+actions** section per rule, or in the YAML tab.
 
 ### Time windows & hysteresis (anti-short-cycle)
 

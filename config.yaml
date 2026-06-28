@@ -171,6 +171,15 @@ status_push:
 # computed:
 #   net_power:  { expr: "power_kw - solar_kw" }
 #   temp_delta: { expr: "temperature - var_temp_setpoint" }
+#
+# Extra actions (optional, per rule): besides on_match/on_clear, fire more things
+# on a transition. Use `trigger` (match|clear|both) -- NOT `on` (a YAML boolean).
+# Payloads/urls/bodies/text support {{metric}} templating. Best-effort.
+#   actions:
+#     - { trigger: match, mqtt: { topic: "facility/fan", payload: "RUN {{temperature}}" } }
+#     - { trigger: both,  webhook: { url: "https://hooks.example.com/x", method: POST,
+#                                    body: '{"temp": {{temperature}}}' } }
+#     - { trigger: clear, notify: { text: "cleared at {{temperature}}F" } }
 # ---------------------------------------------------------------------------
 rules:
   # The main one: don't water if it's raining now OR it has already rained

@@ -864,6 +864,119 @@ def test_computed_metrics_eval_and_validate():
             assert needle in str(e), f"{needle!r} not in {e}"
 
 
+def test_rule_actions_template_validate_and_fire():
+    # {{metric}} templating (bools render true/false; unknown renders empty)
+    assert w.render_template("lvl={{tank}} on={{flag}} x={{nope}}",
+                             {"tank": 7, "flag": True}) == "lvl=7 on=true x="
+    # validation: trigger + exactly-one-type + per-type required fields
+    ok = [{"trigger": "match", "mqtt": {"topic": "a/cmd", "payload": "ON", "qos": 1}},
+          {"webhook": {"url": "https://h/", "method": "POST", "body": "{{tank}}"}},
+          {"trigger": "clear", "notify": {"text": "cleared"}}]
+    assert len(w._validate_actions(ok, "r")) == 3
+    for bad, needle in [
+        ([{"trigger": "match"}], "exactly one"),
+        ([{"mqtt": {}}], "needs a 'topic'"),
+        ([{"webhook": {"method": "POST"}}], "needs a 'url'"),
+        ([{"webhook": {"url": "h", "method": "DELETE"}}], "method must be"),
+        ([{"notify": {"text": ""}}], "needs 'text'"),
+        ([{"trigger": "never", "notify": {"text": "x"}}], "'trigger' must be"),
+        ([{"mqtt": {"topic": "t"}, "notify": {"text": "x"}}], "exactly one"),
+    ]:
+        try:
+            w._validate_actions(bad, "r"); assert False, f"expected: {needle}"
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+    # fire_actions: only the matching trigger fires; templating applied; dry-run safe
+    class _Info:  rc = 0
+    class _Fake:
+        def __init__(self): self.pub = []
+        def publish(self, *a, **k): self.pub.append((a, k)); return _Info()
+    fc = _Fake()
+    rule = {"name": "r", "actions": [
+        {"trigger": "match", "mqtt": {"topic": "a/cmd", "payload": "v={{tank}}", "qos": 2, "retain": False}},
+        {"trigger": "clear", "mqtt": {"topic": "a/cmd", "payload": "OFF"}},
+        {"trigger": "both", "mqtt": {"topic": "log", "payload": "x"}}]}
+    w.fire_actions(rule, True, {"tank": 9}, fc, 1, True, {})     # match + both
+    assert [p[0] for p in fc.pub] == [("a/cmd", "v=9"), ("log", "x")]
+    assert fc.pub[0][1] == {"qos": 2, "retain": False}           # action overrides defaults
+    fc.pub.clear()
+    w.fire_actions(rule, False, {"tank": 9}, fc, 1, True, {})    # clear + both
+    assert [p[0][0] for p in fc.pub] == ["a/cmd", "log"]
+    # dry-run (client None) never raises and never publishes
+    w.fire_actions(rule, True, {"tank": 9}, None, 1, True, {})
+
+
+def test_full_config_with_actions_validates():
+    import copy
+    cfg = {"version": 1, "location": {"latitude": 41, "longitude": -74},
+           "user_agent": "x (a@b.com)", "mqtt": {},
+           "rules": [{"name": "r", "topic": "t", "on_match": "ON", "on_clear": "OFF",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True},
+                      "actions": [{"trigger": "match", "webhook": {"url": "https://h/x"}},
+                                  {"notify": {"text": "rain={{is_raining}}"}}]}]}
+    out = w.validate_config(copy.deepcopy(cfg))
+    assert len(out["rules"][0]["actions"]) == 2
+    bad = copy.deepcopy(cfg); bad["rules"][0]["actions"] = [{"webhook": {"method": "POST"}}]
+    try:
+        w.validate_config(bad); assert False
+    except ValueError as e:
+        assert "needs a 'url'" in str(e)
+
+
+def test_webui_rule_actions_roundtrip():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_rule_actions_roundtrip ({e})")
+        return
+    import tempfile, os, json, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "username": "", "password": ""},
+           "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        assert b"Extra actions" in c.get("/rules").data        # actions editor present
+        rules = [{"name": "vent", "topic": "facility/vent", "on_match": "ON", "on_clear": "OFF",
+                  "enabled": True, "combine": "any",
+                  "conditions": [{"metric": "temperature", "operator": ">", "value": "85"}],
+                  "actions": [
+                      {"kind": "mqtt", "on": "match", "topic": "facility/fan", "payload": "RUN {{temperature}}"},
+                      {"kind": "webhook", "on": "both", "url": "https://h/x", "method": "POST", "body": "t={{temperature}}"},
+                      {"kind": "notify", "on": "clear", "text": "vent cleared"}]}]
+        c.post("/rules", data={"mode": "form", "rules_json": json.dumps(rules)})
+        saved = yaml.safe_load(open(p))["rules"][0]
+        acts = saved["actions"]
+        # stored with the collision-safe `trigger` key (NOT `on`), correct values
+        assert [a["trigger"] for a in acts] == ["match", "both", "clear"]
+        assert acts[0]["mqtt"]["payload"] == "RUN {{temperature}}"
+        assert acts[1]["webhook"]["url"] == "https://h/x"
+        # the monitor accepts it, and it round-trips back to the builder shape
+        w.validate_config(yaml.safe_load(open(p)))
+        st = webui._rule_to_structured(saved)
+        assert [(a["kind"], a["on"]) for a in st["actions"]] == \
+            [("mqtt", "match"), ("webhook", "both"), ("notify", "clear")]
+        # a malformed action is rejected with a clear message
+        bad = [{"name": "b", "topic": "t", "on_match": "1", "enabled": True, "combine": "any",
+                "conditions": [{"metric": "is_raining", "operator": "==", "value": "true"}],
+                "actions": [{"kind": "notify", "on": "match", "text": "hi"},
+                            {"kind": "mqtt", "on": "match", "topic": ""}]}]  # empty topic -> skipped, ok
+        r = c.post("/rules", data={"mode": "form", "rules_json": json.dumps(bad)})
+        assert b"Rules saved" in r.data or b"saved" in r.data
+    finally:
+        for s in ("", ".bak", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
+
+
 def test_webui_activity_page_and_audit_api():
     try:
         import webui

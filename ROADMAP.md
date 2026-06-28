@@ -270,6 +270,15 @@ system "as customizable as possible" without engine changes.
     page), and mirrored in the demo.
   - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
     read each poll cycle).
+- **Action layer — multiple action types (delivered):** beyond the built‑in
+  `on_match`/`on_clear` publish, a rule may declare an `actions:` list that fires
+  on a transition (`trigger: match | clear | both`). Three kinds: **mqtt** (extra
+  publish), **webhook** (HTTP GET/POST/PUT, outbound best‑effort), and **notify**
+  (Slack). Payloads/URLs/bodies/text support **`{{metric}}` templating** with live
+  values. Validated, fail‑safe (a failed action never blocks the cycle or changes
+  committed state), editable in the form builder's *Extra actions* section, and
+  mirrored in the demo. (This delivers the ROADMAP's pluggable action registry —
+  webhooks are no longer out of scope.)
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

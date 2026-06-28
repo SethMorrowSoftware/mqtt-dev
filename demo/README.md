@@ -26,8 +26,10 @@ demo/
 
 It mirrors the current `webui.py`: the rule builder offers the full operator set
 (`between`/`in`/`changed`/`regex`, comparing to **another metric**, a per-condition
-`for`, the `enabled` toggle) and discovers schedule, variable, input, and
-**computed** metrics; the Inputs page edits all of those sources; the dashboard
+`for`, the `enabled` toggle), supports per-rule **extra actions** (extra publishes,
+webhooks, Slack notify with `{{metric}}` templating), and discovers schedule,
+variable, input, and **computed** metrics; the Inputs page edits all of those
+sources; the dashboard
 has a Variables card and per-device manual controls; the **System** page shows
 health, a config summary, and a runtime log viewer. Everything is mock — clicks
 update local state and show a toast; nothing is published or saved.

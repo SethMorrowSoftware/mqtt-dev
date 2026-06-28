@@ -428,8 +428,41 @@ function agoText(iso) {
     if (!card) return;
     card.querySelector(".combine-wrap").style.display = card.querySelectorAll(".cond").length > 1 ? "" : "none";
   }
+  function actionFields(kind, a) {
+    a = a || {};
+    const wrap = el("div", "a-fields"); wrap.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;flex:1;min-width:240px";
+    if (kind === "webhook") {
+      wrap.innerHTML = '<input class="a-url" placeholder="https://host/hook" style="flex:2;min-width:160px">' +
+        '<select class="a-method" style="flex:0 0 84px"></select>' +
+        '<input class="a-body" placeholder="body (supports {{metric}})" style="flex:2;min-width:160px">';
+      ["POST", "GET", "PUT"].forEach(x => wrap.querySelector(".a-method").appendChild(opt(x, x, x === (a.method || "POST"))));
+      wrap.querySelector(".a-url").value = a.url || ""; wrap.querySelector(".a-body").value = a.body || "";
+    } else if (kind === "notify") {
+      wrap.innerHTML = '<input class="a-text" placeholder="Slack message (supports {{metric}})" style="flex:1;min-width:200px">';
+      wrap.querySelector(".a-text").value = a.text || "";
+    } else {
+      wrap.innerHTML = '<input class="a-topic" placeholder="topic e.g. facility/relay1" style="flex:1;min-width:150px">' +
+        '<input class="a-payload" placeholder="payload (supports {{metric}})" style="flex:1;min-width:150px">';
+      wrap.querySelector(".a-topic").value = a.topic || ""; wrap.querySelector(".a-payload").value = a.payload || "";
+    }
+    return wrap;
+  }
+  function actionRow(a) {
+    a = a || { kind: "mqtt", on: "match" };
+    const row = el("div", "action-row row"); row.style.alignItems = "center";
+    const onW = el("div"); onW.style.flex = "0 0 96px"; const on = document.createElement("select"); on.className = "a-on";
+    [["match", "on match"], ["clear", "on clear"], ["both", "on both"]].forEach(x => on.appendChild(opt(x[0], x[1], x[0] === (a.on || "both")))); onW.appendChild(on);
+    const kW = el("div"); kW.style.flex = "0 0 108px"; const k = document.createElement("select"); k.className = "a-kind";
+    [["mqtt", "MQTT"], ["webhook", "Webhook"], ["notify", "Notify"]].forEach(x => k.appendChild(opt(x[0], x[1], x[0] === (a.kind || "mqtt")))); kW.appendChild(k);
+    let fields = actionFields(k.value, a);
+    const rmW = el("div"); rmW.style.flex = "0 0 auto"; const rm = el("button", "secondary danger mini", "×"); rm.type = "button"; rmW.appendChild(rm);
+    k.addEventListener("change", () => { const nf = actionFields(k.value, {}); row.replaceChild(nf, fields); fields = nf; });
+    rm.addEventListener("click", () => row.remove());
+    row.appendChild(onW); row.appendChild(kW); row.appendChild(fields); row.appendChild(rmW);
+    return row;
+  }
   function ruleCard(rule) {
-    rule = rule || { name: "", description: "", topic: "", on_match: "", on_clear: "", enabled: true, combine: "any", conditions: [] };
+    rule = rule || { name: "", description: "", topic: "", on_match: "", on_clear: "", enabled: true, combine: "any", conditions: [], actions: [] };
     const card = el("div", "rule-card");
     card.innerHTML =
       '<div class="rhead"><span class="idx"></span>' +
@@ -444,8 +477,12 @@ function agoText(iso) {
       '<div class="combine-wrap"><label>When there are multiple conditions, match' +
       ' <select class="f-combine"></select></label></div>' +
       '<label style="margin-top:14px">Conditions</label><div class="conds"></div>' +
-      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button>' +
-      '<button type="button" class="danger mini remove-rule">Remove rule</button></div>';
+      '<div class="btnrow"><button type="button" class="secondary mini add-cond">+ Add condition</button></div>' +
+      '<details class="actions-wrap" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
+      'Extra actions <span class="hint">(optional — extra publishes, webhooks, Slack on a transition)</span></summary>' +
+      '<div class="actions" style="margin-top:8px;display:flex;flex-direction:column;gap:8px"></div>' +
+      '<div class="btnrow"><button type="button" class="secondary mini add-action">+ Add action</button></div></details>' +
+      '<div class="btnrow"><button type="button" class="danger mini remove-rule">Remove rule</button></div>';
     card.querySelector(".f-name").value = rule.name || "";
     card.querySelector(".f-topic").value = rule.topic || "";
     card.querySelector(".f-desc").value = rule.description || "";
@@ -458,6 +495,10 @@ function agoText(iso) {
     const conds = card.querySelector(".conds");
     (rule.conditions && rule.conditions.length ? rule.conditions : [null]).forEach(c => conds.appendChild(condRow(c)));
     card.querySelector(".add-cond").addEventListener("click", () => { conds.appendChild(condRow()); refreshCombine(card); });
+    const actionsBox = card.querySelector(".actions");
+    (rule.actions || []).forEach(a => actionsBox.appendChild(actionRow(a)));
+    if ((rule.actions || []).length) card.querySelector(".actions-wrap").open = true;
+    card.querySelector(".add-action").addEventListener("click", () => actionsBox.appendChild(actionRow()));
     card.querySelector(".remove-rule").addEventListener("click", () => { card.remove(); reindex(); });
     refreshCombine(card);
     return card;
@@ -484,6 +525,13 @@ function agoText(iso) {
         if (!noVal) { const ctrl = row.querySelector(".c-val"); value = ctrl ? ctrl.value : ""; }
         return { metric, operator, value, for: forv };
       });
+      const actions = [...card.querySelectorAll(".action-row")].map(row => {
+        const kind = row.querySelector(".a-kind").value;
+        const on = row.querySelector(".a-on").value;
+        if (kind === "webhook") return { kind, on, url: (row.querySelector(".a-url").value || "").trim(), method: row.querySelector(".a-method").value, body: row.querySelector(".a-body").value };
+        if (kind === "notify") return { kind, on, text: (row.querySelector(".a-text").value || "").trim() };
+        return { kind, on, topic: (row.querySelector(".a-topic").value || "").trim(), payload: row.querySelector(".a-payload").value };
+      });
       return {
         name: card.querySelector(".f-name").value.trim(),
         description: card.querySelector(".f-desc").value.trim(),
@@ -493,6 +541,7 @@ function agoText(iso) {
         enabled: card.querySelector(".f-enabled").checked,
         combine: card.querySelector(".f-combine").value,
         conditions: conds,
+        actions: actions,
       };
     });
   }
@@ -528,6 +577,11 @@ function agoText(iso) {
         }
         if (c.value === "") return "Rule '" + r.name + "': the " + c.metric + " condition needs a value.";
         if (meta.type === "number" && isNaN(Number(c.value))) return "Rule '" + r.name + "': " + c.metric + " needs a numeric value.";
+      }
+      for (const a of (r.actions || [])) {
+        if (a.kind === "mqtt" && !a.topic) return "Rule '" + r.name + "': an MQTT action needs a topic.";
+        if (a.kind === "webhook" && !a.url) return "Rule '" + r.name + "': a webhook action needs a URL.";
+        if (a.kind === "notify" && !a.text) return "Rule '" + r.name + "': a notify action needs a message.";
       }
     }
     return "";
