@@ -23,6 +23,7 @@ Test:  python weather_mqtt.py --config config.yaml --once --dry-run --verbose
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -74,6 +75,7 @@ METRIC_SPECS = {
     "time_minute":               {"type": "number", "ops": NUMBER_OPS},   # 0..59
     "time_weekday":              {"type": "text",   "ops": TEXT_OPS},     # mon..sun
     "time_is_weekend":           {"type": "bool",   "ops": ("==", "!=")},
+    "time_is_daytime":           {"type": "bool",   "ops": ("==", "!=")},  # sun up at site
 }
 
 
@@ -1234,17 +1236,51 @@ def _parse_iso(s):
         return None
 
 
-def schedule_metrics(now):
+def is_daytime(lat, lon, now):
+    """True if the sun is up at (lat, lon) for the instant `now` (any-tz
+    datetime). Dependency-free sunrise equation; handles polar day/night.
+
+    The solar transit is computed for the integer solar day nearest `now` (not
+    the continuous timestamp), then `now` is tested against that day's sunrise
+    and sunset.
+    """
+    jd = now.timestamp() / 86400.0 + 2440587.5       # Julian date (UTC instant)
+    n = round(jd - 2451545.0 + lon / 360.0)          # solar-day cycle nearest now
+    D = n - lon / 360.0                              # days since the 2000 epoch
+    M = math.radians((357.5291 + 0.98560028 * D) % 360)
+    C = 1.9148 * math.sin(M) + 0.0200 * math.sin(2 * M) + 0.0003 * math.sin(3 * M)
+    lam = math.radians((math.degrees(M) + C + 180 + 102.9372) % 360)
+    j_transit = 2451545.0 + D + 0.0053 * math.sin(M) - 0.0069 * math.sin(2 * lam)
+    sin_dec = math.sin(lam) * math.sin(math.radians(23.44))
+    dec = math.asin(sin_dec)
+    lat_r = math.radians(lat)
+    denom = math.cos(lat_r) * math.cos(dec)
+    if denom == 0:
+        return False
+    cos_omega = (math.sin(math.radians(-0.833)) - math.sin(lat_r) * sin_dec) / denom
+    if cos_omega > 1:
+        return False        # polar night: sun never rises
+    if cos_omega < -1:
+        return True         # polar day: sun never sets
+    omega = math.degrees(math.acos(cos_omega)) / 360.0
+    return (j_transit - omega) <= jd <= (j_transit + omega)
+
+
+def schedule_metrics(now, lat=None, lon=None):
     """Clock-derived metrics for time-of-day rules, from local civil time `now`.
-    Pure (no clock read here) so it's unit-testable. Merged into the metric
+    Pure (no clock read here) so it's unit-testable. When `lat`/`lon` are given,
+    also includes `time_is_daytime` (sun up at the site). Merged into the metric
     context each cycle alongside the weather metrics."""
     wd = WEEKDAYS[now.weekday()]
-    return {
+    out = {
         "time_hour": now.hour,
         "time_minute": now.minute,
         "time_weekday": wd,
         "time_is_weekend": wd in ("sat", "sun"),
     }
+    if lat is not None and lon is not None:
+        out["time_is_daytime"] = is_daytime(lat, lon, now)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1633,7 +1669,7 @@ def main():
 
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone()    # system local civil time for windows
-            m.update(schedule_metrics(now_local))   # time_* inputs into the context
+            m.update(schedule_metrics(now_local, lat, lon))   # time_* inputs
             m.update(variable_metrics(var_values))  # var_* operator-set inputs
             m.update(dict(mqtt_in_store))            # latest mqtt_in sensor values
             poll_http_inputs(cfg.get("http_inputs", []), http_store, http_last,

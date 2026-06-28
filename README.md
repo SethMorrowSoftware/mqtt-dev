@@ -423,6 +423,7 @@ Available metrics:
 | `time_minute` | local minute, 0–59 | `< <= > >= == != between in` |
 | `time_weekday` | `mon`…`sun` (local) | `equals`, `in`, `contains` |
 | `time_is_weekend` | Sat/Sun (true/false) | `== !=` |
+| `time_is_daytime` | sun up at your lat/long (true/false) | `== !=` |
 
 The `time_*` metrics are computed locally each cycle (no external calls), so
 rules can combine weather with the time of day — e.g. only hold irrigation

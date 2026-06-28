@@ -243,8 +243,11 @@ system "as customizable as possible" without engine changes.
   - **Delivered (cont.):** **`http_poll`** — `http_inputs:` GETs a JSON endpoint on
     an interval and maps fields (dotted path) to typed metrics, discovered by the
     builder; best‑effort with fail‑safe hold.
-  - **Still to come (own PRs):** `time_is_daytime` (sunrise/sunset), and optional
-    event‑driven re‑eval on MQTT input (today inputs are read each poll cycle).
+  - **Delivered (cont.):** **`time_is_daytime`** — a dependency‑free sunrise/sunset
+    flag from the site lat/long (handles polar day/night). **Phase 3 input sources
+    are complete.**
+  - **Optional remaining:** event‑driven re‑eval on MQTT input (today inputs are
+    read each poll cycle).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 
