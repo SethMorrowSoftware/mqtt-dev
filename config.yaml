@@ -90,11 +90,17 @@ status_push:
 #
 # A rule's `when` is either ONE condition:
 #     when: { metric: ..., operator: ..., value: ... }
-# or a compound of several, combined with `any` (OR) or `all` (AND):
+# or a compound of several, combined with `any` (OR) or `all` (AND). Those
+# groups can be NESTED and negated with `not` to any depth:
 #     when:
-#       any:
-#         - { metric: ..., operator: ..., value: ... }
-#         - { metric: ..., operator: ..., value: ... }
+#       all:
+#         - not: { metric: temperature, operator: "<", value: 32 }
+#         - any:
+#             - { metric: is_raining, operator: "==", value: true }
+#             - { metric: wind_speed_mph, operator: "between", value: [20, 60] }
+#
+# Each rule may also set `enabled: false` to leave it idle (not evaluated, no
+# publishing -- the broker's last retained value stands).
 #
 # Available metrics:
 #   is_raining                 precipitating right now (true/false)   [== !=]
@@ -103,10 +109,11 @@ status_push:
 #   temperature                current air temp, degF (measured if available)
 #   wind_speed_mph             current wind speed, mph
 #   humidity                   relative humidity, 0-100 (%)
-#   short_forecast             text e.g. "Light Rain"  (operators: contains, equals)
+#   short_forecast             text e.g. "Light Rain"  (operators: contains, equals, in)
 #   active_alert               NWS watches/warnings    (operators: any | contains | equals)
 #
-# Numeric operators:  <  <=  >  >=  ==  !=
+# Numeric operators:  <  <=  >  >=  ==  !=  between  in
+#   between -> inclusive [low, high] pair;   in -> list of allowed values
 # ---------------------------------------------------------------------------
 rules:
   # The main one: don't water if it's raining now OR it has already rained

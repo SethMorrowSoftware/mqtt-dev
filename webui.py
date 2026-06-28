@@ -383,8 +383,8 @@ function render(s){
   // rule with a known state, else just the first rule. This way a renamed first
   // rule still drives the hero instead of leaving it stuck on UNKNOWN.
   const rules = s.rules || [];
-  const irr = rules.find(r => /irrigation|rain_inhibit/.test(r.name || ""))
-           || rules.find(r => r.active !== null && r.active !== undefined)
+  const irr = rules.find(r => r.enabled !== false && /irrigation|rain_inhibit/.test(r.name || ""))
+           || rules.find(r => r.enabled !== false && r.active !== null && r.active !== undefined)
            || rules[0];
   const d = document.getElementById("directive");
   let st = "unknown";
@@ -421,7 +421,8 @@ function render(s){
   for(const r of rules){
     const tr = document.createElement("tr");
     let pill;
-    if(r.active === null || r.active === undefined) pill = '<span class="pill na">n/a</span>';
+    if(r.enabled === false) pill = '<span class="pill na">disabled</span>';
+    else if(r.active === null || r.active === undefined) pill = '<span class="pill na">n/a</span>';
     else if(r.active) pill = '<span class="pill on">active</span>';
     else pill = '<span class="pill off">clear</span>';
     tr.innerHTML = '<td>'+esc(r.name)+'<div class="muted">'+esc(r.description||"")+'</div></td>'+
@@ -1197,11 +1198,37 @@ def rules():
     rules_yaml = (rules_yaml_override if rules_yaml_override is not None
                   else _y2.safe_dump(_to_plain(cfg["rules"]), sort_keys=False))
     structured = structured_override if structured_override is not None else _structured_list(cfg)
+    # The form builder only represents flat rules (a single condition, or one
+    # any/all group of conditions). If the config uses the engine's nested
+    # any/all/not, default to the YAML editor so a Save in the form tab can't
+    # silently flatten/drop the advanced structure.
+    active_tab = mode
+    if request.method == "GET" and not all(
+            _rule_is_flat(r) for r in _to_plain(cfg.get("rules", []) or [])):
+        active_tab = "yaml"
     body = render_template_string(
         RULES, rules_yaml=rules_yaml, structured=structured,
-        metrics=RULE_METRICS, active_tab=mode)
+        metrics=RULE_METRICS, active_tab=active_tab)
     return page(body, page="rules", msg=msg, msgclass=msgclass,
                 title="Rules · Precipitation → MQTT")
+
+
+def _rule_is_flat(rule):
+    """True if the form builder can faithfully represent this rule (a single
+    leaf condition, or one any/all group of leaf conditions). Nested groups or
+    `not` are YAML-editor only."""
+    if not isinstance(rule, dict):
+        return False
+    when = rule.get("when")
+    if not isinstance(when, dict):
+        return False
+    if "not" in when:
+        return False
+    if "any" in when or "all" in when:
+        group = when.get("any" if "any" in when else "all")
+        return (isinstance(group, list) and bool(group)
+                and all(isinstance(c, dict) and "metric" in c for c in group))
+    return "metric" in when
 
 
 def _to_plain(obj):

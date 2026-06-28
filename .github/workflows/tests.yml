@@ -4,6 +4,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:        # allow manual re-runs from the Actions tab
 
 permissions:
   contents: read

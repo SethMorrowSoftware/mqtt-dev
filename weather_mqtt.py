@@ -54,16 +54,24 @@ NOT_HERE_WORDS = ("vicinity", "in the area")
 # the single source of truth shared by config validation here and the web UI's
 # rule builder (which imports it), so the two can never drift apart.
 NUMERIC_COMPARE = ("<", "<=", ">", ">=", "==", "!=")
+# Set-style operators (ROADMAP Phase 1 engine): `between` takes an inclusive
+# [low, high] pair; `in` takes a list of allowed values.
+SET_OPS = ("between", "in")
+NUMBER_OPS = NUMERIC_COMPARE + SET_OPS
+TEXT_OPS = ("contains", "equals", "in")
 METRIC_SPECS = {
     "is_raining":                {"type": "bool",   "ops": ("==", "!=")},
-    "precip_accum_in":           {"type": "number", "ops": NUMERIC_COMPARE},
-    "precipitation_probability": {"type": "number", "ops": NUMERIC_COMPARE},
-    "temperature":               {"type": "number", "ops": NUMERIC_COMPARE},
-    "wind_speed_mph":            {"type": "number", "ops": NUMERIC_COMPARE},
-    "humidity":                  {"type": "number", "ops": NUMERIC_COMPARE},
-    "short_forecast":            {"type": "text",   "ops": ("contains", "equals")},
+    "precip_accum_in":           {"type": "number", "ops": NUMBER_OPS},
+    "precipitation_probability": {"type": "number", "ops": NUMBER_OPS},
+    "temperature":               {"type": "number", "ops": NUMBER_OPS},
+    "wind_speed_mph":            {"type": "number", "ops": NUMBER_OPS},
+    "humidity":                  {"type": "number", "ops": NUMBER_OPS},
+    "short_forecast":            {"type": "text",   "ops": TEXT_OPS},
     "active_alert":              {"type": "alert",  "ops": ("any", "contains", "equals")},
 }
+
+
+MAX_WHEN_DEPTH = 25   # guard against pathological deeply-nested configs
 
 
 def _validate_condition(cond, rule_name):
@@ -83,20 +91,58 @@ def _validate_condition(cond, rule_name):
                          f"metric '{metric}' (valid: {', '.join(spec['ops'])})")
     if "value" not in cond or cond["value"] is None:
         raise ValueError(f"rule '{rule_name}': condition on '{metric}' needs a value")
-    if spec["type"] == "number" and _as_number(cond["value"], None, f"{metric} value") is None:
+    value = cond["value"]
+    if op == "between":
+        _validate_between_value(value, metric, rule_name)
+    elif op == "in":
+        _validate_in_value(value, spec["type"], metric, rule_name)
+    elif spec["type"] == "number" and _as_number(value, None, f"{metric} value") is None:
         raise ValueError(f"rule '{rule_name}': '{metric}' value "
-                         f"{cond['value']!r} must be a number")
+                         f"{value!r} must be a number")
 
 
-def _validate_rule_when(when, rule_name):
-    """Validate a rule's `when` (single condition or any/all group)."""
+def _validate_between_value(value, metric, rule_name):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"rule '{rule_name}': '{metric}' between needs a "
+                         "[low, high] pair")
+    lo = _as_number(value[0], None, "between low")
+    hi = _as_number(value[1], None, "between high")
+    if lo is None or hi is None:
+        raise ValueError(f"rule '{rule_name}': '{metric}' between bounds must be numbers")
+    if lo > hi:
+        raise ValueError(f"rule '{rule_name}': '{metric}' between low must be <= high")
+
+
+def _validate_in_value(value, vtype, metric, rule_name):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"rule '{rule_name}': '{metric}' in needs a non-empty list")
+    if vtype == "number":
+        for v in value:
+            if _as_number(v, None, "in item") is None:
+                raise ValueError(f"rule '{rule_name}': '{metric}' in list must be "
+                                 "all numbers")
+
+
+def _validate_rule_when(when, rule_name, _depth=0):
+    """Validate a rule's `when`: a single condition, or a nested group built from
+    `any` (OR), `all` (AND), and `not` (negation), to arbitrary depth."""
+    if _depth > MAX_WHEN_DEPTH:
+        raise ValueError(f"rule '{rule_name}': condition nesting is too deep "
+                         f"(max {MAX_WHEN_DEPTH})")
     if isinstance(when, dict) and ("any" in when or "all" in when):
+        if len(when) != 1:
+            raise ValueError(f"rule '{rule_name}': an any/all group must have exactly "
+                             "one of 'any' or 'all' as its only key")
         mode = "any" if "any" in when else "all"
         group = when[mode]
         if not isinstance(group, list) or not group:
             raise ValueError(f"rule '{rule_name}': '{mode}' must be a non-empty list")
         for c in group:
-            _validate_condition(c, rule_name)
+            _validate_rule_when(c, rule_name, _depth + 1)
+    elif isinstance(when, dict) and "not" in when:
+        if len(when) != 1:
+            raise ValueError(f"rule '{rule_name}': 'not' must be the only key in its group")
+        _validate_rule_when(when["not"], rule_name, _depth + 1)
     else:
         _validate_condition(when, rule_name)
 
@@ -193,6 +239,12 @@ def validate_config(cfg):
         # Validate the condition(s) so one malformed rule is caught here rather
         # than blowing up mid-cycle in the monitor.
         _validate_rule_when(r["when"], name)
+        # Per-rule on/off switch (default on). A disabled rule is left idle:
+        # it's evaluated against nothing and publishes no actions this cycle.
+        en = r.get("enabled", True)
+        if isinstance(en, str):
+            en = en.strip().lower() not in ("false", "0", "no", "off", "")
+        r["enabled"] = bool(en)
 
     # --- defaults + clamping for the forgiving numeric knobs ---
     poll = _as_number(cfg.get("poll_interval_minutes", 15), 15, "poll_interval_minutes")
@@ -576,6 +628,8 @@ def _eval_condition(cond, metrics, rule_name):
             return str(value).lower() in text.lower()
         if op == "equals":
             return text.lower() == str(value).lower()
+        if op == "in":
+            return any(text.lower() == str(v).lower() for v in (value or []))
         LOG.warning("Rule '%s': unknown text operator '%s'", rule_name, op)
         return False
 
@@ -585,6 +639,20 @@ def _eval_condition(cond, metrics, rule_name):
         LOG.warning("Rule '%s': metric '%s' unavailable this cycle",
                     rule_name, metric)
         return None
+    if op == "between":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return None
+        lo = _as_number(value[0], None, "between low")
+        hi = _as_number(value[1], None, "between high")
+        if lo is None or hi is None:
+            return None
+        return lo <= current <= hi
+    if op == "in":
+        items = value or []
+        if isinstance(current, bool):
+            return current in items
+        return any(n is not None and current == n
+                   for n in (_as_number(v, None, "in item") for v in items))
     fn = NUMERIC_OPS.get(op)
     if fn is None:
         LOG.warning("Rule '%s': unknown operator '%s'", rule_name, op)
@@ -592,33 +660,41 @@ def _eval_condition(cond, metrics, rule_name):
     return fn(current, value)
 
 
-def evaluate_rule(rule, metrics):
-    """Evaluate a rule's `when`.
+def _eval_node(node, metrics, rule_name, _depth=0):
+    """Recursively evaluate a `when` node with three-valued logic.
 
-    `when` may be a single condition dict {metric, operator, value}, or a
-    compound {any: [...]} / {all: [...]}. Returns True, False, or None
-    (metric(s) unavailable -> caller leaves state unchanged).
+    Returns True, False, or None (a referenced metric was unavailable -> the
+    caller leaves the rule's state unchanged). Groups: `any` (OR), `all` (AND),
+    and `not` (negation), nestable to arbitrary depth; a leaf is a single
+    {metric, operator, value} condition. Unknown (None) propagates so the
+    fail-safe "hold last state" behaviour is preserved through nesting.
     """
-    when = rule["when"]
-    name = rule["name"]
-
-    if isinstance(when, dict) and ("any" in when or "all" in when):
-        mode = "any" if "any" in when else "all"
-        results = [_eval_condition(c, metrics, name) for c in when[mode]]
+    if _depth > MAX_WHEN_DEPTH + 5:   # defensive; validation already bounds depth
+        return None
+    if isinstance(node, dict) and ("any" in node or "all" in node):
+        mode = "any" if "any" in node else "all"
+        results = [_eval_node(c, metrics, rule_name, _depth + 1) for c in node[mode]]
         if mode == "any":
             if any(r is True for r in results):
                 return True
             if any(r is None for r in results):
-                return None      # could still be true if missing data returns
+                return None      # could still be true once missing data returns
             return False
-        else:  # all
-            if any(r is False for r in results):
-                return False
-            if any(r is None for r in results):
-                return None
-            return True
+        if any(r is False for r in results):   # all
+            return False
+        if any(r is None for r in results):
+            return None
+        return True
+    if isinstance(node, dict) and "not" in node:
+        inner = _eval_node(node["not"], metrics, rule_name, _depth + 1)
+        return None if inner is None else (not inner)
+    return _eval_condition(node, metrics, rule_name)
 
-    return _eval_condition(when, metrics, name)
+
+def evaluate_rule(rule, metrics):
+    """Evaluate a rule's `when` (single condition, or a nested any/all/not
+    group). Returns True, False, or None (metric(s) unavailable)."""
+    return _eval_node(rule["when"], metrics, rule["name"])
 
 
 # ---------------------------------------------------------------------------
@@ -872,8 +948,9 @@ def main():
             rule_rows = []
             for rule in rules:
               try:
-                result = evaluate_rule(rule, m)
-                if result is not None:
+                enabled = rule.get("enabled", True)
+                result = evaluate_rule(rule, m) if enabled else None
+                if enabled and result is not None:
                     prev = last_state.get(rule["name"])
                     changed = (prev is None) or (prev != result) or cfg["always_publish"]
                     # Assume committed unless a real publish fails below. A failed
@@ -912,6 +989,7 @@ def main():
                     "name": rule["name"],
                     "description": rule.get("description", ""),
                     "topic": rule["topic"],
+                    "enabled": enabled,
                     "active": last_state.get(rule["name"]),
                     "current_payload": (rule["on_match"]
                                         if last_state.get(rule["name"]) else

@@ -140,7 +140,8 @@ function agoText(iso) {
     const tb = document.getElementById("rulebody");
     tb.innerHTML = "";
     for (const r of s.rules) {
-      const pill = r.active ? '<span class="pill on">active</span>' : '<span class="pill off">clear</span>';
+      const pill = r.enabled === false ? '<span class="pill na">disabled</span>'
+        : (r.active ? '<span class="pill on">active</span>' : '<span class="pill off">clear</span>');
       const tr = document.createElement("tr");
       tr.innerHTML = "<td>" + esc(r.name) + '<div class="muted">' + esc(r.description) + "</div></td>" +
         "<td><code>" + esc(r.topic) + "</code></td><td>" + pill + "</td>" +

@@ -284,7 +284,8 @@ If you installed by hand, re-copy the `.py` files to your install dir, run
 ## Customizing rules
 
 Each rule publishes `on_match`/`on_clear` to a `topic`. A rule's `when` is
-either one condition, or several combined with `any` (OR) / `all` (AND):
+either one condition, or several combined with `any` (OR) / `all` (AND) — and
+those groups can be **nested** and negated with `not` to any depth:
 
 ```yaml
 - name: irrigation_rain_inhibit
@@ -295,6 +296,19 @@ either one condition, or several combined with `any` (OR) / `all` (AND):
   topic: "irrigation/rain_inhibit"
   on_match: "INHIBIT"        # published when wet
   on_clear: "ALLOW"          # published when dry again
+
+# Nested example: hold only when it's NOT freezing AND (raining OR wind is high)
+- name: complex_hold
+  enabled: true              # set false to leave a rule idle (no publishing)
+  when:
+    all:
+      - not: { metric: temperature, operator: "<", value: 32 }
+      - any:
+          - { metric: is_raining,     operator: "==",      value: true }
+          - { metric: wind_speed_mph, operator: "between", value: [20, 60] }
+  topic: "facility/complex_hold"
+  on_match: "1"
+  on_clear: "0"
 ```
 
 Available metrics:
@@ -302,13 +316,22 @@ Available metrics:
 | Metric | Meaning | Operators |
 |---|---|---|
 | `is_raining` | precipitating right now (true/false) | `== !=` |
-| `precip_accum_in` | **measured** rainfall over `lookback_hours`, inches | `< <= > >= == !=` |
-| `precipitation_probability` | **forecast** chance of precip, 0–100% | `< <= > >= == !=` |
-| `temperature` | current air temp, °F (measured if a station is nearby) | `< <= > >= == !=` |
-| `wind_speed_mph` | current wind speed, mph | `< <= > >= == !=` |
-| `humidity` | relative humidity, 0–100% | `< <= > >= == !=` |
-| `short_forecast` | text like "Light Rain" | `contains`, `equals` |
+| `precip_accum_in` | **measured** rainfall over `lookback_hours`, inches | `< <= > >= == != between in` |
+| `precipitation_probability` | **forecast** chance of precip, 0–100% | `< <= > >= == != between in` |
+| `temperature` | current air temp, °F (measured if a station is nearby) | `< <= > >= == != between in` |
+| `wind_speed_mph` | current wind speed, mph | `< <= > >= == != between in` |
+| `humidity` | relative humidity, 0–100% | `< <= > >= == != between in` |
+| `short_forecast` | text like "Light Rain" | `contains`, `equals`, `in` |
 | `active_alert` | NWS watches/warnings | `any`, `contains`, `equals` |
+
+`between` takes an inclusive `[low, high]` pair; `in` takes a list of allowed
+values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).
+
+A rule may set `enabled: false` to leave it idle — it is not evaluated and
+publishes nothing, so the broker's last retained value stands. The web UI's
+**form builder** edits flat rules (one condition or one `any`/`all` group);
+nested/`not` rules are edited in the **YAML (advanced)** tab, which the Rules
+page opens automatically when it detects them.
 
 `on_match` / `on_clear` payloads are sent literally, so they can be anything
 your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.

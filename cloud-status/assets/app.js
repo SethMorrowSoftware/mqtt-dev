@@ -59,8 +59,8 @@ function render(s, ok){
   // rule with a known state, else the first rule, so a renamed first rule still
   // drives the hero instead of leaving it stuck on UNKNOWN.
   const rules = s.rules || [];
-  const irr = rules.find(r => /irrigation|rain_inhibit/.test(r.name||""))
-           || rules.find(r => r.active !== null && r.active !== undefined)
+  const irr = rules.find(r => r.enabled !== false && /irrigation|rain_inhibit/.test(r.name||""))
+           || rules.find(r => r.enabled !== false && r.active !== null && r.active !== undefined)
            || rules[0];
   const d = document.getElementById("directive");
   let st = "unknown";
@@ -96,7 +96,8 @@ function render(s, ok){
   tb.innerHTML = "";
   for(const r of rules){
     let pill;
-    if(r.active===null||r.active===undefined) pill='<span class="pill na">n/a</span>';
+    if(r.enabled===false) pill='<span class="pill na">disabled</span>';
+    else if(r.active===null||r.active===undefined) pill='<span class="pill na">n/a</span>';
     else if(r.active) pill='<span class="pill on">active</span>';
     else pill='<span class="pill off">clear</span>';
     const tr=document.createElement("tr");
