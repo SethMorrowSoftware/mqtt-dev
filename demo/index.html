@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>Dashboard · Precipitation → MQTT</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8C%A7%3C/text%3E%3C/svg%3E">
+<title>Dashboard · The Castle Fun Center</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%B0%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
 <div class="banner">📦 <b>Static demo</b> — sample data, nothing is published or saved. The live app is <code>webui.py</code>.</div>
 <header>
-  <h1><span class="logo">🌧</span> Precipitation → MQTT</h1>
+  <h1><span class="logo">🏰</span> The Castle Fun Center <span style="font-weight:500;color:var(--muted2);font-size:12px;letter-spacing:.02em">· MQTT Command Center</span></h1>
   <nav>
     <a href="index.html" class="active">Dashboard</a>
     <a href="settings.html">Settings</a>
@@ -24,7 +24,7 @@
 
 <main id="dash" class="loading">
   <div class="card" id="directive-card">
-    <div class="eyebrow">Irrigation directive</div>
+    <div class="eyebrow">Headline device</div>
     <div class="big unknown" id="directive">…</div>
     <div class="muted" id="directive-sub">Loading current conditions…</div>
   </div>
@@ -82,7 +82,7 @@
   <p class="muted">Live — updates every few seconds. <span id="staleness"></span></p>
 </main>
 
-<footer>Precipitation → MQTT controller · demo build · data source: National Weather Service (api.weather.gov) · <a href="https://github.com/SethMorrowSoftware/mqtt-dev" target="_blank" rel="noopener">Docs ↗</a></footer>
+<footer>The Castle Fun Center · MQTT Command Center · demo build · data source: National Weather Service (api.weather.gov) · <a href="https://github.com/SethMorrowSoftware/mqtt-dev" target="_blank" rel="noopener">Docs ↗</a></footer>
 <div id="toast"></div>
 <script src="assets/app.js"></script>
 </body>

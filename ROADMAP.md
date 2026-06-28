@@ -227,9 +227,11 @@ system "as customizable as possible" without engine changes.
     and automatic changes, an authenticated `POST /api/control` endpoint, dashboard
     Auto/On/Off buttons, and a read‑only "manual" indicator on the cloud status page.
   - **Delivered (cont.):** an in‑UI **Activity** page (`/activity` + `/api/audit`)
-    that renders the audit log in plain language, newest first.
-  - **Still to come (own PRs):** the generalized device‑grid dashboard refresh +
-    neutral branding (today's rule table already carries the controls).
+    that renders the audit log in plain language; a **device‑grid dashboard** (cards
+    with inline Auto/On/Off, a status legend, and a getting‑started empty state);
+    onboarding/inline help; and **branding** as *The Castle Fun Center · MQTT Command
+    Center* across the web UI, demo, and cloud‑status pages.
+  - Phase 2 is complete.
 - **Phase 3 — Inputs:** `schedule`, `manual` variables, `mqtt_in` sensors, `http_poll`;
   dynamic metric discovery in the builder; optional event‑driven re‑eval on MQTT input.
   - **Delivered:** **schedule/clock metrics** (`time_hour`, `time_minute`,
