@@ -3,8 +3,9 @@
    All client-side, no backend. Every page shares this file; each block runs
    only if the elements it needs are present on the page. Mirrors the live
    webui.py UI (dashboard with variables + manual control, the rule builder,
-   settings, the activity log, and the System health/log page) but everything
-   is mock data — nothing is published or saved.
+   settings, the inputs editor, the activity log, the System health/log page,
+   and the MQTT console) but everything is mock data — nothing is published or
+   saved.
    =========================================================================== */
 "use strict";
 
@@ -920,4 +921,110 @@ function agoText(iso) {
   (SRC.mqtt_inputs || []).forEach(m => mqtts.appendChild(mqttRow(m)));
   (SRC.http_inputs || []).forEach(h => https.appendChild(httpCard(h)));
   (SRC.computed || []).forEach(c => comps.appendChild(compRow(c)));
+})();
+
+/* =========================================================================
+   MQTT  ·  live console: simulated topic feed + topics view + publish (toast)
+   Mirrors the live webui.py MQTT page; mock data, no broker.
+   ========================================================================= */
+(function mqtt() {
+  if (!document.getElementById("feedbody") || !document.getElementById("p-send")) return;
+
+  // A small set of topics the demo "broker" emits on, with payload generators.
+  const SOURCES = [
+    { topic: "sensors/tank/level",   gen: () => (40 + Math.random() * 20).toFixed(1), retain: true },
+    { topic: "sensors/power/kw",     gen: () => (1 + Math.random() * 4).toFixed(2),  retain: false },
+    { topic: "facility/door/north",  gen: () => (Math.random() < 0.5 ? "OPEN" : "CLOSED"), retain: true },
+    { topic: "irrigation/rain_inhibit", gen: () => (Math.random() < 0.5 ? "INHIBIT" : "ALLOW"), retain: true },
+    { topic: "weather/status",       gen: () => JSON.stringify({ t: Math.round(55 + Math.random() * 20), rh: Math.round(40 + Math.random() * 40) }), retain: true },
+    { topic: "facility/vent_fan",    gen: () => (Math.random() < 0.5 ? "ON" : "OFF"), retain: true },
+  ];
+  let seq = 0, received = 0;
+  const ROWS = [];           // recent feed entries (mock ring buffer)
+  const LATEST = {};         // topic -> {payload, ts, count, retain, qos}
+  const MAXROWS = 400;
+
+  function emit() {
+    const s = SOURCES[Math.floor(Math.random() * SOURCES.length)];
+    const qos = Math.random() < 0.3 ? 1 : 0;
+    const e = { seq: ++seq, ts: isoNow(), topic: s.topic, payload: String(s.gen()), qos, retain: s.retain };
+    ROWS.push(e); received++;
+    if (ROWS.length > MAXROWS) ROWS.shift();
+    const cur = LATEST[s.topic];
+    LATEST[s.topic] = { payload: e.payload, ts: e.ts, qos, retain: s.retain, count: cur ? cur.count + 1 : 1 };
+  }
+  // Seed some history so the page isn't empty on load.
+  for (let i = 0; i < 12; i++) emit();
+
+  const ago = iso => { const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000)); return s < 5 ? "now" : s < 60 ? s + "s" : Math.round(s / 60) + "m"; };
+  function flags(m) { let f = []; if (m.retain) f.push('<span class="pill na" style="padding:1px 6px">R</span>'); if (m.qos) f.push('<span class="pill off" style="padding:1px 6px">q' + m.qos + "</span>"); return f.join(" "); }
+
+  function filtered() {
+    const pre = document.getElementById("filter").value.trim();
+    return pre ? ROWS.filter(m => m.topic.startsWith(pre)) : ROWS;
+  }
+  function renderFeed() {
+    const tb = document.getElementById("feedbody");
+    const rows = filtered();
+    document.getElementById("feednote").textContent = "Live · " + Object.keys(LATEST).length + " topics · " + received + " received";
+    document.getElementById("mq-conn").innerHTML = '<span class="dot up"></span>connected · ' + received + " msgs";
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No messages on this filter yet.</td></tr>'; return; }
+    tb.innerHTML = "";
+    for (const m of rows.slice(-120).reverse()) {
+      const tr = document.createElement("tr"); tr.style.cursor = "pointer";
+      tr.innerHTML = '<td class="muted" title="' + esc(m.ts) + '">' + esc(ago(m.ts)) + "</td>" +
+        "<td><code>" + esc(m.topic) + "</code></td><td>" + flags(m) + "</td>" +
+        '<td style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">' + esc(m.payload) + "</td>";
+      tr.addEventListener("click", () => { document.getElementById("p-topic").value = m.topic; });
+      tb.appendChild(tr);
+    }
+  }
+  function renderTopics() {
+    const tb = document.getElementById("topicsbody");
+    const list = Object.keys(LATEST).sort().map(t => ({ topic: t, ...LATEST[t] }));
+    if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">No topics seen yet…</td></tr>'; return; }
+    tb.innerHTML = "";
+    for (const t of list) {
+      const tr = document.createElement("tr"); tr.style.cursor = "pointer";
+      const pl = t.payload.length > 120 ? t.payload.slice(0, 120) + "…" : t.payload;
+      tr.innerHTML = "<td><code>" + esc(t.topic) + "</code></td><td class=\"muted\">" + t.count + "</td>" +
+        '<td class="muted" title="' + esc(t.ts) + '">' + esc(ago(t.ts)) + "</td>" +
+        '<td style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">' + esc(pl) + "</td>";
+      tr.addEventListener("click", () => { document.getElementById("p-topic").value = t.topic; document.getElementById("filter").value = t.topic; });
+      tb.appendChild(tr);
+    }
+  }
+
+  document.getElementById("p-send").addEventListener("click", () => {
+    const topic = document.getElementById("p-topic").value.trim();
+    const err = document.getElementById("p-err"); err.textContent = "";
+    if (!topic) { err.textContent = "Topic is required."; return; }
+    if (/[#+]/.test(topic)) { err.textContent = "Wildcards (# +) are not allowed in a publish topic."; toast("Could not publish: wildcards not allowed", true); return; }
+    // Echo it into the feed like a real publish would appear on a subscribed broker.
+    const payload = document.getElementById("p-payload").value;
+    const qos = Number(document.getElementById("p-qos").value);
+    const retain = document.getElementById("p-retain").checked;
+    const e = { seq: ++seq, ts: isoNow(), topic, payload: String(payload), qos, retain };
+    ROWS.push(e); received++;
+    const cur = LATEST[topic]; LATEST[topic] = { payload: String(payload), ts: e.ts, qos, retain, count: cur ? cur.count + 1 : 1 };
+    renderFeed();
+    toast("Published to " + topic + " (demo — nothing was sent).");
+  });
+
+  document.getElementById("clear").addEventListener("click", () => { ROWS.length = 0; renderFeed(); });
+  document.getElementById("filter").addEventListener("input", renderFeed);
+  document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active")); t.classList.add("active");
+    const tab = t.dataset.tab;
+    document.getElementById("tab-feed").style.display = tab === "feed" ? "" : "none";
+    document.getElementById("tab-topics").style.display = tab === "topics" ? "" : "none";
+    if (tab === "topics") renderTopics();
+  }));
+
+  document.querySelector('.tab[data-tab="feed"]').click();
+  renderFeed();
+  setInterval(() => {
+    if (document.getElementById("follow").checked) { emit(); if (Math.random() < 0.5) emit(); renderFeed(); }
+    if (document.getElementById("tab-topics").style.display !== "none") renderTopics();
+  }, 1500);
 })();

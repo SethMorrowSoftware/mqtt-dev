@@ -16,6 +16,8 @@ demo/
 ├── rules.html      Rules      — form rule builder + YAML editor (both validated)
 ├── inputs.html     Inputs     — sources editor: operator variables, MQTT sensor
 │                                inputs, HTTP JSON inputs, and computed metrics
+├── mqtt.html       MQTT       — live console: simulated topic feed, a Topics view,
+│                                and a publish box (toast only in the demo)
 ├── activity.html   Activity   — read-only audit log of state changes (sample data)
 ├── system.html     System     — monitor/MQTT health, config summary, and a
 │                                runtime log viewer with level filtering (sample data)
@@ -29,10 +31,11 @@ It mirrors the current `webui.py`: the rule builder offers the full operator set
 `for`, the `enabled` toggle), supports per-rule **extra actions** (extra publishes,
 webhooks, Slack notify with `{{metric}}` templating), and discovers schedule,
 variable, input, and **computed** metrics; the Inputs page edits all of those
-sources; the dashboard
-has a Variables card and per-device manual controls; the **System** page shows
-health, a config summary, and a runtime log viewer. Everything is mock — clicks
-update local state and show a toast; nothing is published or saved.
+sources; the **MQTT** page is a live console (topic feed, per-topic view, and a
+publish box); the dashboard has a Variables card and per-device manual controls;
+the **System** page shows health, a config summary, and a runtime log viewer.
+Everything is mock — clicks update local state and show a toast; nothing is
+published or saved.
 
 No build step, no external CDNs, no cookies — just static files.
 

@@ -78,6 +78,13 @@ web:
   # Default false = display-only. Fail-closed: only works when a login is set.
   # Overrides persist in overrides.json; changes are written to audit.log.
   allow_manual_control: false
+  # Allow sending arbitrary messages from the MQTT console (MQTT page).
+  # Default false = the live feed is read-only. Fail-closed like the above.
+  allow_mqtt_publish: false
+  # The MQTT console subscribes so the web UI can show a live message feed:
+  # mqtt_console_enabled: true            # set false to disable the subscription
+  # mqtt_console_topics: ["#"]            # topics to watch (default: everything)
+  # mqtt_console_buffer: 500              # max recent messages kept in memory
 
 # --- MQTT broker -----------------------------------------------------------
 mqtt:
