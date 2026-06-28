@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import time
 from datetime import datetime, timedelta, timezone
@@ -245,6 +246,11 @@ def validate_config(cfg):
         if isinstance(en, str):
             en = en.strip().lower() not in ("false", "0", "no", "off", "")
         r["enabled"] = bool(en)
+        # Optional time window + hysteresis (anti-short-cycle) per rule.
+        if r.get("window") is not None:
+            _validate_window(r["window"], name)
+        if r.get("hysteresis") is not None:
+            _validate_hysteresis(r["hysteresis"], name)
 
     # --- defaults + clamping for the forgiving numeric knobs ---
     poll = _as_number(cfg.get("poll_interval_minutes", 15), 15, "poll_interval_minutes")
@@ -698,6 +704,132 @@ def evaluate_rule(rule, metrics):
 
 
 # ---------------------------------------------------------------------------
+# Engine: time windows + hysteresis (ROADMAP Phase 1)
+# ---------------------------------------------------------------------------
+# A rule's evaluated result is its *desired* state. Two optional layers turn
+# that into the *committed* state the monitor actually publishes:
+#   - `window`: outside its active hours/days the desired state is forced OFF;
+#   - `hysteresis`: min_on / min_off / cooldown timers suppress rapid flapping
+#     so a real load (pump, valve, compressor) isn't short-cycled.
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def parse_duration(value, default=0):
+    """Parse a duration into whole seconds. Accepts '30s', '10m', '2h', or a
+    bare number (minutes). Returns `default` for None/blank/garbage."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value * 60)            # bare number == minutes
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*", str(value).lower())
+    if not m:
+        return default
+    return int(float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "": 60}[m.group(2)])
+
+
+def _parse_hhmm(s):
+    """'HH:MM' -> minutes past midnight (0..1440). '24:00' is allowed (end of day)."""
+    parts = str(s).strip().split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError(f"time '{s}' must be HH:MM")
+    h, mi = int(parts[0]), int(parts[1])
+    total = h * 60 + mi
+    if not (0 <= mi <= 59) or not (0 <= total <= 1440):
+        raise ValueError(f"time '{s}' is out of range")
+    return total
+
+
+def _validate_window(win, rule_name):
+    if not isinstance(win, dict):
+        raise ValueError(f"rule '{rule_name}': window must be a mapping")
+    for k in ("from", "to"):
+        if k in win and win[k] is not None:
+            try:
+                _parse_hhmm(win[k])
+            except ValueError as e:
+                raise ValueError(f"rule '{rule_name}': window.{k}: {e}")
+    days = win.get("days")
+    if days is not None:
+        if not isinstance(days, list) or not days:
+            raise ValueError(f"rule '{rule_name}': window.days must be a non-empty list")
+        for d in days:
+            if str(d).strip().lower()[:3] not in WEEKDAYS:
+                raise ValueError(f"rule '{rule_name}': window.days has invalid day '{d}' "
+                                 f"(use {', '.join(WEEKDAYS)})")
+
+
+def in_window(win, now):
+    """True if local civil time `now` (a datetime) is inside `win`.
+
+    `from`/`to` default to the whole day; `to` is exclusive so adjacent windows
+    don't overlap. A window whose `from` is later than its `to` wraps past
+    midnight (e.g. 22:00->06:00). `days` (mon..sun) filters by weekday.
+    """
+    if not win:
+        return True
+    days = win.get("days")
+    if days:
+        allowed = {str(d).strip().lower()[:3] for d in days}
+        if WEEKDAYS[now.weekday()] not in allowed:
+            return False
+    start = _parse_hhmm(win.get("from", "00:00"))
+    end = _parse_hhmm(win.get("to", "24:00"))
+    cur = now.hour * 60 + now.minute
+    if start == end:
+        return True                       # zero-length/degenerate -> treat as always on
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end       # wraps past midnight
+
+
+def _validate_hysteresis(hyst, rule_name):
+    if not isinstance(hyst, dict):
+        raise ValueError(f"rule '{rule_name}': hysteresis must be a mapping")
+    for k in ("min_on", "min_off", "cooldown"):
+        if k in hyst and hyst[k] is not None and parse_duration(hyst[k], None) is None:
+            raise ValueError(f"rule '{rule_name}': hysteresis.{k} must be a duration "
+                             "like '10m', '30s', '2h', or a number of minutes")
+
+
+def apply_hysteresis(hyst, prev, desired, last_change, now):
+    """Smooth a `desired` bool into the committed bool using min_on/min_off/
+    cooldown. `prev` is the current committed state (None if never set),
+    `last_change` the datetime it last changed, `now` the current time.
+
+    Returns the state to commit: `desired` when a transition is allowed, or
+    `prev` when a timer is still holding the current state.
+    """
+    if prev is None or prev == desired or not hyst:
+        return desired
+    elapsed = (now - last_change).total_seconds() if last_change else float("inf")
+    if elapsed < parse_duration(hyst.get("cooldown"), 0):
+        return prev
+    hold = parse_duration(hyst.get("min_on" if prev else "min_off"), 0)
+    if elapsed < hold:
+        return prev
+    return desired
+
+
+def resolve_desired(rule, metrics, now_local):
+    """The rule's desired state after the time-window gate: outside the window
+    the desired state is OFF; inside it is the evaluated `when` (True/False/
+    None, where None means hold)."""
+    win = rule.get("window")
+    if win and not in_window(win, now_local):
+        return False
+    return evaluate_rule(rule, metrics)
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s))
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
 def make_mqtt_client(mq):
@@ -945,13 +1077,23 @@ def main():
                 client.publish(status_topic, json.dumps(m),
                                qos=qos, retain=retain)
 
+            now_utc = datetime.now(timezone.utc)
+            now_local = now_utc.astimezone()    # system local civil time for windows
             rule_rows = []
             for rule in rules:
               try:
                 enabled = rule.get("enabled", True)
-                result = evaluate_rule(rule, m) if enabled else None
+                prev = last_state.get(rule["name"])
+                # desired state (window-gated), then smoothed into the committed
+                # `result` via hysteresis. None means "hold last state".
+                desired = resolve_desired(rule, m, now_local) if enabled else None
+                if desired is None:
+                    result = None
+                else:
+                    result = apply_hysteresis(
+                        rule.get("hysteresis"), prev, desired,
+                        _parse_iso(last_change.get(rule["name"])), now_utc)
                 if enabled and result is not None:
-                    prev = last_state.get(rule["name"])
                     changed = (prev is None) or (prev != result) or cfg["always_publish"]
                     # Assume committed unless a real publish fails below. A failed
                     # publish leaves last_state unchanged so the next cycle retries
@@ -980,8 +1122,8 @@ def main():
                                              "match=%s)", payload, topic,
                                              rule["name"], result)
                             if commit and prev != result:
-                                last_change[rule["name"]] = datetime.now(
-                                    timezone.utc).isoformat(timespec="seconds")
+                                last_change[rule["name"]] = now_utc.isoformat(
+                                    timespec="seconds")
                     if commit:
                         last_state[rule["name"]] = result
 
