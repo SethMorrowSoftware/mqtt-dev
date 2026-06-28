@@ -290,6 +290,7 @@ BASE = """
   <a href="{{ url_for('dashboard') }}" class="{{ 'active' if page=='dash' }}">Dashboard</a>
   <a href="{{ url_for('settings') }}" class="{{ 'active' if page=='settings' }}">Settings</a>
   <a href="{{ url_for('rules') }}" class="{{ 'active' if page=='rules' }}">Rules</a>
+  <a href="{{ url_for('inputs') }}" class="{{ 'active' if page=='inputs' }}">Inputs</a>
   <a href="{{ url_for('activity') }}" class="{{ 'active' if page=='activity' }}">Activity</a>
   <a href="{{ url_for('system') }}" class="{{ 'active' if page=='system' }}">System</a>
  </nav>
@@ -1813,6 +1814,254 @@ def rules():
         metrics=builder_metrics(cfg), active_tab=active_tab)
     return page(body, page="rules", msg=msg, msgclass=msgclass,
                 title="Rules · The Castle Fun Center")
+
+
+# ---------------------------------------------------------------------------
+# Inputs (sources): operator variables + mqtt_in sensors + http_poll, editable
+# ---------------------------------------------------------------------------
+def _num_or(value, default):
+    try:
+        return _num(str(value))
+    except Exception:
+        return default
+
+
+def _apply_sources(cfg, payload):
+    """Replace cfg's variables / mqtt_inputs / http_inputs from the builder's
+    JSON. Values are quoted for a lossless YAML round-trip; the monitor's
+    validate_config (via save_config) does the real validation."""
+    if not isinstance(payload, dict):
+        raise ValueError("malformed inputs payload")
+
+    variables = {}
+    for it in (payload.get("variables") or []):
+        name = str((it or {}).get("name", "")).strip()
+        if not name:
+            continue
+        vtype = str(it.get("type", "bool")).strip().lower()
+        if vtype == "number":
+            default = _num_or(it.get("default"), 0)
+        else:
+            d = it.get("default")
+            default = d if isinstance(d, bool) else str(d).strip().lower() in ("true", "1", "yes", "on")
+        variables[_qstr(name)] = {"type": _qstr(vtype), "default": default}
+    cfg["variables"] = variables
+
+    mlist = []
+    for it in (payload.get("mqtt_inputs") or []):
+        topic = str((it or {}).get("topic", "")).strip()
+        metric = str(it.get("metric", "")).strip()
+        if not topic and not metric:
+            continue
+        mlist.append({"topic": _qstr(topic), "metric": _qstr(metric),
+                      "parse": _qstr(str(it.get("parse", "number")).strip().lower())})
+    cfg["mqtt_inputs"] = mlist
+
+    hlist = []
+    for it in (payload.get("http_inputs") or []):
+        url = str((it or {}).get("url", "")).strip()
+        mp = []
+        for m in (it.get("map") or []):
+            metric = str((m or {}).get("metric", "")).strip()
+            if not metric:
+                continue
+            mp.append({"metric": _qstr(metric), "path": _qstr(str(m.get("path", "")).strip()),
+                       "type": _qstr(str(m.get("type", "number")).strip().lower())})
+        if not url and not mp:
+            continue
+        hlist.append({"url": _qstr(url),
+                      "interval_minutes": int(_num_or(it.get("interval_minutes"), 5)),
+                      "timeout": int(_num_or(it.get("timeout"), 10)),
+                      "map": mp})
+    cfg["http_inputs"] = hlist
+
+
+def _sources_payload(cfg):
+    """Current sources as the builder's editable JSON shape."""
+    variables = [{"name": str(n), "type": str((s or {}).get("type", "bool")),
+                  "default": _value_to_str((s or {}).get("default"))}
+                 for n, s in (_to_plain(cfg.get("variables", {})) or {}).items()]
+    mqtt_inputs = [{"topic": str((it or {}).get("topic", "")), "metric": str(it.get("metric", "")),
+                    "parse": str(it.get("parse", "number"))}
+                   for it in (_to_plain(cfg.get("mqtt_inputs", [])) or [])]
+    http_inputs = [{"url": str((it or {}).get("url", "")),
+                    "interval_minutes": (it.get("interval_minutes", 5)),
+                    "timeout": (it.get("timeout", 10)),
+                    "map": [{"metric": str((m or {}).get("metric", "")), "path": str(m.get("path", "")),
+                             "type": str(m.get("type", "number"))} for m in (it.get("map") or [])]}
+                   for it in (_to_plain(cfg.get("http_inputs", [])) or [])]
+    return {"variables": variables, "mqtt_inputs": mqtt_inputs, "http_inputs": http_inputs}
+
+
+INPUTS = """
+<form method="post" id="inputs-form">
+  <input type="hidden" name="inputs_json" id="inputs_json">
+  <div class="card">
+    <h3 style="margin:0 0 4px">Inputs (sources)</h3>
+    <p class="muted" style="margin:0 0 6px">Add the signals your rules can use. Each one becomes a
+     <b>metric</b> the rule builder discovers automatically. Saved to <code>config.yaml</code> and
+     validated before writing; new metrics apply on the next poll (mqtt/http connections re-read at the
+     next cycle, a new topic subscription needs a service restart).</p>
+  </div>
+
+  <div class="card">
+    <div class="toprow"><h3 style="margin:0">Operator variables</h3>
+      <button type="button" class="secondary mini" id="add-var" style="margin:0">+ Add variable</button></div>
+    <p class="muted" style="margin:6px 0 0">Virtual flags/setpoints you toggle from the dashboard
+     (metric <code>var_&lt;name&gt;</code>). Type <b>bool</b> or <b>number</b>.</p>
+    <div id="vars" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <div class="toprow"><h3 style="margin:0">MQTT sensor inputs</h3>
+      <button type="button" class="secondary mini" id="add-mqtt" style="margin:0">+ Add MQTT input</button></div>
+    <p class="muted" style="margin:6px 0 0">Subscribe to another device's topic and expose its payload as a
+     metric (<b>number</b>/<b>bool</b>/<b>string</b>).</p>
+    <div id="mqtts" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <div class="toprow"><h3 style="margin:0">HTTP JSON inputs</h3>
+      <button type="button" class="secondary mini" id="add-http" style="margin:0">+ Add HTTP input</button></div>
+    <p class="muted" style="margin:6px 0 0">Poll a JSON endpoint and map fields (dotted path, arrays by
+     index) to metrics.</p>
+    <div id="https" style="margin-top:10px"></div>
+    <div class="field-err" id="inputs-err" style="margin-top:10px"></div>
+    <button type="submit" id="save-inputs">Save inputs</button>
+  </div>
+</form>
+<script>
+const SRC = {{ sources|tojson }};
+const PARSE = ["number","bool","string"];
+function el(t,c,h){const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e;}
+function opt(v,l,s){const o=document.createElement("option");o.value=v;o.textContent=l||v;if(s)o.selected=true;return o;}
+function rmBtn(){const b=el("button","secondary danger mini","×");b.type="button";b.style.margin="0";return b;}
+
+// ---- variables ----
+const vars=document.getElementById("vars");
+function varDefault(type,val){
+  let c;
+  if(type==="number"){c=document.createElement("input");c.type="number";c.step="any";c.className="v-def";c.value=val!=null?val:"";c.placeholder="default";}
+  else{c=document.createElement("select");c.className="v-def";c.appendChild(opt("true","true",String(val)==="true"));c.appendChild(opt("false","false",String(val)!=="true"));}
+  return c;
+}
+function varRow(v){
+  v=v||{name:"",type:"bool",default:"false"};
+  const row=el("div","row"); row.style.alignItems="flex-end";
+  const nw=el("div"); nw.innerHTML='<label style="margin-top:0">Name</label>'; const n=el("input","v-name");n.value=v.name||"";n.placeholder="maintenance_mode";nw.appendChild(n);
+  const tw=el("div"); tw.innerHTML='<label style="margin-top:0">Type</label>'; const t=document.createElement("select");t.className="v-type";["bool","number"].forEach(x=>t.appendChild(opt(x,x,x===v.type)));tw.appendChild(t);
+  const dw=el("div"); dw.innerHTML='<label style="margin-top:0">Default</label>'; const dwrap=el("div","v-defwrap");dwrap.appendChild(varDefault(v.type,v.default));dw.appendChild(dwrap);
+  const rw=el("div"); rw.style.flex="0 0 auto"; const rm=rmBtn(); rw.appendChild(rm);
+  t.addEventListener("change",()=>{dwrap.innerHTML="";dwrap.appendChild(varDefault(t.value,null));});
+  rm.addEventListener("click",()=>row.remove());
+  row.appendChild(nw);row.appendChild(tw);row.appendChild(dw);row.appendChild(rw);
+  return row;
+}
+document.getElementById("add-var").addEventListener("click",()=>vars.appendChild(varRow()));
+
+// ---- mqtt ----
+const mqtts=document.getElementById("mqtts");
+function mqttRow(m){
+  m=m||{topic:"",metric:"",parse:"number"};
+  const row=el("div","row"); row.style.alignItems="flex-end";
+  const tw=el("div"); tw.innerHTML='<label style="margin-top:0">Topic</label>'; const t=el("input","m-topic");t.value=m.topic||"";t.placeholder="sensors/tank/level";tw.appendChild(t);
+  const me=el("div"); me.innerHTML='<label style="margin-top:0">Metric name</label>'; const mm=el("input","m-metric");mm.value=m.metric||"";mm.placeholder="tank_level";me.appendChild(mm);
+  const pw=el("div"); pw.innerHTML='<label style="margin-top:0">Parse</label>'; const p=document.createElement("select");p.className="m-parse";PARSE.forEach(x=>p.appendChild(opt(x,x,x===m.parse)));pw.appendChild(p);
+  const rw=el("div"); rw.style.flex="0 0 auto"; const rm=rmBtn(); rw.appendChild(rm); rm.addEventListener("click",()=>row.remove());
+  row.appendChild(tw);row.appendChild(me);row.appendChild(pw);row.appendChild(rw);
+  return row;
+}
+document.getElementById("add-mqtt").addEventListener("click",()=>mqtts.appendChild(mqttRow()));
+
+// ---- http ----
+const https=document.getElementById("https");
+function httpMapRow(mp){
+  mp=mp||{metric:"",path:"",type:"number"};
+  const row=el("div","row"); row.style.alignItems="flex-end";
+  const me=el("div"); me.innerHTML='<label style="margin-top:0">Metric</label>'; const m=el("input","h-metric");m.value=mp.metric||"";m.placeholder="power_kw";me.appendChild(m);
+  const pe=el("div"); pe.innerHTML='<label style="margin-top:0">JSON path</label>'; const p=el("input","h-path");p.value=mp.path||"";p.placeholder="data.current_kw";pe.appendChild(p);
+  const tw=el("div"); tw.innerHTML='<label style="margin-top:0">Type</label>'; const t=document.createElement("select");t.className="h-type";PARSE.forEach(x=>t.appendChild(opt(x,x,x===mp.type)));tw.appendChild(t);
+  const rw=el("div"); rw.style.flex="0 0 auto"; const rm=rmBtn(); rw.appendChild(rm); rm.addEventListener("click",()=>row.remove());
+  row.appendChild(me);row.appendChild(pe);row.appendChild(tw);row.appendChild(rw);
+  return row;
+}
+function httpCard(h){
+  h=h||{url:"",interval_minutes:5,timeout:10,map:[]};
+  const card=el("div","rule-card");
+  card.innerHTML='<div class="row"><div><label style="margin-top:0">URL</label><input class="h-url"></div>'+
+    '<div style="flex:0 0 130px"><label style="margin-top:0">Every (min)</label><input class="h-iv" type="number" min="1"></div>'+
+    '<div style="flex:0 0 120px"><label style="margin-top:0">Timeout (s)</label><input class="h-to" type="number" min="1"></div></div>'+
+    '<label style="margin-top:10px">Field mappings</label><div class="h-map"></div>'+
+    '<div class="btnrow"><button type="button" class="secondary mini add-map">+ Add mapping</button>'+
+    '<button type="button" class="danger mini rm-http">Remove input</button></div>';
+  card.querySelector(".h-url").value=h.url||""; card.querySelector(".h-url").placeholder="https://meter.local/api";
+  card.querySelector(".h-iv").value=h.interval_minutes!=null?h.interval_minutes:5;
+  card.querySelector(".h-to").value=h.timeout!=null?h.timeout:10;
+  const mapWrap=card.querySelector(".h-map");
+  (h.map&&h.map.length?h.map:[null]).forEach(mp=>mapWrap.appendChild(httpMapRow(mp)));
+  card.querySelector(".add-map").addEventListener("click",()=>mapWrap.appendChild(httpMapRow()));
+  card.querySelector(".rm-http").addEventListener("click",()=>card.remove());
+  return card;
+}
+document.getElementById("add-http").addEventListener("click",()=>https.appendChild(httpCard()));
+
+function collect(){
+  const variables=[...vars.querySelectorAll(".row")].map(r=>({
+    name:r.querySelector(".v-name").value.trim(),
+    type:r.querySelector(".v-type").value,
+    default:(r.querySelector(".v-def")||{}).value||""
+  })).filter(v=>v.name);
+  const mqtt_inputs=[...mqtts.querySelectorAll(".row")].map(r=>({
+    topic:r.querySelector(".m-topic").value.trim(),
+    metric:r.querySelector(".m-metric").value.trim(),
+    parse:r.querySelector(".m-parse").value
+  })).filter(m=>m.topic||m.metric);
+  const http_inputs=[...https.querySelectorAll(".rule-card")].map(c=>({
+    url:c.querySelector(".h-url").value.trim(),
+    interval_minutes:c.querySelector(".h-iv").value,
+    timeout:c.querySelector(".h-to").value,
+    map:[...c.querySelectorAll(".h-map .row")].map(r=>({
+      metric:r.querySelector(".h-metric").value.trim(),
+      path:r.querySelector(".h-path").value.trim(),
+      type:r.querySelector(".h-type").value
+    })).filter(m=>m.metric)
+  })).filter(h=>h.url||h.map.length);
+  return {variables,mqtt_inputs,http_inputs};
+}
+document.getElementById("save-inputs").addEventListener("click",e=>{
+  document.getElementById("inputs_json").value=JSON.stringify(collect());
+});
+
+(SRC.variables||[]).forEach(v=>vars.appendChild(varRow(v)));
+(SRC.mqtt_inputs||[]).forEach(m=>mqtts.appendChild(mqttRow(m)));
+(SRC.http_inputs||[]).forEach(h=>https.appendChild(httpCard(h)));
+</script>
+"""
+
+
+@app.route("/inputs", methods=["GET", "POST"])
+@require_auth
+def inputs():
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return _config_error_page("inputs", e)
+    msg = msgclass = None
+    if request.method == "POST":
+        try:
+            payload = json.loads(request.form.get("inputs_json", "{}"))
+            _apply_sources(cfg, payload)
+            save_config(cfg)
+            msg, msgclass = ("Inputs saved. New metrics are available to rules now; mqtt/http "
+                             "values refresh on the next poll (a new MQTT subscription needs a "
+                             "service restart).", "ok")
+            cfg = load_raw()
+        except Exception as e:
+            msg, msgclass = f"Could not save: {e}", "err"
+            cfg = load_raw()
+    body = render_template_string(INPUTS, sources=_sources_payload(cfg))
+    return page(body, page="inputs", msg=msg, msgclass=msgclass,
+                title="Inputs · The Castle Fun Center")
 
 
 def _rule_is_flat(rule):

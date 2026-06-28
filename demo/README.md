@@ -14,6 +14,8 @@ demo/
 ├── settings.html   Settings   — full config form with in-browser validation
 │                                (incl. Slack, remote status, manual control)
 ├── rules.html      Rules      — form rule builder + YAML editor (both validated)
+├── inputs.html     Inputs     — sources editor: operator variables, MQTT sensor
+│                                inputs, and HTTP JSON inputs (add/remove + validate)
 ├── activity.html   Activity   — read-only audit log of state changes (sample data)
 ├── system.html     System     — monitor/MQTT health, config summary, and a
 │                                runtime log viewer with level filtering (sample data)
