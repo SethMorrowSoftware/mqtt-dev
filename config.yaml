@@ -121,6 +121,11 @@ status_push:
 #
 # Numeric operators:  <  <=  >  >=  ==  !=  between  in
 #   between -> inclusive [low, high] pair;   in -> list of allowed values
+#
+# History-aware (any metric):
+#   operator: changed   -> true the cycle a metric's value changes (no value)
+#   for: <duration>      -> condition must hold continuously this long, e.g.
+#                           { metric: temperature, operator: ">", value: 85, for: "10m" }
 # ---------------------------------------------------------------------------
 rules:
   # The main one: don't water if it's raining now OR it has already rained

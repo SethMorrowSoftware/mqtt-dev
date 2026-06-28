@@ -85,6 +85,13 @@ def _validate_condition(cond, rule_name):
         raise ValueError(f"rule '{rule_name}': unknown metric '{metric}' "
                          f"(valid: {', '.join(sorted(METRIC_SPECS))})")
     op = cond.get("operator")
+    # `for:` is an optional sustain modifier on any condition (must be a duration).
+    if cond.get("for") is not None and parse_duration(cond["for"], None) is None:
+        raise ValueError(f"rule '{rule_name}': '{metric}' for: {cond['for']!r} must "
+                         "be a duration like '10m', '30s', '2h', or minutes")
+    # `changed` works on any metric and needs no value.
+    if op == "changed":
+        return
     if metric == "active_alert" and op in (None, "any"):
         return  # the "any active alert" form needs no value
     if op not in spec["ops"]:
@@ -609,11 +616,39 @@ NUMERIC_OPS = {
 }
 
 
-def _eval_condition(cond, metrics, rule_name):
-    """One condition: True/False, or None if its metric is unavailable."""
+def _eval_condition(cond, metrics, rule_name, state=None, now=None):
+    """One condition: True/False, or None if its metric is unavailable.
+
+    Two history-dependent constructs need the per-cycle `state`/`now`:
+      - operator `changed` -> True when the metric differs from last cycle;
+      - a `for: <duration>` modifier -> the base condition must hold continuously
+        for that long before it counts as True.
+    """
+    base = _eval_base(cond, metrics, rule_name, state)
+    dur = cond.get("for")
+    if dur is not None and state is not None and now is not None:
+        base = _apply_for(base, _cond_key(rule_name, cond),
+                          parse_duration(dur, 0), state, now)
+    return base
+
+
+def _eval_base(cond, metrics, rule_name, state):
+    """The condition's value before any `for:` sustain gate is applied."""
     metric = cond["metric"]
     op = cond.get("operator")
     value = cond.get("value")
+
+    # `changed`: did this metric's value move since the previous cycle?
+    if op == "changed":
+        if state is None:
+            return None
+        cur = metrics.get(metric)
+        if cur is None:
+            return None
+        prev = state.prev_metrics.get(metric, _UNSET)
+        if prev is _UNSET:
+            return False          # first observation -> nothing to compare to yet
+        return cur != prev
 
     # Special metric: active NWS alerts
     if metric == "active_alert":
@@ -666,7 +701,7 @@ def _eval_condition(cond, metrics, rule_name):
     return fn(current, value)
 
 
-def _eval_node(node, metrics, rule_name, _depth=0):
+def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
     """Recursively evaluate a `when` node with three-valued logic.
 
     Returns True, False, or None (a referenced metric was unavailable -> the
@@ -679,7 +714,8 @@ def _eval_node(node, metrics, rule_name, _depth=0):
         return None
     if isinstance(node, dict) and ("any" in node or "all" in node):
         mode = "any" if "any" in node else "all"
-        results = [_eval_node(c, metrics, rule_name, _depth + 1) for c in node[mode]]
+        results = [_eval_node(c, metrics, rule_name, state, now, _depth + 1)
+                   for c in node[mode]]
         if mode == "any":
             if any(r is True for r in results):
                 return True
@@ -692,15 +728,62 @@ def _eval_node(node, metrics, rule_name, _depth=0):
             return None
         return True
     if isinstance(node, dict) and "not" in node:
-        inner = _eval_node(node["not"], metrics, rule_name, _depth + 1)
+        inner = _eval_node(node["not"], metrics, rule_name, state, now, _depth + 1)
         return None if inner is None else (not inner)
-    return _eval_condition(node, metrics, rule_name)
+    return _eval_condition(node, metrics, rule_name, state, now)
 
 
-def evaluate_rule(rule, metrics):
+def evaluate_rule(rule, metrics, state=None, now=None):
     """Evaluate a rule's `when` (single condition, or a nested any/all/not
-    group). Returns True, False, or None (metric(s) unavailable)."""
-    return _eval_node(rule["when"], metrics, rule["name"])
+    group). Returns True, False, or None (metric(s) unavailable).
+
+    `state`/`now` are needed only by the history-dependent constructs
+    (`changed` operator and `for:` sustain); without them those evaluate to
+    None/unsustained, so plain rules need no engine state."""
+    return _eval_node(rule["when"], metrics, rule["name"], state, now)
+
+
+# Sentinel distinguishing "metric never observed" from "observed value None".
+_UNSET = object()
+
+
+class EngineState:
+    """Per-monitor history that the `changed` operator and `for:` sustain gate
+    need across cycles. Created once and threaded into evaluate_rule each cycle;
+    `observe()` is called at the end of a cycle to remember this cycle's metrics
+    for the next one's `changed` comparison."""
+
+    def __init__(self):
+        self.prev_metrics = {}      # metric name -> value seen last cycle
+        self.cond_since = {}        # condition key -> datetime it first held true
+
+    def observe(self, metrics):
+        self.prev_metrics = dict(metrics)
+
+
+def _cond_key(rule_name, cond):
+    """Stable identity for a leaf condition's `for:` timer, tied to the rule and
+    the condition's content (so an edit re-arms the timer rather than reusing a
+    stale one)."""
+    return "|".join(str(x) for x in (
+        rule_name, cond.get("metric"), cond.get("operator"),
+        cond.get("value"), cond.get("for")))
+
+
+def _apply_for(base, key, dur, state, now):
+    """Gate a condition's `base` result behind a sustain duration: only True
+    once `base` has held True continuously for `dur` seconds. False/None reset
+    the timer (and propagate, preserving the unknown->hold fail-safe)."""
+    if base is None:
+        state.cond_since.pop(key, None)
+        return None
+    if not base:
+        state.cond_since.pop(key, None)
+        return False
+    since = state.cond_since.get(key)
+    if since is None:
+        since = state.cond_since[key] = now
+    return (now - since).total_seconds() >= dur
 
 
 # ---------------------------------------------------------------------------
@@ -810,14 +893,14 @@ def apply_hysteresis(hyst, prev, desired, last_change, now):
     return desired
 
 
-def resolve_desired(rule, metrics, now_local):
+def resolve_desired(rule, metrics, now_local, state=None, now=None):
     """The rule's desired state after the time-window gate: outside the window
     the desired state is OFF; inside it is the evaluated `when` (True/False/
     None, where None means hold)."""
     win = rule.get("window")
     if win and not in_window(win, now_local):
         return False
-    return evaluate_rule(rule, metrics)
+    return evaluate_rule(rule, metrics, state, now)
 
 
 def _parse_iso(s):
@@ -1042,6 +1125,7 @@ def main():
 
     last_state = {}            # rule name -> bool
     last_change = {}           # rule name -> iso timestamp of last published change
+    engine_state = EngineState()   # history for `changed` / `for:` across cycles
     broker_watch = BrokerWatch(cfg["slack"]["broker_unreachable_minutes"])
 
     while not stop["flag"]:
@@ -1086,7 +1170,8 @@ def main():
                 prev = last_state.get(rule["name"])
                 # desired state (window-gated), then smoothed into the committed
                 # `result` via hysteresis. None means "hold last state".
-                desired = resolve_desired(rule, m, now_local) if enabled else None
+                desired = (resolve_desired(rule, m, now_local, engine_state, now_utc)
+                           if enabled else None)
                 if desired is None:
                     result = None
                 else:
@@ -1144,6 +1229,9 @@ def main():
                 # cycle; log it and keep evaluating the rest.
                 LOG.warning("Rule '%s' failed this cycle, skipping: %s",
                             rule.get("name", "?") if isinstance(rule, dict) else rule, e)
+
+            # Remember this cycle's metrics so next cycle's `changed` can compare.
+            engine_state.observe(m)
 
             connected = bool(client is not None and client.is_connected())
             snapshot = build_snapshot(m, rule_rows, lookback, connected)

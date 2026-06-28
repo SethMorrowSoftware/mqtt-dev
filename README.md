@@ -327,6 +327,15 @@ Available metrics:
 `between` takes an inclusive `[low, high]` pair; `in` takes a list of allowed
 values (e.g. `value: [30, 50, 70]`, or `["Sunny", "Clear"]` for text).
 
+Two history-aware constructs are also available on any condition:
+
+- **`operator: changed`** (no `value`) — true on the cycle a metric's value
+  differs from the previous one (e.g. `{ metric: active_alert, operator: changed }`).
+- **`for: <duration>`** — the condition must hold **continuously** for that long
+  before it counts as true, e.g.
+  `{ metric: temperature, operator: ">", value: 85, for: "10m" }`. If the
+  condition drops (or its metric becomes unavailable) the timer resets.
+
 A rule may set `enabled: false` to leave it idle — it is not evaluated and
 publishes nothing, so the broker's last retained value stands. The web UI's
 **form builder** edits flat rules (one condition or one `any`/`all` group);

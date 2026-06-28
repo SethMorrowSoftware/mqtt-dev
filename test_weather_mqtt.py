@@ -270,6 +270,62 @@ def test_validate_window_and_hysteresis():
         assert "duration" in str(e)
 
 
+def test_changed_operator():
+    st = w.EngineState()
+    rule = {"name": "r", "when": {"metric": "temperature", "operator": "changed"}}
+    # first cycle: nothing to compare to yet -> False, then remember 70
+    assert w.evaluate_rule(rule, {"temperature": 70}, st) is False
+    st.observe({"temperature": 70})
+    # same value -> not changed
+    assert w.evaluate_rule(rule, {"temperature": 70}, st) is False
+    st.observe({"temperature": 70})
+    # different value -> changed
+    assert w.evaluate_rule(rule, {"temperature": 72}, st) is True
+    st.observe({"temperature": 72})
+    # metric unavailable -> unknown (fail-safe)
+    assert w.evaluate_rule(rule, {"temperature": None}, st) is None
+    # without engine state the construct can't evaluate -> None
+    assert w.evaluate_rule(rule, {"temperature": 80}) is None
+
+
+def test_for_sustain_modifier():
+    from datetime import datetime, timedelta, timezone
+    st = w.EngineState()
+    t0 = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    rule = {"name": "r", "when": {"metric": "temperature", "operator": ">",
+                                  "value": 85, "for": "10m"}}
+    # condition true but not yet sustained 10 min -> False
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0) is False
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0 + timedelta(minutes=5)) is False
+    # sustained past 10 min -> True
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0 + timedelta(minutes=11)) is True
+    # drops below -> resets the timer (False), and must re-accumulate
+    assert w.evaluate_rule(rule, {"temperature": 80}, st, t0 + timedelta(minutes=12)) is False
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0 + timedelta(minutes=13)) is False
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0 + timedelta(minutes=24)) is True
+    # unknown breaks continuity -> None (fail-safe), and resets timer
+    assert w.evaluate_rule(rule, {"temperature": None}, st, t0 + timedelta(minutes=25)) is None
+    assert w.evaluate_rule(rule, {"temperature": 90}, st, t0 + timedelta(minutes=26)) is False
+
+
+def test_validate_changed_and_for():
+    w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1",
+        "when": {"all": [
+            {"metric": "temperature", "operator": "changed"},
+            {"metric": "humidity", "operator": ">", "value": 80, "for": "15m"},
+        ]}}]))
+    # bad `for` duration is rejected
+    try:
+        w.validate_config(_min_cfg(rules=[{
+            "name": "r", "topic": "t", "on_match": "1",
+            "when": {"metric": "temperature", "operator": ">", "value": 5,
+                     "for": "soon"}}]))
+        raise AssertionError("expected ValueError for bad for: duration")
+    except ValueError as e:
+        assert "must" in str(e) and "duration" in str(e)
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

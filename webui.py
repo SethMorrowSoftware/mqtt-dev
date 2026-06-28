@@ -1233,8 +1233,15 @@ def _rule_is_flat(rule):
     if "any" in when or "all" in when:
         group = when.get("any" if "any" in when else "all")
         return (isinstance(group, list) and bool(group)
-                and all(isinstance(c, dict) and "metric" in c for c in group))
-    return "metric" in when
+                and all(_leaf_is_simple(c) for c in group))
+    return _leaf_is_simple(when)
+
+
+def _leaf_is_simple(c):
+    """A leaf the flat form builder can edit: a plain metric condition with no
+    `for:` sustain and not the value-less `changed` operator."""
+    return (isinstance(c, dict) and "metric" in c
+            and c.get("for") is None and c.get("operator") != "changed")
 
 
 def _to_plain(obj):
