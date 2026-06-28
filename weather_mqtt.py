@@ -184,8 +184,90 @@ def variable_specs(variables):
 
 
 def metric_catalogue(cfg):
-    """The full metric catalogue: built-in metrics plus declared variables."""
-    return {**METRIC_SPECS, **variable_specs(cfg.get("variables", {}))}
+    """The full metric catalogue: built-ins + declared variables + mqtt_in metrics."""
+    return {**METRIC_SPECS,
+            **variable_specs(cfg.get("variables", {})),
+            **mqtt_input_specs(cfg.get("mqtt_inputs", []))}
+
+
+# ---------------------------------------------------------------------------
+# mqtt_in sensors: subscribe to a topic, expose its payload as a metric (Phase 3)
+# ---------------------------------------------------------------------------
+MQTT_IN_PARSE = {"number": "number", "bool": "bool", "string": "text"}
+
+
+def mqtt_input_specs(inputs):
+    """Metric specs for mqtt_in sensors: {metric: {type, ops}} keyed by the
+    configured metric name (used as-is, not prefixed)."""
+    out = {}
+    for it in (inputs or []):
+        metric = str((it or {}).get("metric", "")).strip()
+        if not metric:
+            continue
+        mtype = MQTT_IN_PARSE.get(str(it.get("parse", "number")).strip().lower(), "number")
+        if mtype == "number":
+            ops = NUMBER_OPS + ("changed",)
+        elif mtype == "bool":
+            ops = ("==", "!=", "changed")
+        else:
+            ops = TEXT_OPS + ("changed",)
+        out[metric] = {"type": mtype, "ops": ops}
+    return out
+
+
+def _validate_mqtt_inputs(inputs, taken_names):
+    """Validate/normalize the `mqtt_inputs:` list. `taken_names` are metric names
+    already in use (built-ins + variables) that an input must not shadow."""
+    if not isinstance(inputs, list):
+        raise ValueError("'mqtt_inputs' must be a list")
+    clean, seen = [], set()
+    for it in inputs:
+        if not isinstance(it, dict):
+            raise ValueError("each mqtt_in entry must be a mapping")
+        topic = str(it.get("topic", "")).strip()
+        metric = str(it.get("metric", "")).strip()
+        parse = str(it.get("parse", "number")).strip().lower()
+        if not topic:
+            raise ValueError("mqtt_in entry needs a 'topic'")
+        if not metric or not all(c.isalnum() or c == "_" for c in metric):
+            raise ValueError(f"mqtt_in metric '{metric}' must be alphanumeric/underscore")
+        if metric in taken_names:
+            raise ValueError(f"mqtt_in metric '{metric}' collides with an existing metric")
+        if metric in seen:
+            raise ValueError(f"duplicate mqtt_in metric '{metric}'")
+        if parse not in MQTT_IN_PARSE:
+            raise ValueError(f"mqtt_in '{metric}': parse must be one of "
+                             f"{tuple(MQTT_IN_PARSE)}")
+        seen.add(metric)
+        clean.append({"topic": topic, "metric": metric, "parse": parse})
+    return clean
+
+
+def coerce_payload(payload, parse):
+    """Coerce a raw MQTT payload to the input's type. Returns None when a
+    'number' payload isn't numeric (so the metric holds its last value)."""
+    try:
+        s = payload.decode() if isinstance(payload, (bytes, bytearray)) else str(payload)
+    except Exception:
+        return None
+    s = s.strip()
+    if parse == "number":
+        return _as_number(s, None, "mqtt_in payload")
+    if parse == "bool":
+        return s.lower() in ("true", "1", "yes", "on")
+    return s
+
+
+def handle_mqtt_input(in_store, topic_map, topic, payload):
+    """Route an incoming message to its metric and store the coerced value.
+    Pure (no network) so it's unit-testable. A None coercion is ignored so the
+    last good value persists."""
+    it = topic_map.get(topic)
+    if not it:
+        return
+    val = coerce_payload(payload, it["parse"])
+    if val is not None:
+        in_store[it["metric"]] = val
 
 
 def _validate_variables(variables):
@@ -292,6 +374,12 @@ def validate_config(cfg):
         cfg["variables"] = _validate_variables(cfg["variables"])
     else:
         cfg.setdefault("variables", {})
+    # mqtt_in sensors -> dynamic metrics (the configured metric name).
+    if "mqtt_inputs" in cfg and cfg["mqtt_inputs"] is not None:
+        taken = set(METRIC_SPECS) | set(variable_specs(cfg["variables"]))
+        cfg["mqtt_inputs"] = _validate_mqtt_inputs(cfg["mqtt_inputs"], taken)
+    else:
+        cfg.setdefault("mqtt_inputs", [])
     specs = metric_catalogue(cfg)
 
     if not isinstance(cfg["rules"], list) or not cfg["rules"]:
@@ -1119,7 +1207,7 @@ def audit(path, **event):
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
-def make_mqtt_client(mq):
+def make_mqtt_client(mq, mqtt_inputs=None, in_store=None):
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=mq["client_id"],
@@ -1127,18 +1215,31 @@ def make_mqtt_client(mq):
     if mq.get("username"):
         client.username_pw_set(mq["username"], mq.get("password", ""))
 
+    inputs = list(mqtt_inputs or [])
+    topic_map = {i["topic"]: i for i in inputs}
+
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
             LOG.error("MQTT connect failed: %s", reason_code)
         else:
             LOG.info("Connected to MQTT broker %s:%s", mq["host"], mq["port"])
+            # (Re)subscribe to mqtt_in sensor topics on every (re)connect.
+            for i in inputs:
+                client.subscribe(i["topic"])
+                LOG.info("Subscribed to mqtt_in '%s' -> metric '%s' (%s)",
+                         i["topic"], i["metric"], i["parse"])
 
     def on_disconnect(client, userdata, flags, reason_code, properties):
         LOG.warning("Disconnected from MQTT broker (%s); auto-reconnecting",
                     reason_code)
 
+    def on_message(client, userdata, msg):
+        if in_store is not None:
+            handle_mqtt_input(in_store, topic_map, msg.topic, msg.payload)
+
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
+    client.on_message = on_message
     client.reconnect_delay_set(min_delay=1, max_delay=60)
     return client
 
@@ -1324,9 +1425,13 @@ def main():
         LOG.info("Stopped before location was resolved.")
         return
 
+    # Live values from mqtt_in sensors, written by the network thread's
+    # on_message and read each cycle. Subscriptions are fixed at startup (a
+    # topic change needs a restart, like other connection settings).
+    mqtt_in_store = {}
     client = None
     if not args.dry_run:
-        client = make_mqtt_client(mq)
+        client = make_mqtt_client(mq, cfg.get("mqtt_inputs", []), mqtt_in_store)
         client.connect_async(mq["host"], int(mq["port"]), keepalive=60)
         client.loop_start()
 
@@ -1379,6 +1484,7 @@ def main():
             now_local = now_utc.astimezone()    # system local civil time for windows
             m.update(schedule_metrics(now_local))   # time_* inputs into the context
             m.update(variable_metrics(var_values))  # var_* operator-set inputs
+            m.update(dict(mqtt_in_store))            # latest mqtt_in sensor values
             rule_rows = []
             for rule in rules:
               try:

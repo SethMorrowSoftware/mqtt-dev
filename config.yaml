@@ -41,6 +41,13 @@ always_publish: false
 #   maintenance_mode: { type: bool, default: false }
 #   temp_setpoint:    { type: number, default: 70 }
 
+# --- MQTT sensor inputs (optional) -----------------------------------------
+# Subscribe to other devices' topics on the same broker and expose each payload
+# as a rule metric. parse: number | bool | string. Uncomment to use:
+# mqtt_inputs:
+#   - { topic: "sensors/tank/level", metric: tank_level, parse: number }
+#   - { topic: "sensors/door/open",  metric: door_open,  parse: bool }
+
 # --- Precipitation settings ------------------------------------------------
 precipitation:
   # Rolling window (hours) used to total measured rainfall into the
