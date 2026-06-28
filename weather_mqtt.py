@@ -481,7 +481,14 @@ def coerce_payload(payload, parse):
     if parse == "number":
         return _as_number(s, None, "mqtt_in payload")
     if parse == "bool":
-        return s.lower() in ("true", "1", "yes", "on")
+        low = s.lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+        # Unrecognized payload: hold the last value (handle_mqtt_input skips None)
+        # instead of fabricating a real "off".
+        return None
     return s
 
 
@@ -1455,16 +1462,27 @@ def _apply_for(base, key, dur, state, now):
     return (now - since).total_seconds() >= dur
 
 
-def save_engine_state(path, last_state, last_change, engine_state):
+# How long a restart gap may be before we stop trusting persisted `for:` sustain
+# timers. A quick restart/deploy (seconds) keeps them; a longer outage re-accrues
+# them, since we can't prove the condition held *continuously* across a gap we
+# have no observations for. last_state/last_change are wall-clock and always kept.
+_ENGINE_STATE_SUSTAIN_GAP_S = 600
+
+
+def save_engine_state(path, last_state, last_change, engine_state, now=None):
     """Persist the engine's decision history (atomic, best-effort) so hysteresis
     timers, `for:` sustain and the `changed` baseline survive a restart. Without
     this, every restart resets `last_change` (so `apply_hysteresis` sees
     elapsed=inf and a load can short-cycle) and clears `last_state` (so actions
-    re-fire and directives re-publish spuriously)."""
+    re-fire and directives re-publish spuriously). A `saved_at` stamp lets the
+    loader decide whether the restart gap was short enough to trust sustain
+    timers."""
     if not path:
         return
     try:
+        now = now or datetime.now(timezone.utc)
         data = {
+            "saved_at": now.isoformat(timespec="seconds"),
             "last_state": {k: v for k, v in last_state.items() if v is not None},
             "last_change": dict(last_change),
             "cond_since": {k: dt.isoformat() for k, dt in
@@ -1483,10 +1501,16 @@ def save_engine_state(path, last_state, last_change, engine_state):
         LOG.warning("Could not save engine state %s: %s", path, e)
 
 
-def load_engine_state(path):
+def load_engine_state(path, now=None):
     """Reload persisted decision history written by save_engine_state. Returns
     (last_state, last_change, EngineState). A missing or corrupt file yields a
-    clean cold-start state (never raises)."""
+    clean cold-start state (never raises).
+
+    `last_state`/`last_change` (and the `changed` baseline) are always restored.
+    `for:` sustain timers are restored only when the restart gap was short
+    (<= _ENGINE_STATE_SUSTAIN_GAP_S); after a longer outage they re-accrue from
+    `now`, because a sustain gate asserts the condition held *continuously* and we
+    have no observations across the gap to back that up."""
     es = EngineState()
     last_state, last_change = {}, {}
     if not path:
@@ -1501,11 +1525,20 @@ def load_engine_state(path):
         last_state = {str(k): bool(v) for k, v in data["last_state"].items()}
     if isinstance(data.get("last_change"), dict):
         last_change = {str(k): str(v) for k, v in data["last_change"].items() if v}
-    if isinstance(data.get("cond_since"), dict):
-        for k, v in data["cond_since"].items():
-            dt = _parse_iso(v)
-            if dt is not None:
-                es.cond_since[str(k)] = dt
+    now = now or datetime.now(timezone.utc)
+    saved_at = _parse_iso(data.get("saved_at"))
+    short_gap = (saved_at is not None
+                 and (now - saved_at).total_seconds() <= _ENGINE_STATE_SUSTAIN_GAP_S)
+    cond_since = data.get("cond_since")
+    if isinstance(cond_since, dict) and cond_since:
+        if short_gap:
+            for k, v in cond_since.items():
+                dt = _parse_iso(v)
+                if dt is not None:
+                    es.cond_since[str(k)] = dt
+        else:
+            LOG.info("Engine-state restart gap too large; re-accruing `for:` "
+                     "sustain timers from now")
     if isinstance(data.get("prev_metrics"), dict):
         es.prev_metrics = dict(data["prev_metrics"])
     return last_state, last_change, es
@@ -2691,8 +2724,9 @@ def main():
     if client is not None:
         # Mark ourselves offline on a *clean* shutdown (the LWT only fires on an
         # unexpected drop), and wait for it to flush so the retained state is
-        # accurate before we disconnect.
-        avail = cfg["mqtt"].get("availability_topic", "")
+        # accurate before we disconnect. Use the startup `mq` so this matches the
+        # topic the LWT was armed on (connection settings are startup-fixed).
+        avail = mq.get("availability_topic", "")
         if avail:
             try:
                 info = client.publish(avail, "offline", qos=1, retain=True)

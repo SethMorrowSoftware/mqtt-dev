@@ -2044,6 +2044,50 @@ def test_webui_request_size_cap_configured():
     assert hasattr(webui.core, "_atomic_write")
 
 
+def test_engine_state_resets_sustain_timers_after_long_gap():
+    import tempfile, os, json
+    from datetime import datetime, timezone, timedelta
+    from pathlib import Path
+    esf = tempfile.mktemp(suffix=".json")
+    now = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    key = "rule|is_raining|==|True|10m"
+    base = {"last_state": {"r": True},
+            "last_change": {"r": "2026-06-28T11:00:00+00:00"},
+            "cond_since": {key: "2026-06-28T10:00:00+00:00"}, "prev_metrics": {}}
+    try:
+        # Saved an hour ago: beyond the grace window -> `for:` sustain timers
+        # re-accrue (can't prove continuity across the gap), but last_state /
+        # last_change ARE restored (those are genuine wall-clock).
+        Path(esf).write_text(json.dumps(
+            {**base, "saved_at": (now - timedelta(hours=1)).isoformat()}))
+        ls, lc, es = w.load_engine_state(esf, now=now)
+        assert es.cond_since == {}
+        assert ls == {"r": True} and lc == {"r": "2026-06-28T11:00:00+00:00"}
+        # Saved 30s ago: a quick restart keeps the sustain timers.
+        Path(esf).write_text(json.dumps(
+            {**base, "saved_at": (now - timedelta(seconds=30)).isoformat()}))
+        _, _, es2 = w.load_engine_state(esf, now=now)
+        assert key in es2.cond_since
+        # Legacy file with no saved_at: conservatively don't trust sustain timers.
+        Path(esf).write_text(json.dumps(base))
+        _, _, es3 = w.load_engine_state(esf, now=now)
+        assert es3.cond_since == {}
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(esf + s)
+            except OSError: pass
+
+
+def test_coerce_payload_bool_holds_on_unknown():
+    assert w.coerce_payload(b"on", "bool") is True
+    assert w.coerce_payload(b"off", "bool") is False
+    # An unrecognized payload holds (None) rather than fabricating a real "off".
+    assert w.coerce_payload(b"maybe", "bool") is None
+    store, tmap = {}, {"t": {"topic": "t", "metric": "m", "parse": "bool"}}
+    assert w.handle_mqtt_input(store, tmap, "t", b"maybe") is False
+    assert store == {}
+
+
 class _Resp:
     def __init__(self, status, body=None, retry_after=None, bad_json=False):
         self.status_code = status
