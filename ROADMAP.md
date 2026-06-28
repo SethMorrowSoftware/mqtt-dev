@@ -287,11 +287,18 @@ system "as customizable as possible" without engine changes.
   surfaced on the **Activity** page, so you can see what fired and whether it
   succeeded. (This delivers the ROADMAP's pluggable action registry — webhooks
   are no longer out of scope.)
-- **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
-  persisted overrides move into the store.
+- **Phase 4 — History & trends (delivered):** the monitor records each cycle's
+  numeric metrics to a small **SQLite** file (`history.db`), pruned to
+  `history.retention_days`. A new **History** page charts per‑metric **trend
+  sparklines** over a selectable window (6h…30d) via `/api/history`; toggle it and
+  set retention under *Settings → Metric history*. Recording is best‑effort (never
+  blocks the cycle) and the page degrades gracefully when disabled/empty. Mirrored
+  in the demo.
+  - **Optional remaining:** persisted overrides could move into the same store;
+    event‑log/longer‑term aggregation is a future nicety.
 
 Phases 0–2 already deliver "control anything on/off, fully customizable, with manual
-override"; Phase 3 adds the rich inputs; Phase 4 is the nice‑to‑have.
+override"; Phase 3 adds the rich inputs; Phase 4 adds history/trends.
 
 ---
 

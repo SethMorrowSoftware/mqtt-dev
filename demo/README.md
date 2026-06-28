@@ -19,6 +19,7 @@ demo/
 ├── mqtt.html       MQTT       — live console: simulated topic feed, a Topics view,
 │                                and a publish box (toast only in the demo)
 ├── activity.html   Activity   — read-only audit log of state changes (sample data)
+├── history.html    History    — trend sparklines per numeric metric (sample data)
 ├── system.html     System     — monitor/MQTT health, config summary, and a
 │                                runtime log viewer with level filtering (sample data)
 └── assets/
@@ -32,10 +33,10 @@ It mirrors the current `webui.py`: the rule builder offers the full operator set
 webhooks, Slack notify with `{{metric}}` templating), and discovers schedule,
 variable, input, and **computed** metrics; the Inputs page edits all of those
 sources; the **MQTT** page is a live console (topic feed, per-topic view, and a
-publish box); the dashboard has a Variables card and per-device manual controls;
-the **System** page shows health, a config summary, and a runtime log viewer.
-Everything is mock — clicks update local state and show a toast; nothing is
-published or saved.
+publish box); the **History** page shows trend sparklines per metric; the
+dashboard has a Variables card and per-device manual controls; the **System**
+page shows health, a config summary, and a runtime log viewer. Everything is
+mock — clicks update local state and show a toast; nothing is published or saved.
 
 No build step, no external CDNs, no cookies — just static files.
 

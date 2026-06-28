@@ -208,6 +208,10 @@ Run the offline logic tests (no network needed):
   or manual), operator action, manual MQTT publish, and **extra action that
   fired** (webhook / notify / extra publish, with an ok/failed indicator),
   newest first, in plain language.
+- **History** — **trend sparklines** for every numeric metric, over a selectable
+  window (6h / 24h / 3d / 7d / 30d). The monitor records each cycle's numeric
+  metrics to a small SQLite file (`history.db`) and prunes to the retention
+  window; turn it off or set retention under **Settings → Metric history**.
 - **System** — at-a-glance health (monitor running/stale, MQTT connected,
   config valid, time since last poll), a configuration summary (rule/metric/
   input counts and the files in use), and a **live runtime log viewer** that
@@ -226,6 +230,7 @@ Extra endpoints are available:
   `?since=<seq>` / `?topic=<prefix>` / `?topics=1` for the per-topic summary).
 - `POST /api/mqtt/publish` — publish a message (fail-closed; requires
   `web.allow_mqtt_publish` + a login).
+- `GET /api/history?hours=N` — metric time series for the History page.
 - `GET /healthz` — unauthenticated liveness/freshness probe for systemd or an
   uptime monitor; reports whether the config loads and how fresh the monitor's
   last update is.
@@ -618,7 +623,7 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 | Path | What it is |
 |---|---|
 | `weather_mqtt.py` | The monitor: gathers inputs (weather, schedule, variables, mqtt_in, http_poll), evaluates rules, publishes MQTT, writes `weather_state.json`. |
-| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Inputs / MQTT / Activity / System), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/api/system`, `/api/logs`, `/api/mqtt`, `/api/mqtt/publish`, `/healthz`. |
+| `webui.py` | Flask dashboard + config editor (Dashboard / Settings / Rules / Inputs / MQTT / Activity / History / System), `/api/state`, `/api/control`, `/api/variable`, `/api/audit`, `/api/system`, `/api/logs`, `/api/mqtt`, `/api/mqtt/publish`, `/api/history`, `/healthz`. |
 | `setup_wizard.py` | Interactive first-run config generator (`weather-mqtt-setup`). |
 | `install.sh` | One-command Debian/Ubuntu installer (Mosquitto + venv + services). |
 | `config.yaml` | Example/active configuration (the installer writes a real one from the wizard). |
