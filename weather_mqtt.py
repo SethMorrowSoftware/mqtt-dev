@@ -258,6 +258,13 @@ def validate_config(cfg):
             _validate_window(r["window"], name)
         if r.get("hysteresis") is not None:
             _validate_hysteresis(r["hysteresis"], name)
+        # Config-declared manual state (auto|on|off). The web UI sets runtime
+        # overrides in overrides.json instead; this is just the fallback/default.
+        man = str(r.get("manual", "auto")).strip().lower()
+        if man not in ("auto", "on", "off"):
+            LOG.warning("Rule '%s': manual=%r invalid; using 'auto'", name, r.get("manual"))
+            man = "auto"
+        r["manual"] = man
 
     # --- defaults + clamping for the forgiving numeric knobs ---
     poll = _as_number(cfg.get("poll_interval_minutes", 15), 15, "poll_interval_minutes")
@@ -271,6 +278,9 @@ def validate_config(cfg):
     cfg.setdefault("always_publish", False)
     cfg["always_publish"] = bool(cfg["always_publish"])
     cfg.setdefault("state_file", "weather_state.json")
+    # Where runtime manual overrides + the audit trail live (Phase 2).
+    cfg.setdefault("overrides_file", "overrides.json")
+    cfg.setdefault("audit_file", "audit.log")
 
     precip = cfg.setdefault("precipitation", {})
     lb = _as_number(precip.get("lookback_hours", 24), 24, "precipitation.lookback_hours")
@@ -283,6 +293,15 @@ def validate_config(cfg):
     web["port"] = _clamp_port(_as_number(web.get("port", 8080), 8080, "web.port"))
     web.setdefault("username", "")     # blank = no auth (use only on trusted LAN)
     web.setdefault("password", "")
+    # Manual on/off control of devices from the dashboard. Default off so the UI
+    # stays display-only exactly like today. Fail closed: enabling it requires a
+    # web login (username AND password), else it is forced back off with a warning.
+    amc = bool(web.get("allow_manual_control", False))
+    if amc and not (str(web.get("username") or "") and str(web.get("password") or "")):
+        LOG.warning("web.allow_manual_control requires a web login (username + "
+                    "password); disabling manual control until one is set")
+        amc = False
+    web["allow_manual_control"] = amc
 
     mq = cfg["mqtt"]
     if not isinstance(mq, dict):
@@ -913,6 +932,64 @@ def _parse_iso(s):
 
 
 # ---------------------------------------------------------------------------
+# Manual control: override store + audit log (ROADMAP Phase 2)
+# ---------------------------------------------------------------------------
+# Operators can override a device to forced ON/OFF from the dashboard. The
+# override is persisted (overrides.json) so it survives restarts, and is applied
+# as an overlay on top of the config so config edits don't wipe it. "auto" means
+# "no override" -> let the rules decide; it is stored as the absence of a key.
+MANUAL_STATES = ("auto", "on", "off")
+
+
+def load_overrides(path):
+    """Read the manual-override map {device_name: 'on'|'off'} from disk. Robust:
+    a missing or corrupt file yields {} (no overrides)."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if v in ("on", "off")}
+
+
+def set_override(path, name, state):
+    """Persist one device's override. 'auto' clears it (removes the key).
+    Atomic write. Returns the resulting overrides map. Raises ValueError on a
+    bad state."""
+    if state not in MANUAL_STATES:
+        raise ValueError(f"manual state must be one of {MANUAL_STATES}")
+    overrides = load_overrides(path)
+    if state == "auto":
+        overrides.pop(name, None)
+    else:
+        overrides[name] = state
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(overrides, indent=2))
+    tmp.replace(path)
+    return overrides
+
+
+def effective_manual(rule, overrides):
+    """The manual state in force for a rule: a runtime override wins over the
+    config-declared `manual`, otherwise 'auto'."""
+    name = rule.get("name")
+    if name in overrides:
+        return overrides[name]
+    return rule.get("manual", "auto")
+
+
+def audit(path, **event):
+    """Append one JSON event to the audit log. Best-effort: never raises."""
+    try:
+        event.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        with open(path, "a") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception as e:
+        LOG.warning("Could not write audit log %s: %s", path, e)
+
+
+# ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
 def make_mqtt_client(mq):
@@ -1014,12 +1091,13 @@ def notify_slack(slack, text):
 # ---------------------------------------------------------------------------
 # State snapshot (consumed by the web UI + optional remote status page)
 # ---------------------------------------------------------------------------
-def build_snapshot(metrics, rule_rows, lookback, connected):
+def build_snapshot(metrics, rule_rows, lookback, connected, manual_control=False):
     """The status object the dashboard(s) consume."""
     return {
         "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "lookback_hours": lookback,
         "mqtt_connected": connected,
+        "manual_control": bool(manual_control),
         "metrics": metrics,
         "rules": rule_rows,
     }
@@ -1140,6 +1218,11 @@ def main():
         interval = max(MIN_POLL_MINUTES, cfg["poll_interval_minutes"]) * 60
         rules = cfg["rules"]
         state_file = cfg["state_file"]
+        # Manual overrides are an overlay re-read each cycle (like config), so the
+        # web UI's Auto/On/Off takes effect on the next poll without a restart.
+        overrides = load_overrides(cfg["overrides_file"])
+        audit_file = cfg["audit_file"]
+        allow_manual = cfg["web"].get("allow_manual_control", False)
         # Connection params (host/port/user/client_id) are fixed at startup, but
         # qos/retain/status_topic are publish-time options we can honor live so
         # web-UI edits to them take effect on the next cycle without a restart.
@@ -1168,16 +1251,22 @@ def main():
               try:
                 enabled = rule.get("enabled", True)
                 prev = last_state.get(rule["name"])
-                # desired state (window-gated), then smoothed into the committed
-                # `result` via hysteresis. None means "hold last state".
-                desired = (resolve_desired(rule, m, now_local, engine_state, now_utc)
-                           if enabled else None)
-                if desired is None:
+                manual = effective_manual(rule, overrides)
+                # Resolution order: disabled -> idle; a manual on/off wins and
+                # bypasses window+hysteresis (intent is explicit); otherwise the
+                # window-gated, hysteresis-smoothed rule result. None == hold.
+                if not enabled:
                     result = None
+                elif manual in ("on", "off"):
+                    result = (manual == "on")
                 else:
-                    result = apply_hysteresis(
-                        rule.get("hysteresis"), prev, desired,
-                        _parse_iso(last_change.get(rule["name"])), now_utc)
+                    desired = resolve_desired(rule, m, now_local, engine_state, now_utc)
+                    if desired is None:
+                        result = None
+                    else:
+                        result = apply_hysteresis(
+                            rule.get("hysteresis"), prev, desired,
+                            _parse_iso(last_change.get(rule["name"])), now_utc)
                 if enabled and result is not None:
                     changed = (prev is None) or (prev != result) or cfg["always_publish"]
                     # Assume committed unless a real publish fails below. A failed
@@ -1209,6 +1298,10 @@ def main():
                             if commit and prev != result:
                                 last_change[rule["name"]] = now_utc.isoformat(
                                     timespec="seconds")
+                                audit(audit_file, device=rule["name"],
+                                      state="on" if result else "off",
+                                      source="manual" if manual in ("on", "off")
+                                      else "auto", by="monitor")
                     if commit:
                         last_state[rule["name"]] = result
 
@@ -1217,6 +1310,7 @@ def main():
                     "description": rule.get("description", ""),
                     "topic": rule["topic"],
                     "enabled": enabled,
+                    "manual": manual,
                     "active": last_state.get(rule["name"]),
                     "current_payload": (rule["on_match"]
                                         if last_state.get(rule["name"]) else
@@ -1234,7 +1328,7 @@ def main():
             engine_state.observe(m)
 
             connected = bool(client is not None and client.is_connected())
-            snapshot = build_snapshot(m, rule_rows, lookback, connected)
+            snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual)
             write_state(state_file, snapshot)
             push_status(cfg.get("status_push", {}), snapshot)
 

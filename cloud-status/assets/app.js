@@ -100,6 +100,7 @@ function render(s, ok){
     else if(r.active===null||r.active===undefined) pill='<span class="pill na">n/a</span>';
     else if(r.active) pill='<span class="pill on">active</span>';
     else pill='<span class="pill off">clear</span>';
+    if(r.manual && r.manual!=="auto") pill+=' <span class="pill na">manual '+esc(r.manual)+'</span>';
     const tr=document.createElement("tr");
     tr.innerHTML='<td>'+esc(r.name)+'<div class="muted">'+esc(r.description||"")+'</div></td>'+
       '<td><code>'+esc(r.topic)+'</code></td><td>'+pill+'</td>'+

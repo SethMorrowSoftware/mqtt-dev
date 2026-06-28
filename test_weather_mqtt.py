@@ -326,6 +326,139 @@ def test_validate_changed_and_for():
         assert "must" in str(e) and "duration" in str(e)
 
 
+def test_override_store_roundtrip():
+    import tempfile, os, json
+    p = tempfile.mktemp(suffix=".json")
+    try:
+        assert w.load_overrides(p) == {}            # missing -> empty
+        w.set_override(p, "pump", "on")
+        assert w.load_overrides(p) == {"pump": "on"}
+        w.set_override(p, "fan", "off")
+        assert w.load_overrides(p) == {"pump": "on", "fan": "off"}
+        w.set_override(p, "pump", "auto")           # auto clears the key
+        assert w.load_overrides(p) == {"fan": "off"}
+        # corrupt / bad values are ignored
+        open(p, "w").write("{ not json")
+        assert w.load_overrides(p) == {}
+        json.dump({"x": "on", "y": "bogus"}, open(p, "w"))
+        assert w.load_overrides(p) == {"x": "on"}
+        try:
+            w.set_override(p, "z", "weird")
+            raise AssertionError("expected ValueError for bad state")
+        except ValueError:
+            pass
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
+
+
+def test_effective_manual():
+    rule = {"name": "pump", "manual": "off"}
+    assert w.effective_manual(rule, {}) == "off"                 # config default
+    assert w.effective_manual(rule, {"pump": "on"}) == "on"      # override wins
+    assert w.effective_manual({"name": "x"}, {}) == "auto"       # default
+
+
+def test_audit_appends_jsonl():
+    import tempfile, os, json
+    p = tempfile.mktemp(suffix=".log")
+    try:
+        w.audit(p, device="pump", action="manual_set", state="on", by="admin")
+        w.audit(p, device="pump", state="off", source="auto", by="monitor")
+        lines = [json.loads(l) for l in open(p) if l.strip()]
+        assert len(lines) == 2
+        assert lines[0]["device"] == "pump" and lines[0]["by"] == "admin"
+        assert "ts" in lines[0] and lines[1]["source"] == "auto"
+    finally:
+        try: os.unlink(p)
+        except OSError: pass
+
+
+def test_validate_manual_control_gating_and_manual_field():
+    # allow_manual_control without a login is forced off (fail closed)
+    cfg = w.validate_config(_min_cfg(web={"allow_manual_control": True}))
+    assert cfg["web"]["allow_manual_control"] is False
+    # with a login it stays on
+    cfg2 = w.validate_config(_min_cfg(
+        web={"allow_manual_control": True, "username": "a", "password": "b"}))
+    assert cfg2["web"]["allow_manual_control"] is True
+    # per-rule manual coerces/validates; defaults to auto
+    assert cfg["rules"][0]["manual"] == "auto"
+    cfg3 = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1", "manual": "ON",
+        "when": {"metric": "temperature", "operator": "<", "value": 5}}]))
+    assert cfg3["rules"][0]["manual"] == "on"
+    cfg4 = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1", "manual": "bogus",
+        "when": {"metric": "temperature", "operator": "<", "value": 5}}]))
+    assert cfg4["rules"][0]["manual"] == "auto"
+    # new file defaults exist
+    assert cfg["overrides_file"] == "overrides.json"
+    assert cfg["audit_file"] == "audit.log"
+
+
+def test_webui_manual_control_endpoint():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_manual_control_endpoint ({e})")
+        return
+    import tempfile, os, yaml, json, base64
+
+    def _client(allow, login=True):
+        cfg = {
+            "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+            "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+            "precipitation": {"lookback_hours": 24},
+            "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+            "web": {"enabled": True, "host": "0.0.0.0", "port": 8080,
+                    "username": "admin" if login else "", "password": "pw" if login else "",
+                    "allow_manual_control": allow},
+            "overrides_file": ovr, "audit_file": aud,
+            "rules": [{"name": "pump", "topic": "t", "on_match": "ON", "on_clear": "OFF",
+                       "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+        }
+        open(p, "w").write(yaml.safe_dump(cfg))
+        webui.CONFIG_PATH = p
+        webui.app.config["TESTING"] = True
+        return webui.app.test_client()
+
+    p = tempfile.mktemp(suffix=".yaml")
+    ovr = tempfile.mktemp(suffix=".json")
+    aud = tempfile.mktemp(suffix=".log")
+    hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:pw").decode()}
+    try:
+        # disabled -> 403, nothing written
+        c = _client(allow=False)
+        r = c.post("/api/control", json={"device": "pump", "state": "on"}, headers=hdr)
+        assert r.status_code == 403
+        assert w.load_overrides(ovr) == {}
+
+        # enabled + authed -> 200, persisted + audited
+        c = _client(allow=True)
+        r = c.post("/api/control", json={"device": "pump", "state": "on"}, headers=hdr)
+        assert r.status_code == 200 and r.get_json()["manual"] == "on"
+        assert w.load_overrides(ovr) == {"pump": "on"}
+        events = [json.loads(l) for l in open(aud) if l.strip()]
+        assert events[-1] == {**events[-1], "device": "pump", "action": "manual_set",
+                              "state": "on", "by": "admin"}
+        # auto clears it
+        r = c.post("/api/control", json={"device": "pump", "state": "auto"}, headers=hdr)
+        assert r.status_code == 200 and w.load_overrides(ovr) == {}
+        # unknown device / bad state
+        assert c.post("/api/control", json={"device": "nope", "state": "on"}, headers=hdr).status_code == 404
+        assert c.post("/api/control", json={"device": "pump", "state": "x"}, headers=hdr).status_code == 400
+        # wrong credentials are rejected by auth
+        bad = {"Authorization": "Basic " + base64.b64encode(b"admin:WRONG").decode()}
+        assert c.post("/api/control", json={"device": "pump", "state": "on"}, headers=bad).status_code == 401
+    finally:
+        for f in (p, ovr, aud):
+            for s in ("", ".tmp", ".bak"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}
