@@ -486,6 +486,102 @@ def test_schedule_rules_validate_and_evaluate():
     assert w.evaluate_rule(rule, ctx2) is False          # Saturday -> weekend, not in [mon,fri]
 
 
+def test_variables_validate_catalogue_and_rules():
+    cfg = w.validate_config(_min_cfg(
+        variables={"maintenance_mode": {"type": "bool", "default": True},
+                   "temp_setpoint": {"type": "number", "default": 70}},
+        rules=[{"name": "r", "topic": "t", "on_match": "1",
+                "when": {"any": [
+                    {"metric": "var_maintenance_mode", "operator": "==", "value": True},
+                    {"metric": "var_temp_setpoint", "operator": ">", "value": 65},
+                ]}}]))
+    assert cfg["variables"]["maintenance_mode"] == {"type": "bool", "default": True}
+    cat = w.metric_catalogue(cfg)
+    assert "var_maintenance_mode" in cat and cat["var_temp_setpoint"]["type"] == "number"
+    # a rule referencing an undeclared variable is rejected
+    try:
+        w.validate_config(_min_cfg(rules=[{"name": "r", "topic": "t", "on_match": "1",
+            "when": {"metric": "var_unknown", "operator": "==", "value": True}}]))
+        raise AssertionError("expected ValueError for unknown var metric")
+    except ValueError as e:
+        assert "unknown metric" in str(e)
+    # bad variable type rejected
+    try:
+        w.validate_config(_min_cfg(variables={"x": {"type": "text"}}))
+        raise AssertionError("expected ValueError for bad var type")
+    except ValueError as e:
+        assert "type must be one of" in str(e)
+
+
+def test_variable_store_and_metrics():
+    import tempfile, os
+    declared = {"maintenance_mode": {"type": "bool", "default": False},
+                "temp_setpoint": {"type": "number", "default": 70}}
+    p = tempfile.mktemp(suffix=".json")
+    try:
+        # defaults when nothing stored
+        assert w.load_variables(p, declared) == {"maintenance_mode": False, "temp_setpoint": 70}
+        w.set_variable(p, "maintenance_mode", "true", declared)
+        w.set_variable(p, "temp_setpoint", "68.5", declared)
+        vals = w.load_variables(p, declared)
+        assert vals == {"maintenance_mode": True, "temp_setpoint": 68.5}
+        assert w.variable_metrics(vals) == {"var_maintenance_mode": True, "var_temp_setpoint": 68.5}
+        try:
+            w.set_variable(p, "nope", 1, declared)
+            raise AssertionError("expected ValueError for undeclared variable")
+        except ValueError:
+            pass
+    finally:
+        for s in ("", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
+
+
+def test_webui_variable_endpoint_and_builder_metrics():
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_variable_endpoint_and_builder_metrics ({e})")
+        return
+    import tempfile, os, yaml, base64
+
+    p = tempfile.mktemp(suffix=".yaml")
+    varf = tempfile.mktemp(suffix=".json")
+    aud = tempfile.mktemp(suffix=".log")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+        "precipitation": {"lookback_hours": 24},
+        "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+        "web": {"enabled": True, "host": "0.0.0.0", "port": 8080,
+                "username": "admin", "password": "pw", "allow_manual_control": True},
+        "variables": {"maintenance_mode": {"type": "bool", "default": False}},
+        "variables_file": varf, "audit_file": aud,
+        "rules": [{"name": "hold", "topic": "t", "on_match": "1",
+                   "when": {"metric": "var_maintenance_mode", "operator": "==", "value": True}}],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:pw").decode()}
+    try:
+        # builder discovers the variable metric
+        bm = webui.builder_metrics(yaml.safe_load(open(p)))
+        assert "var_maintenance_mode" in bm and bm["var_maintenance_mode"]["type"] == "bool"
+        # set the variable via the endpoint
+        r = c.post("/api/variable", json={"name": "maintenance_mode", "value": "true"}, headers=hdr)
+        assert r.status_code == 200 and r.get_json()["value"] is True
+        assert w.load_variables(varf, {"maintenance_mode": {"type": "bool", "default": False}}) == {"maintenance_mode": True}
+        # unknown variable -> 404
+        assert c.post("/api/variable", json={"name": "nope", "value": "1"}, headers=hdr).status_code == 404
+    finally:
+        for f in (p, varf, aud):
+            for s in ("", ".tmp", ".bak"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
 def test_single_condition_rule():
     rule = {"name": "freeze", "when": {"metric": "temperature",
                                        "operator": "<=", "value": 35}}

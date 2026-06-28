@@ -32,6 +32,15 @@ poll_interval_minutes: 15
 # Set true if your broker may restart and you depend on retained values.
 always_publish: false
 
+# --- Operator variables (optional) -----------------------------------------
+# Virtual flags/setpoints you can toggle from the dashboard (when manual control
+# is enabled). Each becomes a metric named var_<name> that rules can reference,
+# e.g. var_maintenance_mode. Types: bool or number. Runtime values persist in
+# variables.json. Uncomment to use:
+# variables:
+#   maintenance_mode: { type: bool, default: false }
+#   temp_setpoint:    { type: number, default: 70 }
+
 # --- Precipitation settings ------------------------------------------------
 precipitation:
   # Rolling window (hours) used to total measured rainfall into the

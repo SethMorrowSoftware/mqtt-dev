@@ -231,13 +231,14 @@ system "as customizable as possible" without engine changes.
     controls).
 - **Phase 3 — Inputs:** `schedule`, `manual` variables, `mqtt_in` sensors, `http_poll`;
   dynamic metric discovery in the builder; optional event‑driven re‑eval on MQTT input.
-  - **Delivered:** **schedule/clock metrics** — `time_hour`, `time_minute`,
-    `time_weekday`, `time_is_weekend`, computed locally each cycle and merged into the
-    metric context (no external calls). They flow through the engine + builder
-    automatically; also generalized text‑operator handling to any text metric.
-  - **Still to come (own PRs):** operator‑set `manual` variables (UI‑toggled flags),
-    `mqtt_in` sensors (subscribe → metric, with event‑driven re‑eval), `http_poll`
-    (GET JSON → metric via JSONPath), and `time_is_daytime` (sunrise/sunset).
+  - **Delivered:** **schedule/clock metrics** (`time_hour`, `time_minute`,
+    `time_weekday`, `time_is_weekend`); **operator‑set `variables`** (bool/number
+    flags declared in config, toggled from the dashboard, persisted to
+    `variables.json`, audited) surfaced as `var_<name>` metrics; and **dynamic metric
+    discovery** — the builder dropdowns now include declared variables live.
+  - **Still to come (own PRs):** `mqtt_in` sensors (subscribe → metric, with
+    event‑driven re‑eval), `http_poll` (GET JSON → metric via JSONPath), and
+    `time_is_daytime` (sunrise/sunset).
 - **Phase 4 — History (optional, low priority):** SQLite event log + simple trends;
   persisted overrides move into the store.
 

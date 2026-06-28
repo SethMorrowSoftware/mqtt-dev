@@ -80,15 +80,16 @@ METRIC_SPECS = {
 MAX_WHEN_DEPTH = 25   # guard against pathological deeply-nested configs
 
 
-def _validate_condition(cond, rule_name):
-    """Validate one rule condition's metric/operator/value. Raises ValueError."""
+def _validate_condition(cond, rule_name, specs=METRIC_SPECS):
+    """Validate one rule condition's metric/operator/value. Raises ValueError.
+    `specs` is the active metric catalogue (built-ins plus declared variables)."""
     if not isinstance(cond, dict) or "metric" not in cond:
         raise ValueError(f"rule '{rule_name}': each condition needs a 'metric'")
     metric = cond["metric"]
-    spec = METRIC_SPECS.get(metric)
+    spec = specs.get(metric)
     if spec is None:
         raise ValueError(f"rule '{rule_name}': unknown metric '{metric}' "
-                         f"(valid: {', '.join(sorted(METRIC_SPECS))})")
+                         f"(valid: {', '.join(sorted(specs))})")
     op = cond.get("operator")
     # `for:` is an optional sustain modifier on any condition (must be a duration).
     if cond.get("for") is not None and parse_duration(cond["for"], None) is None:
@@ -136,7 +137,7 @@ def _validate_in_value(value, vtype, metric, rule_name):
                                  "all numbers")
 
 
-def _validate_rule_when(when, rule_name, _depth=0):
+def _validate_rule_when(when, rule_name, specs=METRIC_SPECS, _depth=0):
     """Validate a rule's `when`: a single condition, or a nested group built from
     `any` (OR), `all` (AND), and `not` (negation), to arbitrary depth."""
     if _depth > MAX_WHEN_DEPTH:
@@ -151,13 +152,62 @@ def _validate_rule_when(when, rule_name, _depth=0):
         if not isinstance(group, list) or not group:
             raise ValueError(f"rule '{rule_name}': '{mode}' must be a non-empty list")
         for c in group:
-            _validate_rule_when(c, rule_name, _depth + 1)
+            _validate_rule_when(c, rule_name, specs, _depth + 1)
     elif isinstance(when, dict) and "not" in when:
         if len(when) != 1:
             raise ValueError(f"rule '{rule_name}': 'not' must be the only key in its group")
-        _validate_rule_when(when["not"], rule_name, _depth + 1)
+        _validate_rule_when(when["not"], rule_name, specs, _depth + 1)
     else:
-        _validate_condition(when, rule_name)
+        _validate_condition(when, rule_name, specs)
+
+
+# ---------------------------------------------------------------------------
+# Manual variables (operator-set inputs) -> dynamic metrics (ROADMAP Phase 3)
+# ---------------------------------------------------------------------------
+# A `variables:` section declares operator-set flags/setpoints. Each becomes a
+# metric named `var_<name>` that rules can reference, toggled from the dashboard.
+VAR_PREFIX = "var_"
+VARIABLE_TYPES = ("bool", "number")
+
+
+def variable_specs(variables):
+    """Build metric specs for declared variables: {var_<name>: {type, ops}}."""
+    out = {}
+    for name, spec in (variables or {}).items():
+        vtype = (spec or {}).get("type", "bool")
+        if vtype == "number":
+            ops = NUMBER_OPS + ("changed",)
+        else:
+            ops = ("==", "!=", "changed")
+        out[VAR_PREFIX + str(name)] = {"type": vtype, "ops": ops}
+    return out
+
+
+def metric_catalogue(cfg):
+    """The full metric catalogue: built-in metrics plus declared variables."""
+    return {**METRIC_SPECS, **variable_specs(cfg.get("variables", {}))}
+
+
+def _validate_variables(variables):
+    """Validate + normalize the `variables:` section. Returns the cleaned dict."""
+    if not isinstance(variables, dict):
+        raise ValueError("'variables' must be a mapping of name -> {type, default}")
+    clean = {}
+    for name, spec in variables.items():
+        nm = str(name).strip()
+        if not nm or not all(c.isalnum() or c == "_" for c in nm):
+            raise ValueError(f"variable name '{name}' must be alphanumeric/underscore")
+        spec = dict(spec or {})
+        vtype = str(spec.get("type", "bool")).strip().lower()
+        if vtype not in VARIABLE_TYPES:
+            raise ValueError(f"variable '{nm}': type must be one of {VARIABLE_TYPES}")
+        if vtype == "number":
+            default = _as_number(spec.get("default", 0), 0, f"variable '{nm}' default")
+        else:
+            d = spec.get("default", False)
+            default = d if isinstance(d, bool) else str(d).strip().lower() in ("true", "1", "yes", "on")
+        clean[nm] = {"type": vtype, "default": default}
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +286,14 @@ def validate_config(cfg):
     if not cfg.get("user_agent") or not str(cfg["user_agent"]).strip():
         raise ValueError("user_agent must be set (NWS requires a real contact)")
 
+    # Operator-set variables -> dynamic metrics (var_<name>), validated first so
+    # rules may reference them.
+    if "variables" in cfg and cfg["variables"] is not None:
+        cfg["variables"] = _validate_variables(cfg["variables"])
+    else:
+        cfg.setdefault("variables", {})
+    specs = metric_catalogue(cfg)
+
     if not isinstance(cfg["rules"], list) or not cfg["rules"]:
         raise ValueError("'rules' must be a non-empty list")
     seen_names = set()
@@ -251,7 +309,7 @@ def validate_config(cfg):
         seen_names.add(name)
         # Validate the condition(s) so one malformed rule is caught here rather
         # than blowing up mid-cycle in the monitor.
-        _validate_rule_when(r["when"], name)
+        _validate_rule_when(r["when"], name, specs)
         # Per-rule on/off switch (default on). A disabled rule is left idle:
         # it's evaluated against nothing and publishes no actions this cycle.
         en = r.get("enabled", True)
@@ -286,6 +344,7 @@ def validate_config(cfg):
     # Where runtime manual overrides + the audit trail live (Phase 2).
     cfg.setdefault("overrides_file", "overrides.json")
     cfg.setdefault("audit_file", "audit.log")
+    cfg.setdefault("variables_file", "variables.json")   # operator-set variables (Phase 3)
 
     precip = cfg.setdefault("precipitation", {})
     lb = _as_number(precip.get("lookback_hours", 24), 24, "precipitation.lookback_hours")
@@ -998,6 +1057,55 @@ def effective_manual(rule, overrides):
     return rule.get("manual", "auto")
 
 
+def _coerce_var(value, vtype, default):
+    """Coerce a stored/incoming variable value to its declared type."""
+    if vtype == "number":
+        return _as_number(value, default, "variable")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def load_variables(path, declared):
+    """Effective variable values: declared defaults overlaid with any persisted
+    operator settings (type-coerced). Only declared names are returned."""
+    try:
+        stored = json.loads(Path(path).read_text())
+        if not isinstance(stored, dict):
+            stored = {}
+    except Exception:
+        stored = {}
+    out = {}
+    for name, spec in (declared or {}).items():
+        vtype, default = spec.get("type", "bool"), spec.get("default")
+        out[name] = _coerce_var(stored[name], vtype, default) if name in stored else default
+    return out
+
+
+def set_variable(path, name, value, declared):
+    """Persist one operator-set variable (must be declared). Atomic write."""
+    if name not in (declared or {}):
+        raise ValueError(f"unknown variable '{name}'")
+    spec = declared[name]
+    coerced = _coerce_var(value, spec.get("type", "bool"), spec.get("default"))
+    try:
+        stored = json.loads(Path(path).read_text())
+        if not isinstance(stored, dict):
+            stored = {}
+    except Exception:
+        stored = {}
+    stored[name] = coerced
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(stored, indent=2))
+    tmp.replace(path)
+    return coerced
+
+
+def variable_metrics(values):
+    """Map effective variable values to their metric names (var_<name>)."""
+    return {VAR_PREFIX + str(k): v for k, v in (values or {}).items()}
+
+
 def audit(path, **event):
     """Append one JSON event to the audit log. Best-effort: never raises."""
     try:
@@ -1110,7 +1218,8 @@ def notify_slack(slack, text):
 # ---------------------------------------------------------------------------
 # State snapshot (consumed by the web UI + optional remote status page)
 # ---------------------------------------------------------------------------
-def build_snapshot(metrics, rule_rows, lookback, connected, manual_control=False):
+def build_snapshot(metrics, rule_rows, lookback, connected, manual_control=False,
+                   variables=None):
     """The status object the dashboard(s) consume."""
     return {
         "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1119,6 +1228,7 @@ def build_snapshot(metrics, rule_rows, lookback, connected, manual_control=False
         "manual_control": bool(manual_control),
         "metrics": metrics,
         "rules": rule_rows,
+        "variables": variables or [],
     }
 
 
@@ -1242,6 +1352,8 @@ def main():
         overrides = load_overrides(cfg["overrides_file"])
         audit_file = cfg["audit_file"]
         allow_manual = cfg["web"].get("allow_manual_control", False)
+        declared_vars = cfg.get("variables", {})
+        var_values = load_variables(cfg["variables_file"], declared_vars)
         # Connection params (host/port/user/client_id) are fixed at startup, but
         # qos/retain/status_topic are publish-time options we can honor live so
         # web-UI edits to them take effect on the next cycle without a restart.
@@ -1266,6 +1378,7 @@ def main():
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone()    # system local civil time for windows
             m.update(schedule_metrics(now_local))   # time_* inputs into the context
+            m.update(variable_metrics(var_values))  # var_* operator-set inputs
             rule_rows = []
             for rule in rules:
               try:
@@ -1348,7 +1461,10 @@ def main():
             engine_state.observe(m)
 
             connected = bool(client is not None and client.is_connected())
-            snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual)
+            var_rows = [{"name": n, "type": declared_vars[n].get("type", "bool"),
+                         "value": var_values.get(n)} for n in declared_vars]
+            snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual,
+                                      var_rows)
             write_state(state_file, snapshot)
             push_status(cfg.get("status_push", {}), snapshot)
 

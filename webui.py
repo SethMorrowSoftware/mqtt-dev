@@ -335,6 +335,11 @@ DASH = """
     <p class="muted" style="margin-top:14px" id="forecast">—</p>
   </div>
 
+  <div class="card" id="vars-card" style="display:none">
+    <div class="eyebrow" style="margin-bottom:10px">Variables</div>
+    <div class="grid" id="vars-body"></div>
+  </div>
+
   <div class="card">
     <div class="eyebrow" style="margin-bottom:10px">Rules</div>
     <div class="table-wrap">
@@ -435,9 +440,49 @@ function render(s){
     tb.appendChild(tr);
   }
   if(!rules.length) tb.innerHTML = '<tr><td colspan="5" class="muted">No rules.</td></tr>';
+  renderVars(s.variables || [], manualControl);
   document.getElementById("dash").classList.remove("loading");
 }
 function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function renderVars(vars, manualControl){
+  const card = document.getElementById("vars-card");
+  const box = document.getElementById("vars-body");
+  if(!card || !box) return;
+  if(!vars.length){ card.style.display = "none"; return; }
+  card.style.display = "";
+  box.innerHTML = "";
+  for(const v of vars){
+    let ctrl;
+    if(!manualControl){
+      ctrl = '<span class="v">'+esc(fmt(v.value))+'</span>';
+    } else if(v.type === "bool"){
+      const on = v.value === true;
+      ctrl = '<button type="button" class="mini '+(on?"":"secondary")+'" data-var="'+esc(v.name)+
+        '" data-next="'+(on?"false":"true")+'" style="margin:0">'+(on?"ON":"OFF")+'</button>';
+    } else {
+      ctrl = '<input class="var-num" data-var="'+esc(v.name)+'" type="number" step="any" value="'+
+        (v.value!=null?esc(v.value):"")+'" style="width:120px;margin:0">';
+    }
+    const cell = document.createElement("div"); cell.className = "metric";
+    cell.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:10px";
+    cell.innerHTML = '<div class="k">'+esc(v.name)+'</div><div>'+ctrl+'</div>';
+    box.appendChild(cell);
+  }
+}
+function setVar(name, value){
+  fetch("api/variable", {method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name, value})})
+    .then(async r=>{ if(!r.ok){ const j=await r.json().catch(()=>({})); alert(j.error||("variable failed ("+r.status+")")); } tick(); })
+    .catch(()=>{ alert("variable request failed"); });
+}
+document.getElementById("vars-body").addEventListener("click", e=>{
+  const b = e.target.closest("button[data-var]"); if(!b) return;
+  b.disabled = true; setVar(b.getAttribute("data-var"), b.getAttribute("data-next"));
+});
+document.getElementById("vars-body").addEventListener("change", e=>{
+  const i = e.target.closest("input.var-num[data-var]"); if(!i) return;
+  setVar(i.getAttribute("data-var"), i.value);
+});
 function ctlButtons(r){
   const cur = r.manual || "auto";
   const mk = (st,lbl)=> '<button type="button" class="mini '+(cur===st?"":"secondary")+
@@ -539,6 +584,42 @@ def api_control():
                action="manual_set", state=state,
                by=(auth.username if auth and auth.username else user or "local"))
     return jsonify({"ok": True, "device": device, "manual": state})
+
+
+@app.route("/api/variable", methods=["POST"])
+@require_auth
+def api_variable():
+    """Set an operator variable's value. Same fail-closed gating as /api/control:
+    manual control must be enabled and a web login configured. Persists to
+    variables.json and audits with the authenticated user."""
+    try:
+        cfg = load_raw()
+    except Exception as e:
+        return jsonify({"error": f"config unreadable: {e}"}), 500
+    web = cfg.get("web", {}) or {}
+    user = str(web.get("username") or "")
+    pw = str(web.get("password") or "")
+    if not (bool(web.get("allow_manual_control", False)) and user and pw):
+        return jsonify({"error": "manual control is disabled "
+                        "(enable it and set a web login in Settings)"}), 403
+    try:
+        declared = core._validate_variables(cfg.get("variables") or {})
+    except Exception:
+        declared = {}
+    data = request.get_json(silent=True) or request.form
+    name = str(data.get("name", "")).strip()
+    if name not in declared:
+        return jsonify({"error": f"unknown variable '{name}'"}), 404
+    try:
+        coerced = core.set_variable(cfg.get("variables_file", "variables.json"),
+                                    name, data.get("value"), declared)
+    except Exception as e:
+        return jsonify({"error": f"could not save variable: {e}"}), 500
+    auth = request.authorization
+    core.audit(cfg.get("audit_file", "audit.log"), variable=name,
+               action="variable_set", value=coerced,
+               by=(auth.username if auth and auth.username else user or "local"))
+    return jsonify({"ok": True, "variable": name, "value": coerced})
 
 
 @app.route("/healthz")
@@ -875,13 +956,22 @@ RULE_METRICS = {
 }
 
 
-def _coerce_cond_value(metric, operator, raw):
+def builder_metrics(cfg):
+    """The builder's metric catalogue for this config: built-ins plus the
+    config-declared variables (var_<name>), so dropdowns discover them live."""
+    out = dict(RULE_METRICS)
+    for name, spec in core.variable_specs(cfg.get("variables", {})).items():
+        out[name] = {"type": spec["type"], "ops": list(spec["ops"])}
+    return out
+
+
+def _coerce_cond_value(metric, operator, raw, metrics=RULE_METRICS):
     """Validate a metric/operator pair and coerce the value to the right type.
 
     Returns the typed value, or None when the operator needs no value
     (active_alert + any). Raises ValueError with a human message on anything
     the builder shouldn't have allowed through."""
-    meta = RULE_METRICS.get(metric)
+    meta = metrics.get(metric)
     if meta is None:
         raise ValueError(f"unknown metric '{metric}'")
     if operator not in meta["ops"]:
@@ -921,7 +1011,7 @@ def _coerce_cond_value(metric, operator, raw):
     return s
 
 
-def _rules_from_structured(items):
+def _rules_from_structured(items, metrics=RULE_METRICS):
     """Build a validated rules list from the builder's JSON payload."""
     if not isinstance(items, list) or not items:
         raise ValueError("add at least one rule")
@@ -949,7 +1039,7 @@ def _rules_from_structured(items):
                 continue
             operator = str(c.get("operator", "")).strip()
             try:
-                val = _coerce_cond_value(metric, operator, c.get("value"))
+                val = _coerce_cond_value(metric, operator, c.get("value"), metrics)
             except ValueError as e:
                 raise ValueError(f"rule '{name}': {e}")
             cond = {"metric": metric, "operator": _qstr(operator)}
@@ -1329,7 +1419,7 @@ def rules():
         try:
             if mode == "form":
                 items = json.loads(request.form.get("rules_json", "[]"))
-                cfg["rules"] = _rules_from_structured(items)
+                cfg["rules"] = _rules_from_structured(items, builder_metrics(cfg))
             else:
                 # Parse with ruamel (YAML 1.2): unlike PyYAML's 1.1 loader it does
                 # NOT turn unquoted ON/OFF/YES/NO into booleans, so payloads survive.
@@ -1369,7 +1459,7 @@ def rules():
         active_tab = "yaml"
     body = render_template_string(
         RULES, rules_yaml=rules_yaml, structured=structured,
-        metrics=RULE_METRICS, active_tab=active_tab)
+        metrics=builder_metrics(cfg), active_tab=active_tab)
     return page(body, page="rules", msg=msg, msgclass=msgclass,
                 title="Rules · Precipitation → MQTT")
 
