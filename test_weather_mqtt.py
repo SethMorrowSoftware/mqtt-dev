@@ -52,13 +52,26 @@ def test_accumulation_ignores_outside_window_and_meters():
     assert w._accumulate_precip(data, 24, now) == 0.25
 
 
-def test_accumulation_none_when_no_data():
+def test_accumulation_dry_vs_no_data():
     now = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
-    data = {"features": [
+    # Station IS reporting in-window, but precipitationLastHour is null -- that's
+    # how most ASOS stations report a dry hour, so it means 0.0 (dry), not
+    # unknown. This lets a rain-inhibit rule resolve to ALLOW instead of UNKNOWN.
+    reporting_dry = {"features": [
         {"properties": {"timestamp": "2026-06-27T11:53:00+00:00",
                         "precipitationLastHour": {"value": None}}},
+        {"properties": {"timestamp": "2026-06-27T10:53:00+00:00",
+                        "precipitationLastHour": {"value": None}}},
     ]}
-    assert w._accumulate_precip(data, 24, now) is None
+    assert w._accumulate_precip(reporting_dry, 24, now) == 0.0
+    # No observations at all in the window -> genuinely unavailable -> None.
+    assert w._accumulate_precip({"features": []}, 24, now) is None
+    # Observations exist but all are older than the lookback window -> None too.
+    stale = {"features": [
+        {"properties": {"timestamp": "2026-06-20T11:53:00+00:00",
+                        "precipitationLastHour": {"value": 5.0}}},
+    ]}
+    assert w._accumulate_precip(stale, 24, now) is None
 
 
 def test_detect_raining():

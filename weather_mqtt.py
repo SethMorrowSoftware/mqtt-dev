@@ -1140,9 +1140,11 @@ def fetch_precip_accum_in(station_id, user_agent, hours, now=None):
     """Measured precip over the last `hours`, in inches.
 
     Sums each hour's `precipitationLastHour`, de-duplicated into hourly
-    buckets so more-frequent observations don't double-count. Returns None
-    when the station reports no precipitation data at all (so a rule can
-    leave its state unchanged rather than wrongly read "dry").
+    buckets so more-frequent observations don't double-count. A station that
+    IS reporting observations but with null `precipitationLastHour` (how most
+    ASOS stations report a dry hour) reads as 0.0; only a total absence of
+    observations returns None (so a rule holds its last state during a true
+    data gap rather than wrongly reading "dry").
     """
     now = now or datetime.now(timezone.utc)
     start = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1155,6 +1157,7 @@ def _accumulate_precip(data, hours, now):
     """Pure helper (no network) so it can be unit-tested with a fixture."""
     cutoff = now - timedelta(hours=hours)
     buckets = {}  # "YYYY-MM-DDTHH" -> max mm reported in that hour
+    saw_obs = False  # did the station report ANY observation in the window?
     for feat in data.get("features", []):
         p = feat.get("properties", {})
         ts = p.get("timestamp")
@@ -1166,19 +1169,26 @@ def _accumulate_precip(data, hours, now):
             continue
         if when < cutoff:
             continue
+        saw_obs = True
         plh = p.get("precipitationLastHour") or {}
         mm = to_mm(plh.get("value"), plh.get("unitCode"))
         if mm is None:
-            continue
+            continue  # this hour reported a null precip value -> no rain that hour
         # Bucket by the parsed UTC hour, not the raw string, so the same instant
         # written with different timezone offsets can't land in two buckets and
         # double-count.
         key = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
         buckets[key] = max(buckets.get(key, 0.0), mm)
 
-    if not buckets:
-        return None  # station did not report any precip values this window
-    return mm_to_in(sum(buckets.values()))
+    if buckets:
+        return mm_to_in(sum(buckets.values()))
+    # No precip *values* this window. Distinguish two very different cases:
+    #   - the station WAS reporting observations, all with a null
+    #     precipitationLastHour -> that is how most ASOS stations report "no
+    #     measurable rain", so it means 0.0 (dry) and the rule can resolve.
+    #   - we saw NO observations at all (station down / gap) -> data is genuinely
+    #     unavailable, so return None and let the rule hold its last state.
+    return 0.0 if saw_obs else None
 
 
 def fetch_conditions(loc, user_agent, lookback_hours):
