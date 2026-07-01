@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 import weather_mqtt as w
 
 
+class _Skip(Exception):
+    """Raised by a test to mark itself skipped (e.g. an optional dependency
+    like Flask is missing). The runner counts these separately from passes so
+    the summary never claims coverage that didn't run."""
+
+
 def _obs(ts, value_mm, unit="wmoUnit:mm"):
     return {"properties": {"timestamp": ts,
                            "precipitationLastHour": {"value": value_mm,
@@ -415,8 +421,7 @@ def test_webui_manual_control_endpoint():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_manual_control_endpoint ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, yaml, json, base64
 
     def _client(allow, login=True):
@@ -554,8 +559,7 @@ def test_webui_variable_endpoint_and_builder_metrics():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_variable_endpoint_and_builder_metrics ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, yaml, base64
 
     p = tempfile.mktemp(suffix=".yaml")
@@ -625,8 +629,7 @@ def test_event_driven_wake_hook():
             mq, [{"topic": "s/tank", "metric": "tank_level", "parse": "number"}],
             {}, on_input=lambda: woke.append(1))
     except Exception as e:
-        print(f"  SKIP  test_event_driven_wake_hook ({e})")
-        return
+        raise _Skip(e)
 
     class _Msg:
         def __init__(self, t, p): self.topic, self.payload, self.qos, self.retain = t, p, 0, False
@@ -840,8 +843,7 @@ def test_webui_inputs_editor():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_inputs_editor ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, yaml, json
     p = tempfile.mktemp(suffix=".yaml")
     cfg = {
@@ -1056,8 +1058,7 @@ def test_webui_rule_actions_roundtrip():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_rule_actions_roundtrip ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, json, yaml
     p = tempfile.mktemp(suffix=".yaml")
     cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
@@ -1121,8 +1122,7 @@ def test_mqtt_console_buffer_and_publish():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_mqtt_console_buffer_and_publish ({e})")
-        return
+        raise _Skip(e)
     con = webui.MqttConsole(buffer_size=3)
     con.record("sensors/a", b"1", qos=0, retain=True)
     con.record("sensors/b", b"hello", qos=1, retain=False)
@@ -1158,8 +1158,7 @@ def test_webui_mqtt_console_api_and_publish_gating():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_mqtt_console_api_and_publish_gating ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, json, base64, yaml
     p = tempfile.mktemp(suffix=".yaml")
     aud = tempfile.mktemp(suffix=".log")
@@ -1235,8 +1234,7 @@ def test_webui_activity_page_and_audit_api():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_activity_page_and_audit_api ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, yaml
     p = tempfile.mktemp(suffix=".yaml")
     aud = tempfile.mktemp(suffix=".log")
@@ -1334,8 +1332,7 @@ def test_webui_history_page_and_api():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_history_page_and_api ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, yaml
     from datetime import datetime, timezone, timedelta
     p = tempfile.mktemp(suffix=".yaml")
@@ -1377,8 +1374,7 @@ def test_webui_system_page_and_apis():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_system_page_and_apis ({e})")
-        return
+        raise _Skip(e)
     import tempfile, os, json, yaml
     from datetime import datetime, timezone
     p = tempfile.mktemp(suffix=".yaml")
@@ -1578,8 +1574,7 @@ def test_setup_wizard_renders_valid_config():
     try:
         import setup_wizard
     except Exception as e:
-        print(f"  SKIP  test_setup_wizard_renders_valid_config ({e})")
-        return
+        raise _Skip(e)
     import yaml
     answers = {
         "lat": 41.25, "lon": -74.27, "user_agent": "weather-mqtt-controller (a@b.com)",
@@ -1595,6 +1590,13 @@ def test_setup_wizard_renders_valid_config():
     # and with no web auth
     answers2 = dict(answers, web_user="", web_pass="")
     w.validate_config(yaml.safe_load(setup_wizard._render(answers2)))
+    # answers containing quotes/backslashes must not break the YAML
+    answers3 = dict(answers, web_pass='p"w\\d',
+                    user_agent='weather ("quoted" contact)')
+    parsed3 = yaml.safe_load(setup_wizard._render(answers3))
+    w.validate_config(parsed3)
+    assert parsed3["web"]["password"] == 'p"w\\d'
+    assert parsed3["user_agent"] == 'weather ("quoted" contact)'
 
 
 def test_detect_raining_ignores_vicinity_and_fog():
@@ -1744,8 +1746,7 @@ def test_webui_settings_roundtrip_and_validation():
     try:
         import webui
     except Exception as e:  # Flask / ruamel not installed -> skip, don't fail
-        print(f"  SKIP  test_webui_settings_roundtrip_and_validation ({e})")
-        return
+        raise _Skip(e)
 
     import tempfile, os, yaml
     base = {
@@ -1809,8 +1810,7 @@ def test_webui_structured_rule_builder():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_structured_rule_builder ({e})")
-        return
+        raise _Skip(e)
     import yaml, copy
 
     items = [
@@ -1870,8 +1870,7 @@ def test_webui_builder_advanced_constructs():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_builder_advanced_constructs ({e})")
-        return
+        raise _Skip(e)
     import yaml, copy
 
     items = [
@@ -2049,8 +2048,7 @@ def test_webui_request_size_cap_configured():
     try:
         import webui
     except Exception as e:
-        print(f"  SKIP  test_webui_request_size_cap_configured ({e})")
-        return
+        raise _Skip(e)
     # A request-body cap must be set so an oversized POST can't OOM the dashboard.
     assert webui.app.config.get("MAX_CONTENT_LENGTH") == 1024 * 1024
     # save_config routes through the core atomic+fsync writer.
@@ -2259,6 +2257,8 @@ class _FakePahoClient:
     def publish(self, topic, payload, qos=0, retain=False):
         self.pubs.append((topic, payload, qos, retain)); return _FakeInfo()
     def reconnect_delay_set(self, **k): pass
+    def connect_async(self, *a, **k): pass
+    def loop_start(self): pass
 
 
 class _FakeMqttModule:
@@ -2330,6 +2330,42 @@ def test_mqtt_tls_applied_when_enabled():
     _with_fake_mqtt(body)
 
 
+def test_dynamic_string_metric_rules_evaluate():
+    # A rule on an mqtt_in `parse: string` metric must actually evaluate with
+    # the text operators validation accepts for it (contains/equals/in/regex).
+    cfg = w.validate_config(_min_cfg(
+        mqtt_inputs=[{"topic": "t/door", "metric": "door_state", "parse": "string"}],
+        rules=[{"name": "door",
+                "when": {"metric": "door_state", "operator": "contains",
+                         "value": "open"},
+                "topic": "alarm/door", "on_match": "1", "on_clear": "0"}]))
+    specs = w.metric_catalogue(cfg)
+    rule = cfg["rules"][0]
+    assert w.evaluate_rule(rule, {"door_state": "OPEN wide"}, specs=specs) is True
+    assert w.evaluate_rule(rule, {"door_state": "closed"}, specs=specs) is False
+    # No reading yet -> unavailable -> hold last state (None), never a
+    # fabricated False.
+    assert w.evaluate_rule(rule, {}, specs=specs) is None
+    # The other text operators work on dynamic strings too.
+    for op, val, text, expect in [
+        ("equals", "open", "Open", True),
+        ("equals", "open", "ajar", False),
+        ("in", ["open", "ajar"], "AJAR", True),
+        ("regex", "^op", "opening", True),
+        ("regex", "^op", "closed", False),
+    ]:
+        r = {"name": "x", "when": {"metric": "door_state", "operator": op,
+                                   "value": val},
+             "topic": "t", "on_match": "1"}
+        assert w.evaluate_rule(r, {"door_state": text}, specs=specs) is expect, \
+            (op, val, text)
+    # Built-in text metrics are unaffected: no specs arg still works.
+    r2 = {"name": "y", "when": {"metric": "short_forecast",
+                                "operator": "contains", "value": "rain"},
+          "topic": "t", "on_match": "1"}
+    assert w.evaluate_rule(r2, {"short_forecast": "Light Rain"}) is True
+
+
 def test_mqtt_config_defaults_availability_and_tls():
     cfg = w.validate_config(_min_cfg())
     assert cfg["mqtt"]["availability_topic"] == "weather-mqtt/status"
@@ -2339,20 +2375,156 @@ def test_mqtt_config_defaults_availability_and_tls():
     assert cfg2["mqtt"]["tls"]["enabled"] is True
 
 
+def test_audit_log_rotates_and_reads_backup():
+    import tempfile, os
+    path = tempfile.mktemp(suffix=".log")
+    old = w._AUDIT_MAX_BYTES
+    try:
+        w._AUDIT_MAX_BYTES = 200        # force rotation quickly
+        for i in range(50):
+            w.audit(path, device=f"d{i}", state="on", source="auto", by="t")
+        assert os.path.exists(path + ".1")            # rotated
+        assert os.path.getsize(path) < 1000           # current file stays small
+        cur_lines = len(open(path).read().splitlines())
+        events = w.read_audit(path, limit=50)
+        assert len(events) > cur_lines                # backup fills the window
+        assert events[0]["device"] == "d49"           # newest first, nothing lost
+    finally:
+        w._AUDIT_MAX_BYTES = old
+        for s in ("", ".1"):
+            try: os.unlink(path + s)
+            except OSError: pass
+
+
+def test_webui_cross_origin_posts_rejected():
+    # Browsers attach Basic-auth credentials automatically, so a cross-site
+    # POST must be refused even when it authenticates (CSRF defense).
+    try:
+        import webui
+    except Exception as e:
+        raise _Skip(e)
+    import tempfile, os, yaml, base64
+
+    p = tempfile.mktemp(suffix=".yaml")
+    ovr = tempfile.mktemp(suffix=".json")
+    aud = tempfile.mktemp(suffix=".log")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)",
+        "mqtt": {"host": "localhost", "port": 1883},
+        "web": {"enabled": True, "username": "admin", "password": "pw",
+                "allow_manual_control": True},
+        "overrides_file": ovr, "audit_file": aud,
+        "rules": [{"name": "pump", "topic": "t", "on_match": "ON",
+                   "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:pw").decode()}
+    body = {"device": "pump", "state": "on"}
+    try:
+        # cross-site Origin -> rejected before any handler runs
+        r = c.post("/api/control", json=body,
+                   headers={**hdr, "Origin": "http://evil.example"})
+        assert r.status_code == 403 and w.load_overrides(ovr) == {}
+        # a sandboxed "null" Origin is cross-site too
+        assert c.post("/api/control", json=body,
+                      headers={**hdr, "Origin": "null"}).status_code == 403
+        # same-origin fetch (browser sends our own host) -> allowed
+        r = c.post("/api/control", json=body,
+                   headers={**hdr, "Origin": "http://localhost"})
+        assert r.status_code == 200 and w.load_overrides(ovr) == {"pump": "on"}
+        # no Origin at all (curl / scripts) -> allowed
+        assert c.post("/api/control", json={"device": "pump", "state": "auto"},
+                      headers=hdr).status_code == 200
+        # GETs are never blocked by the guard
+        assert c.get("/api/state",
+                     headers={**hdr, "Origin": "http://evil.example"}).status_code in (200, 503)
+    finally:
+        for f in (p, ovr, aud):
+            for s in ("", ".tmp", ".bak"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
+def test_webui_auth_handles_non_ascii_credentials():
+    # hmac.compare_digest raises on non-ASCII str; the login must compare bytes
+    # so a non-ASCII password works and a wrong guess gets 401, not a 500.
+    try:
+        import webui
+    except Exception as e:
+        raise _Skip(e)
+    import tempfile, os, yaml, base64
+
+    p = tempfile.mktemp(suffix=".yaml")
+    cfg = {
+        "version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+        "user_agent": "x (a@b.com)", "mqtt": {},
+        "web": {"enabled": True, "username": "admin", "password": "pässwörd"},
+        "rules": [{"name": "r", "topic": "t", "on_match": "ON",
+                   "when": {"metric": "is_raining", "operator": "==", "value": True}}],
+    }
+    open(p, "w").write(yaml.safe_dump(cfg, allow_unicode=True))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    try:
+        good = {"Authorization": "Basic " +
+                base64.b64encode("admin:pässwörd".encode()).decode()}
+        assert c.get("/api/system", headers=good).status_code == 200
+        bad = {"Authorization": "Basic " +
+               base64.b64encode("admin:wröng".encode()).decode()}
+        assert c.get("/api/system", headers=bad).status_code == 401
+    finally:
+        try: os.unlink(p)
+        except OSError: pass
+
+
+def test_webui_console_applies_broker_tls():
+    # The web UI's MQTT console must honor mqtt.tls like the monitor does,
+    # or it can never connect to a TLS-only broker.
+    try:
+        import webui
+    except Exception as e:
+        raise _Skip(e)
+    real = webui.mqtt
+    webui.mqtt = _FakeMqttModule
+    try:
+        console = webui.MqttConsole()
+        console.start({"web": {"mqtt_console_enabled": True},
+                       "mqtt": {"host": "h", "port": 8883, "client_id": "c",
+                                "tls": {"enabled": True, "ca_certs": "/x/ca.pem"}}})
+        assert console._client is not None
+        assert console._client.tls is not None
+        assert console._client.tls.get("ca_certs") == "/x/ca.pem"
+    finally:
+        webui.mqtt = real
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
+    failed = skipped = 0
     for t in tests:
         try:
             t()
             print(f"  PASS  {t.__name__}")
+        except _Skip as e:
+            skipped += 1
+            print(f"  SKIP  {t.__name__} ({e})")
         except AssertionError as e:
             failed += 1
             print(f"  FAIL  {t.__name__}: {e}")
         except Exception as e:
             failed += 1
             print(f"  ERROR {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    summary = f"\n{len(tests) - failed - skipped}/{len(tests)} passed"
+    if skipped:
+        summary += f", {skipped} skipped"
+    if failed:
+        summary += f", {failed} FAILED"
+    print(summary)
     return failed
 
 

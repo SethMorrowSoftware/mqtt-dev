@@ -73,7 +73,14 @@ def _range(lo, hi, label):
 # ---------------------------------------------------------------------------
 # Config template (commented, so the written file stays human-friendly)
 # ---------------------------------------------------------------------------
+def _yq(s):
+    """Escape a value for a double-quoted YAML scalar, so an answer containing
+    a quote or backslash (e.g. in a password) can't break the generated file."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _render(c):
+    c = {k: (_yq(v) if isinstance(v, str) else v) for k, v in c.items()}
     web_auth_note = ("" if c["web_user"] else
                      "  # (blank = no login; set both to require one)\n")
     return f"""# ===========================================================================

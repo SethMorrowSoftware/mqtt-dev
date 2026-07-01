@@ -1288,7 +1288,7 @@ def _regex_search(pattern, text):
         return False
 
 
-def _eval_condition(cond, metrics, rule_name, state=None, now=None):
+def _eval_condition(cond, metrics, rule_name, state=None, now=None, specs=None):
     """One condition: True/False, or None if its metric is unavailable.
 
     Two history-dependent constructs need the per-cycle `state`/`now`:
@@ -1296,7 +1296,7 @@ def _eval_condition(cond, metrics, rule_name, state=None, now=None):
       - a `for: <duration>` modifier -> the base condition must hold continuously
         for that long before it counts as True.
     """
-    base = _eval_base(cond, metrics, rule_name, state)
+    base = _eval_base(cond, metrics, rule_name, state, specs)
     dur = cond.get("for")
     if dur is not None and state is not None and now is not None:
         base = _apply_for(base, _cond_key(rule_name, cond),
@@ -1304,8 +1304,13 @@ def _eval_condition(cond, metrics, rule_name, state=None, now=None):
     return base
 
 
-def _eval_base(cond, metrics, rule_name, state):
-    """The condition's value before any `for:` sustain gate is applied."""
+def _eval_base(cond, metrics, rule_name, state, specs=None):
+    """The condition's value before any `for:` sustain gate is applied.
+
+    `specs` is the active metric catalogue (metric_catalogue(cfg)); without it
+    only the built-in METRIC_SPECS are known, so dynamic text metrics (mqtt_in
+    parse: string / http type: string) would fall through to the numeric path
+    and never evaluate."""
     metric = cond["metric"]
     op = cond.get("operator")
     value = cond.get("value")
@@ -1336,10 +1341,18 @@ def _eval_base(cond, metrics, rule_name, state):
         LOG.warning("Rule '%s': unknown alert operator '%s'", rule_name, op)
         return False
 
-    # Text metrics (short_forecast, time_weekday, ...): case-insensitive ops.
-    spec = METRIC_SPECS.get(metric)
+    # Text metrics (short_forecast, time_weekday, dynamic string inputs, ...):
+    # case-insensitive ops.
+    spec = (specs or METRIC_SPECS).get(metric) or METRIC_SPECS.get(metric)
     if spec and spec["type"] == "text":
-        text = str(metrics.get(metric, "") or "")
+        raw = metrics.get(metric)
+        if raw is None and metric not in METRIC_SPECS:
+            # A dynamic string input with no reading yet is unavailable ->
+            # hold last state (built-in text metrics always carry "" at least).
+            LOG.warning("Rule '%s': metric '%s' unavailable this cycle",
+                        rule_name, metric)
+            return None
+        text = str(raw or "")
         if op == "contains":
             return str(value).lower() in text.lower()
         if op == "equals":
@@ -1387,7 +1400,8 @@ def _eval_base(cond, metrics, rule_name, state):
     return fn(current, value)
 
 
-def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
+def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0,
+               specs=None):
     """Recursively evaluate a `when` node with three-valued logic.
 
     Returns True, False, or None (a referenced metric was unavailable -> the
@@ -1400,7 +1414,7 @@ def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
         return None
     if isinstance(node, dict) and ("any" in node or "all" in node):
         mode = "any" if "any" in node else "all"
-        results = [_eval_node(c, metrics, rule_name, state, now, _depth + 1)
+        results = [_eval_node(c, metrics, rule_name, state, now, _depth + 1, specs)
                    for c in node[mode]]
         if mode == "any":
             if any(r is True for r in results):
@@ -1414,19 +1428,22 @@ def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
             return None
         return True
     if isinstance(node, dict) and "not" in node:
-        inner = _eval_node(node["not"], metrics, rule_name, state, now, _depth + 1)
+        inner = _eval_node(node["not"], metrics, rule_name, state, now,
+                           _depth + 1, specs)
         return None if inner is None else (not inner)
-    return _eval_condition(node, metrics, rule_name, state, now)
+    return _eval_condition(node, metrics, rule_name, state, now, specs)
 
 
-def evaluate_rule(rule, metrics, state=None, now=None):
+def evaluate_rule(rule, metrics, state=None, now=None, specs=None):
     """Evaluate a rule's `when` (single condition, or a nested any/all/not
     group). Returns True, False, or None (metric(s) unavailable).
 
     `state`/`now` are needed only by the history-dependent constructs
     (`changed` operator and `for:` sustain); without them those evaluate to
-    None/unsustained, so plain rules need no engine state."""
-    return _eval_node(rule["when"], metrics, rule["name"], state, now)
+    None/unsustained, so plain rules need no engine state. `specs` is the
+    active metric catalogue (metric_catalogue(cfg)); without it dynamic text
+    metrics can't be typed and their conditions read as unavailable."""
+    return _eval_node(rule["when"], metrics, rule["name"], state, now, 0, specs)
 
 
 # Sentinel distinguishing "metric never observed" from "observed value None".
@@ -1661,14 +1678,14 @@ def apply_hysteresis(hyst, prev, desired, last_change, now):
     return desired
 
 
-def resolve_desired(rule, metrics, now_local, state=None, now=None):
+def resolve_desired(rule, metrics, now_local, state=None, now=None, specs=None):
     """The rule's desired state after the time-window gate: outside the window
     the desired state is OFF; inside it is the evaluated `when` (True/False/
     None, where None means hold)."""
     win = rule.get("window")
     if win and not in_window(win, now_local):
         return False
-    return evaluate_rule(rule, metrics, state, now)
+    return evaluate_rule(rule, metrics, state, now, specs)
 
 
 def _parse_iso(s):
@@ -1822,9 +1839,20 @@ def variable_metrics(values):
     return {VAR_PREFIX + str(k): v for k, v in (values or {}).items()}
 
 
+_AUDIT_MAX_BYTES = 5_000_000   # rotate audit.log past ~5 MB (one .1 backup kept)
+
+
 def audit(path, **event):
-    """Append one JSON event to the audit log. Best-effort: never raises."""
+    """Append one JSON event to the audit log. Best-effort: never raises.
+    Rotates the file to <path>.1 once it grows past _AUDIT_MAX_BYTES, so a
+    chatty rule can't grow it without bound over a months-long runtime."""
     try:
+        p = Path(path)
+        try:
+            if p.exists() and p.stat().st_size > _AUDIT_MAX_BYTES:
+                p.replace(str(p) + ".1")
+        except OSError:
+            pass
         event.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
         with open(path, "a") as f:
             f.write(json.dumps(event, sort_keys=True) + "\n")
@@ -1834,10 +1862,20 @@ def audit(path, **event):
 
 def read_audit(path, limit=200):
     """Return the most recent audit events (newest first), up to `limit`.
-    Robust to a missing file or unparseable lines."""
+    Robust to a missing file or unparseable lines. Reaches into the rotated
+    backup (<path>.1) when the current file alone can't fill `limit`, so the
+    Activity page doesn't go near-empty right after a rotation."""
     try:
         lines = Path(path).read_text().splitlines()
     except Exception:
+        lines = []
+    if len(lines) < limit:
+        try:
+            prev = Path(str(path) + ".1").read_text().splitlines()
+            lines = prev[-(limit - len(lines)):] + lines
+        except Exception:
+            pass
+    if not lines:
         return []
     out = []
     for ln in lines[-limit:]:
@@ -2477,6 +2515,9 @@ def main():
         lookback = cfg["precipitation"]["lookback_hours"]
         interval = max(MIN_POLL_MINUTES, cfg["poll_interval_minutes"]) * 60
         rules = cfg["rules"]
+        # Full metric catalogue (built-ins + variables + mqtt/http inputs +
+        # computed) so evaluation can type dynamic metrics (esp. string ones).
+        specs = metric_catalogue(cfg)
         state_file = cfg["state_file"]
         # Manual overrides are an overlay re-read each cycle (like config), so the
         # web UI's Auto/On/Off takes effect on the next poll without a restart.
@@ -2574,7 +2615,8 @@ def main():
                 elif manual in ("on", "off"):
                     result = (manual == "on")
                 else:
-                    desired = resolve_desired(rule, m, now_local, engine_state, now_utc)
+                    desired = resolve_desired(rule, m, now_local, engine_state,
+                                              now_utc, specs)
                     if desired is None:
                         result = None
                     else:

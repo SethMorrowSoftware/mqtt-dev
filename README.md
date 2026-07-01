@@ -253,7 +253,10 @@ broadly, put it behind nginx/Caddy and enable auth. To enable the login set
 password); credentials are compared in constant time, and the UI fails **closed**
 — if `config.yaml` can't be read it denies access rather than serving the editor
 unauthenticated. Saved passwords are never echoed back into the page; leave a
-password field blank to keep the stored value.
+password field blank to keep the stored value. State-changing requests are
+protected against cross-site request forgery: a POST whose `Origin` header
+names another site is rejected outright, so a malicious page can't ride the
+browser's remembered login to flip devices or publish MQTT.
 
 ## Manual control (opt-in)
 
@@ -448,8 +451,14 @@ journalctl -u weather-mqtt -f                       # live logs
 
 ```bash
 cd mqtt-dev && git pull
-sudo ./install.sh        # idempotent: refreshes code + deps, keeps your config
+sudo ./install.sh        # idempotent: refreshes code + deps, keeps your config,
+                         # and restarts both services on the new code
 ```
+
+A re-run never touches your `config.yaml` or runtime state (overrides,
+variables, history, audit trail), and only restarts Mosquitto if it had to
+write the broker config in the first place — so connected PLCs aren't bounced
+by a routine update.
 
 If you installed by hand, re-copy the `.py` files to your install dir, run
 `./venv/bin/pip install -r requirements.txt`, then

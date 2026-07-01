@@ -20,6 +20,7 @@ import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, request, url_for, render_template_string, Response, jsonify
 
@@ -69,6 +70,26 @@ app = Flask(__name__)
 # Cap request bodies so an oversized POST (e.g. a giant MQTT payload or rules
 # blob) can't balloon memory and OOM the dashboard on a small box.
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MiB
+
+
+@app.before_request
+def _reject_cross_site_writes():
+    """Same-origin guard for state-changing requests (CSRF defense).
+
+    Browsers attach Basic-auth credentials automatically, so without this a
+    malicious page could POST to /api/control, /api/mqtt/publish, /settings,
+    etc. from another site and the browser would authenticate it. Browsers
+    send an Origin header on every cross-site POST; when one is present it
+    must name this host. Requests without an Origin (curl, scripts, same-site
+    non-CORS GETs) are unaffected."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if not origin:
+        return None
+    if origin != "null" and urlsplit(origin).netloc == request.host:
+        return None
+    return jsonify({"error": "cross-origin request rejected"}), 403
 CONFIG_PATH = "config.yaml"
 
 # Serialize config writes so two concurrent saves can't interleave the backup +
@@ -253,6 +274,9 @@ class MqttConsole:
                 client_id=str(mq.get("client_id", "weather-mqtt")) + "-webui")
             if mq.get("username"):
                 client.username_pw_set(mq["username"], mq.get("password", ""))
+            # Same TLS setup as the monitor, so the console can reach a
+            # TLS-only broker instead of silently never connecting.
+            core._apply_mqtt_tls(client, mq)
 
             def on_connect(c, u, flags, reason_code, props):
                 self._connected = not reason_code.is_failure
@@ -316,9 +340,12 @@ def _auth_ok():
     auth = request.authorization
     if not auth or auth.username is None or auth.password is None:
         return False
-    # constant-time comparison so the endpoint doesn't leak length/contents
-    return (hmac.compare_digest(auth.username, user)
-            and hmac.compare_digest(auth.password, pw))
+    # Constant-time comparison so the endpoint doesn't leak length/contents.
+    # Compare as UTF-8 bytes: compare_digest raises on non-ASCII str, which
+    # would turn a login attempt against a non-ASCII password into a 500.
+    def _ct_eq(a, b):
+        return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+    return _ct_eq(auth.username, user) and _ct_eq(auth.password, pw)
 
 
 def require_auth(fn):
@@ -2929,9 +2956,12 @@ def main():
     cfg = core.load_config(args.config)   # validate on startup
     web = cfg.get("web", {})
     if not web.get("enabled", True):
-        print("web.enabled is false in config; refusing to start. "
+        # Exit 0: "disabled in config" is a deliberate state, not a failure --
+        # a non-zero exit would make systemd (Restart=on-failure) crash-loop
+        # the service every RestartSec forever.
+        print("web.enabled is false in config; not starting. "
               "Set web.enabled: true to use the UI.")
-        raise SystemExit(1)
+        raise SystemExit(0)
     host = args.host or web.get("host", "0.0.0.0")
     port = args.port or web.get("port", 8080)
     # Loud warning if we're exposed on a non-loopback interface with no login:

@@ -67,10 +67,18 @@ for f in weather_mqtt.py webui.py setup_wizard.py requirements.txt; do
 done
 # Ship the demo and example config too (handy reference); never overwrite a live config.
 cp -r "$SRC_DIR/demo" "$INSTALL_DIR/" 2>/dev/null || true
-[ -f "$SRC_DIR/config.yaml" ] && install -m 0644 "$SRC_DIR/config.yaml" "$INSTALL_DIR/config.yaml.example"
+if [ -f "$SRC_DIR/config.yaml" ]; then
+  install -m 0644 "$SRC_DIR/config.yaml" "$INSTALL_DIR/config.yaml.example"
+fi
 c_g "Files copied."
 
 step "Creating Python virtualenv + installing dependencies"
+# A venv left behind by an OS/Python upgrade may have a dead interpreter;
+# rebuild it rather than letting pip fail and abort the install.
+if [ -e "$INSTALL_DIR/venv" ] && ! "$INSTALL_DIR/venv/bin/python" -c '' >/dev/null 2>&1; then
+  c_y "Existing virtualenv is broken (Python upgrade?); recreating it."
+  rm -rf "$INSTALL_DIR/venv"
+fi
 if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
   python3 -m venv "$INSTALL_DIR/venv"
 fi
@@ -99,6 +107,7 @@ chmod 600 "$CONFIG" 2>/dev/null || true
 if [ "$SETUP_MOSQUITTO" = "1" ]; then
   step "Configuring Mosquitto (local listener)"
   MOSQ_CONF="/etc/mosquitto/conf.d/weather-mqtt.conf"
+  WROTE_MOSQ_CONF=0
   if [ -d /etc/mosquitto/conf.d ] && [ ! -f "$MOSQ_CONF" ]; then
     cat > "$MOSQ_CONF" <<'EOF'
 # Added by weather-mqtt install.sh: a local listener the controller connects to.
@@ -109,11 +118,16 @@ listener 1883 localhost
 allow_anonymous true
 EOF
     c_g "Wrote $MOSQ_CONF (localhost:1883, anonymous)."
+    WROTE_MOSQ_CONF=1
   else
     echo "Leaving existing Mosquitto config untouched."
   fi
   systemctl enable --now mosquitto >/dev/null 2>&1 || true
-  systemctl restart mosquitto || c_y "Could not restart mosquitto; check 'systemctl status mosquitto'."
+  # Restart the broker only when we changed its config: a re-install over a
+  # live system must not bounce every connected PLC for nothing.
+  if [ "$WROTE_MOSQ_CONF" = "1" ]; then
+    systemctl restart mosquitto || c_y "Could not restart mosquitto; check 'systemctl status mosquitto'."
+  fi
   if command -v mosquitto_pub >/dev/null 2>&1; then
     if mosquitto_pub -h localhost -t weather-mqtt/installtest -m ok >/dev/null 2>&1; then
       c_g "Broker reachable on localhost:1883."
@@ -137,9 +151,14 @@ render_unit "$SRC_DIR/weather-webui.service" > /etc/systemd/system/weather-webui
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 
 systemctl daemon-reload
-systemctl enable --now weather-mqtt.service
-systemctl enable --now weather-webui.service
-c_g "Services installed and started."
+# enable + restart (not `enable --now`): on a re-install over running services
+# `--now` is a no-op, which would leave the OLD code running until someone
+# restarted by hand. restart also starts a stopped service, so a fresh install
+# behaves the same.
+systemctl enable weather-mqtt.service weather-webui.service >/dev/null
+systemctl restart weather-mqtt.service
+systemctl restart weather-webui.service
+c_g "Services installed and (re)started."
 
 # ---------------------------------------------------------------------------
 PORT="$("$INSTALL_DIR/venv/bin/python" - "$CONFIG" <<'PY' 2>/dev/null || echo 8080
