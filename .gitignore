@@ -18,11 +18,16 @@ weather_state.json
 # Manual-override overlay + audit trail (Phase 2) + operator variables (Phase 3).
 overrides.json
 audit.log
+audit.log.1
 variables.json
-# Runtime log (System page) + metric history db (Phase 4).
+# Persisted engine decision history (hysteresis / for: / changed baselines).
+engine_state.json
+# Runtime log (System page) + metric history db (Phase 4, incl. WAL sidecars).
 monitor.log
 monitor.log.*
 history.db
+history.db-wal
+history.db-shm
 # Atomic-write temp + backup files left by the web UI's config saves.
 *.tmp
 *.bak
