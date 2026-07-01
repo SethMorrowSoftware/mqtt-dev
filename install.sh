@@ -60,31 +60,50 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "Installing application to $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
-for f in weather_mqtt.py webui.py setup_wizard.py requirements.txt; do
-  install -m 0644 "$SRC_DIR/$f" "$INSTALL_DIR/$f"
-done
-# Ship the demo and example config too (handy reference); never overwrite a live config.
-cp -r "$SRC_DIR/demo" "$INSTALL_DIR/" 2>/dev/null || true
-if [ -f "$SRC_DIR/config.yaml" ]; then
-  install -m 0644 "$SRC_DIR/config.yaml" "$INSTALL_DIR/config.yaml.example"
-fi
-c_g "Files copied."
-
+# Build/refresh the virtualenv BEFORE swapping in the new code, so a pip
+# failure on a re-run aborts while the running services still have a matching
+# code+venv pair -- rather than leaving new .py files against stale deps that
+# crash-loop on the next restart.
 step "Creating Python virtualenv + installing dependencies"
+mkdir -p "$INSTALL_DIR"
+install -m 0644 "$SRC_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"
 # A venv left behind by an OS/Python upgrade may have a dead interpreter;
 # rebuild it rather than letting pip fail and abort the install.
+NEW_VENV=0
 if [ -e "$INSTALL_DIR/venv" ] && ! "$INSTALL_DIR/venv/bin/python" -c '' >/dev/null 2>&1; then
   c_y "Existing virtualenv is broken (Python upgrade?); recreating it."
   rm -rf "$INSTALL_DIR/venv"
 fi
 if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
   python3 -m venv "$INSTALL_DIR/venv"
+  NEW_VENV=1
 fi
-"$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+# Upgrading pip needs the network; only do it for a fresh venv, and never let it
+# abort a re-run (an existing venv's pip is fine).
+[ "$NEW_VENV" = "1" ] && "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip || true
+if ! "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"; then
+  if [ "$NEW_VENV" = "1" ]; then
+    c_r "Dependency install failed on a fresh virtualenv; aborting."
+    exit 1
+  fi
+  c_y "Dependency refresh failed (offline?); keeping the existing venv's packages."
+fi
 c_g "Dependencies installed."
+
+# ---------------------------------------------------------------------------
+# Only now swap in the new application code (deps are already in place).
+step "Installing application to $INSTALL_DIR"
+for f in weather_mqtt.py webui.py setup_wizard.py; do
+  install -m 0644 "$SRC_DIR/$f" "$INSTALL_DIR/$f"
+done
+# Ship the demo and example config too (handy reference); never overwrite a live config.
+cp -r "$SRC_DIR/demo" "$INSTALL_DIR/" 2>/dev/null || true
+# The example may hold secrets if the source config was edited; keep it 0600
+# like the live config rather than the default world-readable 0644.
+if [ -f "$SRC_DIR/config.yaml" ]; then
+  install -m 0600 "$SRC_DIR/config.yaml" "$INSTALL_DIR/config.yaml.example"
+fi
+c_g "Files copied."
 
 # ---------------------------------------------------------------------------
 step "Configuration"
@@ -108,7 +127,16 @@ if [ "$SETUP_MOSQUITTO" = "1" ]; then
   step "Configuring Mosquitto (local listener)"
   MOSQ_CONF="/etc/mosquitto/conf.d/weather-mqtt.conf"
   WROTE_MOSQ_CONF=0
-  if [ -d /etc/mosquitto/conf.d ] && [ ! -f "$MOSQ_CONF" ]; then
+  # Only write our snippet when there's no broker config to disturb. If the box
+  # already has a listener/auth defined (our snippet from a previous run, or an
+  # operator's own broker), leave it strictly alone: adding a second anonymous
+  # localhost listener or clashing on port 1883 could break a working broker.
+  EXISTING_BROKER_CFG=0
+  if grep -rqsE '^[[:space:]]*(listener|allow_anonymous|password_file|per_listener_settings)' \
+        /etc/mosquitto/mosquitto.conf /etc/mosquitto/conf.d/ 2>/dev/null; then
+    EXISTING_BROKER_CFG=1
+  fi
+  if [ -d /etc/mosquitto/conf.d ] && [ ! -f "$MOSQ_CONF" ] && [ "$EXISTING_BROKER_CFG" = "0" ]; then
     cat > "$MOSQ_CONF" <<'EOF'
 # Added by weather-mqtt install.sh: a local listener the controller connects to.
 # Anonymous access is fine because it only listens on localhost. To accept
@@ -124,9 +152,17 @@ EOF
   fi
   systemctl enable --now mosquitto >/dev/null 2>&1 || true
   # Restart the broker only when we changed its config: a re-install over a
-  # live system must not bounce every connected PLC for nothing.
+  # live system must not bounce every connected PLC for nothing. If our fresh
+  # snippet fails to load, that's fatal -- remove it and stop, rather than
+  # marching on to a green "Done!" with a broker that won't start.
   if [ "$WROTE_MOSQ_CONF" = "1" ]; then
-    systemctl restart mosquitto || c_y "Could not restart mosquitto; check 'systemctl status mosquitto'."
+    if ! systemctl restart mosquitto; then
+      c_r "Mosquitto failed to start with the new listener config; reverting it."
+      rm -f "$MOSQ_CONF"
+      systemctl restart mosquitto >/dev/null 2>&1 || true
+      c_r "Fix the broker ('systemctl status mosquitto') and re-run."
+      exit 1
+    fi
   fi
   if command -v mosquitto_pub >/dev/null 2>&1; then
     if mosquitto_pub -h localhost -t weather-mqtt/installtest -m ok >/dev/null 2>&1; then

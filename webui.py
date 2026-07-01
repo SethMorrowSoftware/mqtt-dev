@@ -42,6 +42,13 @@ except Exception:  # pragma: no cover - fallback path
     import yaml as _pyyaml
     _HAVE_RUAMEL = False
 
+# A single ruamel YAML() object caches parser/composer state on itself and
+# resets it per load, so concurrent loads on Flask's threaded dev server
+# interleave and raise spurious ParserError/ComposerError -- surfacing as
+# random 401s (auth re-parses config every request) and failed saves. Serialize
+# all ruamel load/dump through this lock.
+_YAML_LOCK = threading.Lock()
+
 
 def _qstr(s):
     """Quote a string when dumping so the monitor's PyYAML (1.1) loader never
@@ -97,6 +104,11 @@ CONFIG_PATH = "config.yaml"
 # racy .bak.)
 _SAVE_LOCK = threading.Lock()
 
+# Serialize read-modify-write of the JSON overlay files (overrides.json,
+# variables.json) so two concurrent /api/control or /api/variable requests
+# can't clobber each other's update.
+_OVERLAY_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Config + state IO
@@ -105,7 +117,8 @@ def load_raw():
     """Load config preserving comments/structure when ruamel is available."""
     text = Path(CONFIG_PATH).read_text()
     if _HAVE_RUAMEL:
-        return _yaml.load(text)
+        with _YAML_LOCK:
+            return _yaml.load(text)
     return _pyyaml.safe_load(text)
 
 
@@ -114,7 +127,8 @@ def dump_raw(data):
     import io
     if _HAVE_RUAMEL:
         buf = io.StringIO()
-        _yaml.dump(data, buf)
+        with _YAML_LOCK:
+            _yaml.dump(data, buf)
         return buf.getvalue()
     return _pyyaml.safe_dump(data, sort_keys=False)
 
@@ -133,9 +147,17 @@ def save_config(data):
     p = Path(CONFIG_PATH)
     with _SAVE_LOCK:
         if p.exists():
-            Path(str(p) + ".bak").write_text(p.read_text())
+            bak = Path(str(p) + ".bak")
+            bak.write_text(p.read_text())
+            # config.yaml holds secrets (mqtt/web passwords, Slack + status
+            # tokens); the backup must not be more permissive than the original.
+            try:
+                os.chmod(bak, os.stat(p).st_mode & 0o7777)
+            except OSError:
+                pass
         # Atomic + fsync so a crash/power-loss can't leave a half-written config
-        # the monitor would fail to load on its next cycle.
+        # the monitor would fail to load on its next cycle. _atomic_write
+        # preserves the existing file's 0600, so a save never widens perms.
         core._atomic_write(p, text)
 
 
@@ -469,6 +491,9 @@ BASE = """
  .rule-card .rhead .idx{font-size:11px;color:var(--muted2);font-weight:700;text-transform:uppercase;letter-spacing:.09em}
  .cond{align-items:flex-end}.cond .rm{flex:0 0 auto;min-width:0}.combine-wrap{margin-top:6px}
  footer{max-width:980px;margin:0 auto;padding:8px 18px 44px;color:var(--muted2);font-size:12.5px;text-align:center}
+ #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:#0f2e1c;color:#bbf7d0;box-shadow:0 0 0 1px #14532d inset,var(--shadow);padding:11px 18px;border-radius:var(--r);font-size:13.5px;font-weight:600;opacity:0;pointer-events:none;transition:opacity var(--t),transform var(--t);z-index:50}
+ #toast.show,#toast.err{opacity:1;transform:translateX(-50%) translateY(0)}
+ #toast.err{background:#3a1115;color:#fecaca;box-shadow:0 0 0 1px #7f1d1d inset,var(--shadow)}
  @media (max-width:560px){header{gap:12px;padding:10px 14px}.conn{display:none}main{margin-top:16px}.big{font-size:28px}}
  @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}}
 </style></head><body>
@@ -592,9 +617,21 @@ function render(s){
     return;
   }
   if(gs) gs.style.display = "none";
+  // Staleness: if the monitor stopped writing snapshots, don't keep showing an
+  // old state as live. Threshold is two poll intervals plus a small grace.
+  const pollMin = Number(s.poll_interval_minutes) || 15;
+  const staleAfter = pollMin*60*2 + 90;
+  const ageS = s.updated ? Math.max(0,(Date.now()-Date.parse(s.updated))/1000) : null;
+  const stale = ageS !== null && ageS > staleAfter;
+  const staleEl = document.getElementById("staleness");
+  if(staleEl) staleEl.textContent = stale ? ("⚠ monitor stale — last update "+agoText(s.updated)) : "";
   // connection badge
   const up = !!s.mqtt_connected;
-  conn.innerHTML = '<span class="dot '+(up?'up':'down')+'"></span>MQTT '+(up?'connected':'offline');
+  if(stale){
+    conn.innerHTML = '<span class="dot idle"></span>monitor stale';
+  } else {
+    conn.innerHTML = '<span class="dot '+(up?'up':'down')+'"></span>MQTT '+(up?'connected':'offline');
+  }
 
   // Headline device: prefer the irrigation rule (back-compat), else the first
   // rule with a known state, else just the first rule. This way a renamed first
@@ -637,6 +674,9 @@ function render(s){
   const hint = document.getElementById("manual-hint");
   if(hint) hint.style.display = manualControl ? "none" : "";
   const grid = document.getElementById("devicegrid");
+  // Don't yank focus from an Auto/On/Off button the operator just pressed.
+  if(grid.contains(document.activeElement) &&
+     document.activeElement.tagName === "BUTTON"){ renderVars(s.variables||[], manualControl); document.getElementById("dash").classList.remove("loading"); return; }
   grid.innerHTML = "";
   for(const r of rules){
     let pill;
@@ -660,13 +700,17 @@ function render(s){
   renderVars(s.variables || [], manualControl);
   document.getElementById("dash").classList.remove("loading");
 }
-function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }  // safe in attribute context too
 function renderVars(vars, manualControl){
   const card = document.getElementById("vars-card");
   const box = document.getElementById("vars-body");
   if(!card || !box) return;
   if(!vars.length){ card.style.display = "none"; return; }
   card.style.display = "";
+  // Don't wipe a value the operator is mid-edit: skip the rebuild while a
+  // control inside this card has focus (the next tick will refresh it).
+  if(box.contains(document.activeElement) &&
+     /^(INPUT|BUTTON|SELECT)$/.test(document.activeElement.tagName)) return;
   box.innerHTML = "";
   for(const v of vars){
     let ctrl;
@@ -793,7 +837,8 @@ def api_control():
         return jsonify({"error": f"state must be one of {core.MANUAL_STATES}"}), 400
 
     try:
-        core.set_override(cfg.get("overrides_file", "overrides.json"), device, state)
+        with _OVERLAY_LOCK:
+            core.set_override(cfg.get("overrides_file", "overrides.json"), device, state)
     except Exception as e:
         return jsonify({"error": f"could not save override: {e}"}), 500
     auth = request.authorization
@@ -828,8 +873,9 @@ def api_variable():
     if name not in declared:
         return jsonify({"error": f"unknown variable '{name}'"}), 404
     try:
-        coerced = core.set_variable(cfg.get("variables_file", "variables.json"),
-                                    name, data.get("value"), declared)
+        with _OVERLAY_LOCK:
+            coerced = core.set_variable(cfg.get("variables_file", "variables.json"),
+                                        name, data.get("value"), declared)
     except Exception as e:
         return jsonify({"error": f"could not save variable: {e}"}), 500
     auth = request.authorization
@@ -959,7 +1005,7 @@ def api_history():
         hours = max(1, min(24 * 90, int(request.args.get("hours", 24))))
     except Exception:
         hours = 24
-    names = [n for n in (request.args.get("metrics", "").split(",")) if n.strip()]
+    names = [n.strip() for n in request.args.get("metrics", "").split(",") if n.strip()]
     available = core.history_metrics(db) if enabled else []
     series = core.read_history(db, hours=hours, names=names or None) if enabled else {}
     return jsonify({"enabled": enabled, "hours": hours,
@@ -1084,7 +1130,7 @@ ACTIVITY = """
 </div>
 <script>
 const REFRESH = {{ refresh }} * 1000;
-function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }  // safe in attribute context too
 function agoText(iso){
   if(!iso) return "—"; const t=Date.parse(iso); if(isNaN(t)) return iso;
   const s=Math.max(0,Math.round((Date.now()-t)/1000));
@@ -1196,7 +1242,7 @@ SYSTEM = """
 </div>
 <script>
 const REFRESH = {{ refresh }} * 1000;
-function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }  // safe in attribute context too
 function setText(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
 function agoText(iso){
   if(!iso) return "never"; const t=Date.parse(iso); if(isNaN(t)) return iso;
@@ -1308,7 +1354,7 @@ HISTORY = """
 </div>
 <script>
 const REFRESH = {{ refresh }} * 1000;
-function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }  // safe in attribute context too
 function fmtNum(n){ if(n===null||n===undefined) return "—"; const r=Math.round(n*100)/100; return (r===Math.round(r))?String(r):r.toFixed(2); }
 function fmtTime(iso){ const t=Date.parse(iso); if(isNaN(t)) return ""; const d=new Date(t);
   return d.toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}); }
@@ -1336,6 +1382,10 @@ async function tick(){
   const hours=document.getElementById("win").value;
   let d; try{ const r=await fetch("api/history?hours="+hours,{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
   catch(e){ return; }
+  // A slower earlier fetch (e.g. the 30-day window) can resolve after the user
+  // has already switched the dropdown; drop it so we never render a window the
+  // control no longer selects.
+  if(String(hours)!==String(document.getElementById("win").value)) return;
   LAST = {series:d.series||{}, hours:hours};
   const note=document.getElementById("hist-note");
   const charts=document.getElementById("charts");
@@ -1466,13 +1516,13 @@ MQTT_PAGE = """
 <div id="toast"></div>
 <script>
 const REFRESH = {{ refresh }} * 1000;
-function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
-function toast(t,e){ const x=document.getElementById("toast"); if(!x) return; x.textContent=t; x.className="show"+(e?" err":""); clearTimeout(toast._t); toast._t=setTimeout(()=>x.className=e?"err":"",3200); }
+function esc(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }  // safe in attribute context too
+function toast(t,e){ const x=document.getElementById("toast"); if(!x) return; x.textContent=t; x.className="show"+(e?" err":""); clearTimeout(toast._t); toast._t=setTimeout(()=>{ x.className=""; },3200); }
 function agoText(iso){ if(!iso) return "—"; const t=Date.parse(iso); if(isNaN(t)) return iso;
   const s=Math.max(0,Math.round((Date.now()-t)/1000));
   if(s<5) return "now"; if(s<60) return s+"s"; if(s<3600) return Math.round(s/60)+"m"; return Math.round(s/3600)+"h"; }
 
-let SINCE=0, CAN_PUBLISH=false, ROWS=[];
+let SINCE=0, CAN_PUBLISH=false, ROWS=[], FEED_INFLIGHT=false;
 const MAXROWS=400;
 function flags(m){ let f=[]; if(m.retain) f.push('<span class="pill na" style="padding:1px 6px">R</span>'); if(m.qos) f.push('<span class="pill off" style="padding:1px 6px">q'+m.qos+'</span>'); return f.join(" "); }
 
@@ -1492,15 +1542,25 @@ function renderFeed(){
   }
 }
 async function tickFeed(){
+  // Skip if a poll is already in flight: two overlapping fetches share the same
+  // SINCE and would append the same messages twice (duplicate rows).
+  if(FEED_INFLIGHT) return;
+  FEED_INFLIGHT=true;
+  const conn=document.getElementById("mq-conn");
   const topic=encodeURIComponent(document.getElementById("filter").value.trim());
-  let d; try{ const r=await fetch("api/mqtt?since="+SINCE+"&topic="+topic,{cache:"no-store"}); if(!r.ok) return; d=await r.json(); }
-  catch(e){ return; }
-  const st=d.stats||{}; const conn=document.getElementById("mq-conn");
+  let d;
+  try{ const r=await fetch("api/mqtt?since="+SINCE+"&topic="+topic,{cache:"no-store"}); if(!r.ok){ FEED_INFLIGHT=false; return; } d=await r.json(); }
+  catch(e){ conn.innerHTML='<span class="dot down"></span>UI unreachable — retrying'; FEED_INFLIGHT=false; return; }
+  finally{ /* cleared below after processing */ }
+  const st=d.stats||{};
   if(!d.enabled){ conn.innerHTML='<span class="dot idle"></span>console disabled'; }
   else conn.innerHTML='<span class="dot '+(st.connected?"up":"down")+'"></span>'+(st.connected?"connected":"broker offline")+' · '+(st.received||0)+' msgs';
   CAN_PUBLISH=!!d.can_publish; applyPublishState();
-  for(const m of (d.messages||[])){ ROWS.push(m); SINCE=Math.max(SINCE,m.seq); }
+  // Dedupe defensively: only accept messages strictly newer than the cursor.
+  for(const m of (d.messages||[])){ if(m.seq>SINCE){ ROWS.push(m); } }
+  for(const m of (d.messages||[])){ SINCE=Math.max(SINCE,m.seq); }
   if(ROWS.length>MAXROWS) ROWS=ROWS.slice(-MAXROWS);
+  FEED_INFLIGHT=false;
   document.getElementById("feednote").textContent =
     (st.connected? "Live · ":"Offline · ")+(st.topics||0)+" topics · "+(st.buffered||0)+" buffered"+
     (d.enabled? "":" · enable the console in config (web.mqtt_console_enabled)");
@@ -1841,6 +1901,12 @@ def settings():
             if f.get("web_password", ""):
                 web["password"] = _qstr(f.get("web_password"))
             web.setdefault("password", "")
+            # Clearing the username disables the login entirely, so drop the
+            # stored password too. Otherwise we'd leave username="" + password
+            # set -- a half-configured state that _auth_ok denies for EVERY
+            # request, locking the operator out until they hand-edit the file.
+            if not str(web["username"]):
+                web["password"] = _qstr("")
             # Refuse a username with no password: it looks like auth is on but
             # accepts a blank password. Require both, or neither.
             if web["username"] and not str(web.get("password") or ""):
@@ -2509,6 +2575,13 @@ function validate(data){
       if(c.value==="") return "Rule '"+r.name+"': the "+c.metric+" condition needs a value.";
       if(meta.type==="number" && isNaN(Number(c.value))) return "Rule '"+r.name+"': "+c.metric+" needs a numeric value.";
     }
+    // Extra actions: an incomplete row would be silently dropped on save, so
+    // reject it here where the operator can fix it.
+    for(const a of (r.actions||[])){
+      if(a.kind==="mqtt" && !a.topic) return "Rule '"+r.name+"': an MQTT action needs a topic.";
+      if(a.kind==="webhook" && !a.url) return "Rule '"+r.name+"': a webhook action needs a URL.";
+      if(a.kind==="notify" && !a.text) return "Rule '"+r.name+"': a notify action needs a message.";
+    }
   }
   return "";
 }
@@ -2562,6 +2635,20 @@ def rules():
     if request.method == "POST":
         try:
             if mode == "form":
+                # Guard: refuse a form-builder save when the config on disk
+                # contains rules the builder can't represent (nested/not/window/
+                # hysteresis, a declared manual state, webhook headers, explicit
+                # retain: false). Without this a form save silently flattens and
+                # destroys them. The GET path already routes such configs to the
+                # YAML tab; this enforces it even if a stale form tab is posted.
+                existing = _to_plain(cfg.get("rules", []) or [])
+                if existing and not all(_rule_is_flat(r) for r in existing):
+                    raise ValueError(
+                        "some existing rules use advanced features the form "
+                        "builder can't edit (nested conditions, not/window/"
+                        "hysteresis, a manual state, or webhook headers/retain) "
+                        "-- edit rules in the YAML (advanced) tab so they aren't "
+                        "lost")
                 items = json.loads(request.form.get("rules_json", "[]"))
                 cfg["rules"] = _rules_from_structured(items, builder_metrics(cfg))
             else:
@@ -2569,7 +2656,8 @@ def rules():
                 # NOT turn unquoted ON/OFF/YES/NO into booleans, so payloads survive.
                 rules_yaml_override = request.form.get("rules_yaml", "")
                 if _HAVE_RUAMEL:
-                    parsed = _to_plain(_yaml.load(rules_yaml_override))
+                    with _YAML_LOCK:
+                        parsed = _to_plain(_yaml.load(rules_yaml_override))
                 else:
                     import yaml as _y
                     parsed = _y.safe_load(rules_yaml_override)
@@ -2626,10 +2714,14 @@ def _apply_sources(cfg, payload):
         raise ValueError("malformed inputs payload")
 
     variables = {}
+    seen_vars = set()
     for it in (payload.get("variables") or []):
         name = str((it or {}).get("name", "")).strip()
         if not name:
             continue
+        if name in seen_vars:
+            raise ValueError(f"duplicate variable name '{name}'")
+        seen_vars.add(name)
         vtype = str(it.get("type", "bool")).strip().lower()
         if vtype == "number":
             default = _num_or(it.get("default"), 0)
@@ -2668,11 +2760,15 @@ def _apply_sources(cfg, payload):
     cfg["http_inputs"] = hlist
 
     computed = {}
+    seen_comp = set()
     for it in (payload.get("computed") or []):
         name = str((it or {}).get("name", "")).strip()
         expr = str(it.get("expr", "")).strip()
         if not name and not expr:
             continue
+        if name in seen_comp:
+            raise ValueError(f"duplicate computed metric name '{name}'")
+        seen_comp.add(name)
         computed[_qstr(name)] = {"expr": _qstr(expr)}
     cfg["computed"] = computed
 
@@ -2901,10 +2997,20 @@ def _rule_is_flat(rule):
     leaf condition, or one any/all group of leaf conditions). Nested groups,
     `not`, time windows, and hysteresis are YAML-editor only -- a rule using
     any of them opens the YAML tab so a form save can't silently drop it. The
-    builder does handle enabled, between/in, changed, and per-condition for."""
+    builder does handle enabled, between/in, changed, and per-condition for.
+
+    A rule is also treated as non-flat when it carries data the builder can't
+    round-trip: a config-declared `manual:` state, or an action with webhook
+    `headers` or an explicit `retain: false`. Routing these to the YAML tab
+    (plus the server-side guard in rules()) is what keeps a form save from
+    silently discarding them."""
     if not isinstance(rule, dict):
         return False
     if rule.get("window") is not None or rule.get("hysteresis") is not None:
+        return False
+    if str(rule.get("manual", "auto")).strip().lower() not in ("", "auto"):
+        return False
+    if not _actions_round_trip_safe(rule.get("actions")):
         return False
     when = rule.get("when")
     if not isinstance(when, dict):
@@ -2916,6 +3022,22 @@ def _rule_is_flat(rule):
         return (isinstance(group, list) and bool(group)
                 and all(_leaf_is_simple(c) for c in group))
     return _leaf_is_simple(when)
+
+
+def _actions_round_trip_safe(actions):
+    """False if any action carries a field the form builder can't represent
+    (webhook headers, or an explicit retain: false that the builder would
+    silently turn back into the default). Such rules are YAML-editor only."""
+    for a in (actions or []):
+        if not isinstance(a, dict):
+            continue
+        wh = a.get("webhook")
+        if isinstance(wh, dict) and wh.get("headers") is not None:
+            return False
+        mq = a.get("mqtt")
+        if isinstance(mq, dict) and mq.get("retain") is False:
+            return False
+    return True
 
 
 def _leaf_is_simple(c):

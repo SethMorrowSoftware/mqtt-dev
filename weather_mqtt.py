@@ -65,7 +65,12 @@ def _atomic_write(path, text, fsync=True):
     """Write `text` to `path` atomically: temp file + os.replace so a reader never
     sees a partial file. With fsync (the default for durable state) the data is
     flushed to disk before the rename, so a power loss can't leave a zero-length
-    or stale file behind the successful rename. Raises on failure."""
+    or stale file behind the successful rename. Raises on failure.
+
+    Preserves the destination's existing permissions across the replace. Without
+    this, os.replace would give `path` the temp file's umask-default mode
+    (typically 0644) -- silently widening a config.yaml the installer locked to
+    0600, exposing stored passwords/tokens to any local user."""
     path = Path(path)
     tmp = Path(str(path) + ".tmp")
     with open(tmp, "w") as f:
@@ -73,6 +78,15 @@ def _atomic_write(path, text, fsync=True):
         f.flush()
         if fsync:
             os.fsync(f.fileno())
+    try:
+        mode = os.stat(path).st_mode  # existing file: keep its permissions
+    except OSError:
+        mode = None
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode & 0o7777)
+        except OSError:
+            pass
     tmp.replace(path)
 
 # Words in NWS present-weather / textDescription that mean "it's precipitating".
@@ -1222,7 +1236,7 @@ def fetch_conditions(loc, user_agent, lookback_hours):
         "is_raining": None,                  # bool: precipitating right now
         "humidity": None,                    # %
         "short_forecast": "",
-        "active_alerts": [],                 # list of NWS event names
+        "active_alerts": None,               # list of NWS event names; None = fetch failed (hold)
     }
 
     # --- Hourly forecast: US units, includes forecast precip probability ---
@@ -1352,7 +1366,11 @@ def _eval_base(cond, metrics, rule_name, state, specs=None):
 
     # Special metric: active NWS alerts
     if metric == "active_alert":
-        alerts = metrics.get("active_alerts", [])
+        alerts = metrics.get("active_alerts")
+        if alerts is None:
+            # Alerts fetch failed this cycle -> unavailable, hold last state
+            # (don't read "no alerts" during an outage and clear a warning rule).
+            return None
         if op in (None, "any"):
             return len(alerts) > 0
         if op == "contains":
@@ -2744,6 +2762,10 @@ def main():
                          "value": var_values.get(n)} for n in declared_vars]
             snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual,
                                       var_rows)
+            # Poll cadence so the dashboard can tell "live" from "stale" (a
+            # frozen snapshot that stopped updating) rather than showing an old
+            # state as current.
+            snapshot["poll_interval_minutes"] = cfg["poll_interval_minutes"]
             # Surface weather freshness so the dashboard can show "data is N min
             # old" rather than always looking current (the snapshot's `updated`
             # is just when it was built, not when the weather was last fetched).
