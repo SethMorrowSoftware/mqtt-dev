@@ -896,22 +896,33 @@ def validate_config(cfg):
     web["port"] = _clamp_port(_as_number(web.get("port", 8080), 8080, "web.port"))
     web.setdefault("username", "")     # blank = no auth (use only on trusted LAN)
     web.setdefault("password", "")
+    # Opt-in escape hatch: allow the privileged control surfaces (manual control +
+    # MQTT publish) WITHOUT a web login. Off by default (fail closed). Intended for
+    # a trusted/isolated LAN -- with it on, anyone who can reach the page can drive
+    # MQTT, exactly like an anonymous broker (mosquitto's allow_anonymous).
+    web.setdefault("allow_anonymous_control", False)
+    web["allow_anonymous_control"] = bool(web["allow_anonymous_control"])
+    _has_login = bool(str(web.get("username") or "") and str(web.get("password") or ""))
+    _may_control = _has_login or web["allow_anonymous_control"]
     # Manual on/off control of devices from the dashboard. Default off so the UI
     # stays display-only exactly like today. Fail closed: enabling it requires a
-    # web login (username AND password), else it is forced back off with a warning.
+    # web login (username AND password) OR allow_anonymous_control, else it is
+    # forced back off with a warning.
     amc = bool(web.get("allow_manual_control", False))
-    if amc and not (str(web.get("username") or "") and str(web.get("password") or "")):
+    if amc and not _may_control:
         LOG.warning("web.allow_manual_control requires a web login (username + "
-                    "password); disabling manual control until one is set")
+                    "password) or web.allow_anonymous_control: true; disabling "
+                    "manual control until one is set")
         amc = False
     web["allow_manual_control"] = amc
-    # Arbitrary MQTT publishing from the web UI's console. Same fail-closed
-    # posture as manual control: off by default, and enabling it requires a web
-    # login so the publish surface is always authenticated.
+    # Arbitrary MQTT publishing from the web UI's console. Same posture as manual
+    # control: off by default, and enabling it requires a web login OR
+    # allow_anonymous_control.
     amp = bool(web.get("allow_mqtt_publish", False))
-    if amp and not (str(web.get("username") or "") and str(web.get("password") or "")):
+    if amp and not _may_control:
         LOG.warning("web.allow_mqtt_publish requires a web login (username + "
-                    "password); disabling MQTT publishing until one is set")
+                    "password) or web.allow_anonymous_control: true; disabling "
+                    "MQTT publishing until one is set")
         amp = False
     web["allow_mqtt_publish"] = amp
     # Web UI's live MQTT console (subscribe + buffer). Display-only; independent

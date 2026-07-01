@@ -370,6 +370,15 @@ def _auth_ok():
     return _ct_eq(auth.username, user) and _ct_eq(auth.password, pw)
 
 
+def _may_control(web):
+    """True when the privileged control surfaces (manual control / MQTT publish)
+    are allowed to act: a web login is configured, OR anonymous control is
+    explicitly opted in (web.allow_anonymous_control) for a trusted LAN. The
+    cross-origin guard still applies, so this never opens a CSRF hole."""
+    has_login = bool(str(web.get("username") or "") and str(web.get("password") or ""))
+    return has_login or bool(web.get("allow_anonymous_control", False))
+
+
 def require_auth(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
@@ -822,10 +831,9 @@ def api_control():
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
     user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_manual_control", False)) and user and pw):
-        return jsonify({"error": "manual control is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_manual_control", False)) and _may_control(web)):
+        return jsonify({"error": "manual control is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
 
     data = request.get_json(silent=True) or request.form
     device = str(data.get("device", "")).strip()
@@ -860,10 +868,9 @@ def api_variable():
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
     user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_manual_control", False)) and user and pw):
-        return jsonify({"error": "manual control is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_manual_control", False)) and _may_control(web)):
+        return jsonify({"error": "manual control is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
     try:
         declared = core._validate_variables(cfg.get("variables") or {})
     except Exception:
@@ -1034,7 +1041,7 @@ def api_mqtt():
     want_topics = request.args.get("topics") == "1"
     out = {"enabled": bool(web.get("mqtt_console_enabled", True)),
            "can_publish": bool(web.get("allow_mqtt_publish", False)
-                               and web.get("username") and web.get("password")),
+                               and _may_control(web)),
            "stats": console.stats(),
            "messages": console.messages(since=since, topic=topic, limit=limit)}
     if want_topics:
@@ -1053,10 +1060,9 @@ def api_mqtt_publish():
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
     user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_mqtt_publish", False)) and user and pw):
-        return jsonify({"error": "MQTT publishing is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_mqtt_publish", False)) and _may_control(web)):
+        return jsonify({"error": "MQTT publishing is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
     data = request.get_json(silent=True) or request.form
     topic = str(data.get("topic", "")).strip()
     payload = data.get("payload", "")
@@ -1770,9 +1776,20 @@ SETTINGS = """
         <option value="true" {{ 'selected' if c.web.allow_mqtt_publish }}>on (requires a login)</option>
       </select></div>
   </div>
-  <p class="muted">Manual control lets an authenticated operator force a device ON/OFF from the
+  <div class="row">
+    <div><label>Anonymous control <span class="hint">(let the two controls above work with NO login — trusted LAN only)</span></label>
+      <select name="web_allow_anonymous_control">
+        <option value="false" {{ 'selected' if not c.web.allow_anonymous_control }}>off (a login is required)</option>
+        <option value="true" {{ 'selected' if c.web.allow_anonymous_control }}>on (open — trusted/isolated LAN only)</option>
+      </select></div>
+    <div></div>
+  </div>
+  <p class="muted">Manual control lets an operator force a device ON/OFF from the
    dashboard (LAN-only, audited). <b>Allow MQTT publishing</b> lets the MQTT console send arbitrary
-   messages to the broker. Both require a login to be set; the remote status page stays read-only.</p>
+   messages to the broker. Both normally require a login; the remote status page stays read-only.
+   <b>Anonymous control</b> is the escape hatch for a trusted, isolated network — with it on you can
+   enable the two controls above <i>without</i> a login, but then <b>anyone who can reach the page can
+   drive MQTT</b> (like an anonymous broker). Leave it off unless the network is fully trusted.</p>
   <p class="muted">⚠ Changing <b>location</b>, the <b>MQTT connection</b> (host/port/credentials/client id),
    or any <b>web interface</b> setting needs a restart of the corresponding service.
    Thresholds, lookback, poll interval, QoS, retain, status topic and rules apply on the next poll automatically.</p>
@@ -1912,15 +1929,23 @@ def settings():
             if web["username"] and not str(web.get("password") or ""):
                 raise ValueError("set a login password too (or clear the username "
                                  "to disable the login)")
+            # Trusted-LAN escape hatch: allow the privileged controls without a
+            # login. When it's on, the login requirement below is relaxed.
+            anon = f.get("web_allow_anonymous_control") == "true"
+            web["allow_anonymous_control"] = anon
+            _has_login = bool(str(web.get("username") or "") and str(web.get("password") or ""))
+            _may_ctl = _has_login or anon
             amc = f.get("web_allow_manual_control") == "true"
-            if amc and not (str(web.get("username") or "") and str(web.get("password") or "")):
+            if amc and not _may_ctl:
                 raise ValueError("manual device control needs a web login "
-                                 "(set a username and password first)")
+                                 "(set a username and password), or enable "
+                                 "anonymous control for a trusted LAN")
             web["allow_manual_control"] = amc
             amp = f.get("web_allow_mqtt_publish") == "true"
-            if amp and not (str(web.get("username") or "") and str(web.get("password") or "")):
+            if amp and not _may_ctl:
                 raise ValueError("MQTT publishing needs a web login "
-                                 "(set a username and password first)")
+                                 "(set a username and password), or enable "
+                                 "anonymous control for a trusted LAN")
             web["allow_mqtt_publish"] = amp
 
             histd = cfg.setdefault("history", {})
@@ -1957,6 +1982,7 @@ def settings():
     webd.setdefault("password", "")
     webd.setdefault("allow_manual_control", False)
     webd.setdefault("allow_mqtt_publish", False)
+    webd.setdefault("allow_anonymous_control", False)
     sld = cfg.setdefault("slack", {})
     sld.setdefault("enabled", False)
     sld.setdefault("channel", "")
