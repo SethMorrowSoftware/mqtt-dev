@@ -321,6 +321,14 @@ def _auth_ok():
             and hmac.compare_digest(auth.password, pw))
 
 
+def _may_control(web):
+    """True when the privileged control surfaces (manual control / MQTT publish)
+    are allowed to act: a web login is configured, OR anonymous control is
+    explicitly opted in (web.allow_anonymous_control) for a trusted LAN."""
+    has_login = bool(str(web.get("username") or "") and str(web.get("password") or ""))
+    return has_login or bool(web.get("allow_anonymous_control", False))
+
+
 def require_auth(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
@@ -751,10 +759,9 @@ def api_control():
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
     user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_manual_control", False)) and user and pw):
-        return jsonify({"error": "manual control is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_manual_control", False)) and _may_control(web)):
+        return jsonify({"error": "manual control is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
 
     data = request.get_json(silent=True) or request.form
     device = str(data.get("device", "")).strip()
@@ -787,11 +794,9 @@ def api_variable():
     except Exception as e:
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
-    user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_manual_control", False)) and user and pw):
-        return jsonify({"error": "manual control is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_manual_control", False)) and _may_control(web)):
+        return jsonify({"error": "manual control is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
     try:
         declared = core._validate_variables(cfg.get("variables") or {})
     except Exception:
@@ -808,7 +813,8 @@ def api_variable():
     auth = request.authorization
     core.audit(cfg.get("audit_file", "audit.log"), variable=name,
                action="variable_set", value=coerced,
-               by=(auth.username if auth and auth.username else user or "local"))
+               by=(auth.username if auth and auth.username
+                   else (str(web.get("username") or "") or "local")))
     return jsonify({"ok": True, "variable": name, "value": coerced})
 
 
@@ -961,7 +967,7 @@ def api_mqtt():
     want_topics = request.args.get("topics") == "1"
     out = {"enabled": bool(web.get("mqtt_console_enabled", True)),
            "can_publish": bool(web.get("allow_mqtt_publish", False)
-                               and web.get("username") and web.get("password")),
+                               and _may_control(web)),
            "stats": console.stats(),
            "messages": console.messages(since=since, topic=topic, limit=limit)}
     if want_topics:
@@ -979,11 +985,9 @@ def api_mqtt_publish():
     except Exception as e:
         return jsonify({"error": f"config unreadable: {e}"}), 500
     web = cfg.get("web", {}) or {}
-    user = str(web.get("username") or "")
-    pw = str(web.get("password") or "")
-    if not (bool(web.get("allow_mqtt_publish", False)) and user and pw):
-        return jsonify({"error": "MQTT publishing is disabled "
-                        "(enable it and set a web login in Settings)"}), 403
+    if not (bool(web.get("allow_mqtt_publish", False)) and _may_control(web)):
+        return jsonify({"error": "MQTT publishing is disabled (enable it and set a "
+                        "web login, or web.allow_anonymous_control, in Settings)"}), 403
     data = request.get_json(silent=True) or request.form
     topic = str(data.get("topic", "")).strip()
     payload = data.get("payload", "")
@@ -1003,7 +1007,8 @@ def api_mqtt_publish():
     auth = request.authorization
     core.audit(cfg.get("audit_file", "audit.log"), action="mqtt_publish",
                topic=topic, qos=qos, retain=retain,
-               by=(auth.username if auth and auth.username else user or "local"))
+               by=(auth.username if auth and auth.username
+                   else (str(web.get("username") or "") or "local")))
     return jsonify({"ok": True, "topic": topic, "qos": qos, "retain": retain})
 
 

@@ -396,6 +396,10 @@ def test_validate_manual_control_gating_and_manual_field():
     cfg2 = w.validate_config(_min_cfg(
         web={"allow_manual_control": True, "username": "a", "password": "b"}))
     assert cfg2["web"]["allow_manual_control"] is True
+    # allow_anonymous_control also keeps it on WITHOUT a login (trusted-LAN opt-in)
+    cfg_anon = w.validate_config(_min_cfg(
+        web={"allow_manual_control": True, "allow_anonymous_control": True}))
+    assert cfg_anon["web"]["allow_manual_control"] is True
     # per-rule manual coerces/validates; defaults to auto
     assert cfg["rules"][0]["manual"] == "auto"
     cfg3 = w.validate_config(_min_cfg(rules=[{
@@ -1229,6 +1233,59 @@ def test_allow_mqtt_publish_requires_login():
     # with a login it sticks
     cfg2 = dict(cfg); cfg2["web"] = {"allow_mqtt_publish": True, "username": "a", "password": "b"}
     assert w.validate_config(cfg2)["web"]["allow_mqtt_publish"] is True
+    # allow_anonymous_control unlocks it without a login (trusted-LAN opt-in)
+    cfg3 = dict(cfg); cfg3["web"] = {"allow_mqtt_publish": True, "allow_anonymous_control": True}
+    assert w.validate_config(cfg3)["web"]["allow_mqtt_publish"] is True
+
+
+def test_webui_anonymous_control_no_login():
+    # web.allow_anonymous_control lets manual control / publish work with NO login
+    # (open UI on a trusted LAN). Verifies publish succeeds without any auth header.
+    try:
+        import webui
+    except Exception as e:
+        print(f"  SKIP  test_webui_anonymous_control_no_login ({e})")
+        return
+    import tempfile, os, yaml
+    p = tempfile.mktemp(suffix=".yaml"); aud = tempfile.mktemp(suffix=".log")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "web": {"enabled": True, "host": "0.0.0.0", "port": 8080,
+                   "username": "", "password": "",
+                   "allow_mqtt_publish": True, "allow_anonymous_control": True},
+           "audit_file": aud,
+           "rules": [{"name": "r", "topic": "t", "on_match": "1",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    webui.console = webui.MqttConsole()
+    c = webui.app.test_client()
+
+    class _Info: rc = 0
+    class _Fake:
+        def publish(self, *a, **k): return _Info()
+    try:
+        # no auth header at all: UI open, publish allowed via anonymous control
+        assert c.get("/mqtt").status_code == 200
+        assert c.get("/api/mqtt").get_json()["can_publish"] is True
+        webui.console._client = _Fake(); webui.console._connected = True
+        r = c.post("/api/mqtt/publish",
+                   json={"topic": "facility/cmd", "payload": "ON", "qos": 0})
+        assert r.status_code == 200 and r.get_json()["ok"] is True
+        # sanity: with anonymous control OFF and still no login -> back to 403
+        cfg["web"]["allow_anonymous_control"] = False
+        open(p, "w").write(yaml.safe_dump(cfg))
+        assert c.post("/api/mqtt/publish",
+                      json={"topic": "facility/cmd", "payload": "ON"}).status_code == 403
+        assert c.get("/api/mqtt").get_json()["can_publish"] is False
+    finally:
+        for f in (p, aud):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
 
 
 def test_webui_activity_page_and_audit_api():
