@@ -2392,6 +2392,33 @@ def test_mqtt_config_defaults_availability_and_tls():
     assert cfg2["mqtt"]["tls"]["enabled"] is True
 
 
+def test_reload_config_keeps_last_good_on_invalid():
+    # Documented fail-safe: a mid-run edit that breaks config.yaml must not take
+    # the monitor down -- it keeps the last-good config.
+    import tempfile, os
+    good = _min_cfg()
+    prev = w.validate_config(dict(good, poll_interval_minutes=7,
+                                  precipitation={"lookback_hours": 12}))
+    p = tempfile.mktemp(suffix=".yaml")
+    try:
+        # syntactically broken YAML -> previous returned unchanged
+        open(p, "w").write("rules: [::: not yaml")
+        cfg, ok = w.reload_config_or_keep(p, prev)
+        assert ok is False and cfg is prev
+        # schema-invalid (validate_config raises) -> previous kept
+        import yaml
+        open(p, "w").write(yaml.safe_dump({"version": 1, "rules": []}))
+        cfg, ok = w.reload_config_or_keep(p, prev)
+        assert ok is False and cfg is prev
+        # a valid file -> the new config is applied
+        open(p, "w").write(yaml.safe_dump(_min_cfg(poll_interval_minutes=9)))
+        cfg, ok = w.reload_config_or_keep(p, prev)
+        assert ok is True and cfg["poll_interval_minutes"] == 9
+    finally:
+        try: os.unlink(p)
+        except OSError: pass
+
+
 def test_read_history_time_window_filters():
     # Unambiguous offsets well clear of the 1h boundary, so the window filter is
     # actually exercised (not a vacuous <= assertion).

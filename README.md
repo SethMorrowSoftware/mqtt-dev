@@ -277,7 +277,8 @@ weather):
   `config.yaml`, so editing rules never wipes an override.
 - Every manual change and every automatic state change is appended to an
   **audit log** (`audit.log`) with a timestamp and the acting user, and is shown
-  in the web UI's **Activity** page in plain language (newest first).
+  in the web UI's **Activity** page in plain language (newest first). The log
+  rotates at ~5 MB (one `.1` backup) so it can't grow without bound.
 - The remote status page stays **strictly read-only** — it can never issue a
   command; it only shows a "manual" indicator when a device is overridden.
 
@@ -656,8 +657,9 @@ your PLCs expect — `INHIBIT`, `1`, `STOP`, or even a JSON string.
 
 Runtime files the monitor/UI create next to the install (git-ignored): the
 `weather_state.json` snapshot, `nws_location_cache.json`, `overrides.json`
-(manual device overrides), `variables.json` (operator variables), and
-`audit.log` (manual + automatic state-change trail).
+(manual device overrides), `variables.json` (operator variables), `audit.log`
+(manual + automatic state-change trail), `engine_state.json` (persisted
+hysteresis/`for:`/`changed` history), and `history.db` (metric trends).
 
 ## Development & tests
 
@@ -668,7 +670,13 @@ python test_weather_mqtt.py          # offline test suite, no network required
 CI (GitHub Actions, `.github/workflows/tests.yml`) runs the suite on Python
 3.9–3.12 on every push/PR, plus an **`install-smoke`** job that runs the real
 `install.sh` on a clean Ubuntu VM and verifies Mosquitto and both services come
-up, the dashboard responds, and the broker round-trips a message.
+up, the dashboard responds, and the broker round-trips a message — then
+**re-runs `install.sh`** over the live install to prove it's idempotent (config
+byte-for-byte unchanged, services still healthy).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
 
 ## Notes & tips
 

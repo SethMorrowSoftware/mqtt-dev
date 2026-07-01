@@ -1009,6 +1009,19 @@ def load_config(path):
     return validate_config(cfg)
 
 
+def reload_config_or_keep(path, previous):
+    """Reload config for a hot cycle, returning `previous` unchanged if the file
+    is now unreadable/invalid (bad YAML or failing validation). This is the
+    documented fail-safe: a mid-run edit that breaks config.yaml must not take
+    the monitor down -- it keeps running on the last-good config. Returns
+    (cfg, ok)."""
+    try:
+        return load_config(path), True
+    except Exception as e:
+        LOG.error("Config reload failed, keeping previous: %s", e)
+        return previous, False
+
+
 # ---------------------------------------------------------------------------
 # NWS / weather.gov client
 # ---------------------------------------------------------------------------
@@ -2550,10 +2563,7 @@ def main():
         # Reload config each cycle so web-UI edits to rules / thresholds /
         # interval take effect without a restart. Location & MQTT connection
         # are fixed at startup (changing those needs a restart).
-        try:
-            cfg = load_config(args.config)
-        except Exception as e:
-            LOG.error("Config reload failed, keeping previous: %s", e)
+        cfg, _cfg_ok = reload_config_or_keep(args.config, cfg)
         lookback = cfg["precipitation"]["lookback_hours"]
         interval = max(MIN_POLL_MINUTES, cfg["poll_interval_minutes"]) * 60
         rules = cfg["rules"]
