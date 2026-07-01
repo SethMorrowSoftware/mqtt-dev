@@ -71,6 +71,28 @@ jobs:
           echo "dashboard /healthz did not respond in time"
           exit 1
 
+      # The installer's core promise: re-running over a live install keeps the
+      # config byte-for-byte and leaves everything running (on the new code).
+      - name: Re-run install.sh over the live install (idempotency)
+        run: |
+          sudo md5sum /opt/weather-mqtt/config.yaml | sudo tee /tmp/cfg.md5
+          sudo SETUP_MOSQUITTO=1 ./install.sh
+          sudo md5sum -c /tmp/cfg.md5 || { echo "re-install changed config.yaml"; exit 1; }
+
+      - name: Services still healthy after the re-install
+        run: |
+          systemctl is-active --quiet mosquitto       || { echo "mosquitto not active"; exit 1; }
+          systemctl is-active --quiet weather-mqtt     || { echo "weather-mqtt not active"; exit 1; }
+          systemctl is-active --quiet weather-webui    || { echo "weather-webui not active"; exit 1; }
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:8080/healthz -o /tmp/healthz2.json; then
+              cat /tmp/healthz2.json; echo; exit 0
+            fi
+            sleep 2
+          done
+          echo "dashboard /healthz did not respond after re-install"
+          exit 1
+
       - name: Diagnostics on failure
         if: failure()
         run: |

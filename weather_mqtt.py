@@ -65,7 +65,12 @@ def _atomic_write(path, text, fsync=True):
     """Write `text` to `path` atomically: temp file + os.replace so a reader never
     sees a partial file. With fsync (the default for durable state) the data is
     flushed to disk before the rename, so a power loss can't leave a zero-length
-    or stale file behind the successful rename. Raises on failure."""
+    or stale file behind the successful rename. Raises on failure.
+
+    Preserves the destination's existing permissions across the replace. Without
+    this, os.replace would give `path` the temp file's umask-default mode
+    (typically 0644) -- silently widening a config.yaml the installer locked to
+    0600, exposing stored passwords/tokens to any local user."""
     path = Path(path)
     tmp = Path(str(path) + ".tmp")
     with open(tmp, "w") as f:
@@ -73,6 +78,15 @@ def _atomic_write(path, text, fsync=True):
         f.flush()
         if fsync:
             os.fsync(f.fileno())
+    try:
+        mode = os.stat(path).st_mode  # existing file: keep its permissions
+    except OSError:
+        mode = None
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode & 0o7777)
+        except OSError:
+            pass
     tmp.replace(path)
 
 # Words in NWS present-weather / textDescription that mean "it's precipitating".
@@ -188,6 +202,18 @@ def _validate_condition(cond, rule_name, specs=METRIC_SPECS):
         # Normalize to a real number; the engine then never compares against a
         # string (e.g. value: "5" in YAML), which would raise and hold the rule.
         cond["value"] = num
+    elif spec["type"] == "bool" and not isinstance(value, bool):
+        # Normalize a quoted YAML bool (value: "true") to a real bool; the
+        # string would otherwise compare unequal to True/False forever without
+        # any error -- a rule that silently never fires.
+        low = str(value).strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            cond["value"] = True
+        elif low in ("false", "0", "no", "off"):
+            cond["value"] = False
+        else:
+            raise ValueError(f"rule '{rule_name}': '{metric}' value {value!r} "
+                             "must be true or false")
 
 
 def _validate_between_value(value, metric, rule_name):
@@ -690,15 +716,24 @@ CURRENT_SCHEMA_VERSION = 1
 
 
 def _as_number(value, default, name):
-    """Coerce a YAML scalar to int/float, falling back to default with a warn."""
+    """Coerce a YAML scalar to int/float, falling back to default with a warn.
+    NaN/Infinity are rejected too: a sensor payload of "nan" must read as
+    unavailable (hold last state), not poison every comparison downstream."""
     if isinstance(value, bool):  # bool is a subclass of int; reject it explicitly
         LOG.warning("%s=%r is not a number; using %r", name, value, default)
+        return default
+    if isinstance(value, float) and not math.isfinite(value):
+        LOG.warning("%s=%r is not a finite number; using %r", name, value, default)
         return default
     if isinstance(value, (int, float)):
         return value
     try:
         s = str(value).strip()
-        return int(s) if s.lstrip("-").isdigit() else float(s)
+        num = int(s) if s.lstrip("-").isdigit() else float(s)
+        if isinstance(num, float) and not math.isfinite(num):
+            LOG.warning("%s=%r is not a finite number; using %r", name, value, default)
+            return default
+        return num
     except (TypeError, ValueError):
         LOG.warning("%s=%r is not a number; using %r", name, value, default)
         return default
@@ -974,6 +1009,19 @@ def load_config(path):
     return validate_config(cfg)
 
 
+def reload_config_or_keep(path, previous):
+    """Reload config for a hot cycle, returning `previous` unchanged if the file
+    is now unreadable/invalid (bad YAML or failing validation). This is the
+    documented fail-safe: a mid-run edit that breaks config.yaml must not take
+    the monitor down -- it keeps running on the last-good config. Returns
+    (cfg, ok)."""
+    try:
+        return load_config(path), True
+    except Exception as e:
+        LOG.error("Config reload failed, keeping previous: %s", e)
+        return previous, False
+
+
 # ---------------------------------------------------------------------------
 # NWS / weather.gov client
 # ---------------------------------------------------------------------------
@@ -1201,7 +1249,7 @@ def fetch_conditions(loc, user_agent, lookback_hours):
         "is_raining": None,                  # bool: precipitating right now
         "humidity": None,                    # %
         "short_forecast": "",
-        "active_alerts": [],                 # list of NWS event names
+        "active_alerts": None,               # list of NWS event names; None = fetch failed (hold)
     }
 
     # --- Hourly forecast: US units, includes forecast precip probability ---
@@ -1288,7 +1336,7 @@ def _regex_search(pattern, text):
         return False
 
 
-def _eval_condition(cond, metrics, rule_name, state=None, now=None):
+def _eval_condition(cond, metrics, rule_name, state=None, now=None, specs=None):
     """One condition: True/False, or None if its metric is unavailable.
 
     Two history-dependent constructs need the per-cycle `state`/`now`:
@@ -1296,7 +1344,7 @@ def _eval_condition(cond, metrics, rule_name, state=None, now=None):
       - a `for: <duration>` modifier -> the base condition must hold continuously
         for that long before it counts as True.
     """
-    base = _eval_base(cond, metrics, rule_name, state)
+    base = _eval_base(cond, metrics, rule_name, state, specs)
     dur = cond.get("for")
     if dur is not None and state is not None and now is not None:
         base = _apply_for(base, _cond_key(rule_name, cond),
@@ -1304,8 +1352,13 @@ def _eval_condition(cond, metrics, rule_name, state=None, now=None):
     return base
 
 
-def _eval_base(cond, metrics, rule_name, state):
-    """The condition's value before any `for:` sustain gate is applied."""
+def _eval_base(cond, metrics, rule_name, state, specs=None):
+    """The condition's value before any `for:` sustain gate is applied.
+
+    `specs` is the active metric catalogue (metric_catalogue(cfg)); without it
+    only the built-in METRIC_SPECS are known, so dynamic text metrics (mqtt_in
+    parse: string / http type: string) would fall through to the numeric path
+    and never evaluate."""
     metric = cond["metric"]
     op = cond.get("operator")
     value = cond.get("value")
@@ -1314,32 +1367,47 @@ def _eval_base(cond, metrics, rule_name, state):
     if op == "changed":
         if state is None:
             return None
-        cur = metrics.get(metric)
+        # active_alert's value lives under the plural key in the metric dict.
+        key = "active_alerts" if metric == "active_alert" else metric
+        cur = metrics.get(key)
         if cur is None:
             return None
-        prev = state.prev_metrics.get(metric, _UNSET)
+        prev = state.prev_metrics.get(key, _UNSET)
         if prev is _UNSET:
             return False          # first observation -> nothing to compare to yet
         return cur != prev
 
     # Special metric: active NWS alerts
     if metric == "active_alert":
-        alerts = metrics.get("active_alerts", [])
+        alerts = metrics.get("active_alerts")
+        if alerts is None:
+            # Alerts fetch failed this cycle -> unavailable, hold last state
+            # (don't read "no alerts" during an outage and clear a warning rule).
+            return None
         if op in (None, "any"):
             return len(alerts) > 0
         if op == "contains":
             return any(str(value).lower() in a.lower() for a in alerts)
         if op == "equals":
-            return any(a == value for a in alerts)
+            # case-insensitive like every other text/alert comparison
+            return any(a.lower() == str(value).lower() for a in alerts)
         if op == "regex":
             return any(_regex_search(value, a) for a in alerts)
         LOG.warning("Rule '%s': unknown alert operator '%s'", rule_name, op)
         return False
 
-    # Text metrics (short_forecast, time_weekday, ...): case-insensitive ops.
-    spec = METRIC_SPECS.get(metric)
+    # Text metrics (short_forecast, time_weekday, dynamic string inputs, ...):
+    # case-insensitive ops.
+    spec = (specs or METRIC_SPECS).get(metric) or METRIC_SPECS.get(metric)
     if spec and spec["type"] == "text":
-        text = str(metrics.get(metric, "") or "")
+        raw = metrics.get(metric)
+        if raw is None and metric not in METRIC_SPECS:
+            # A dynamic string input with no reading yet is unavailable ->
+            # hold last state (built-in text metrics always carry "" at least).
+            LOG.warning("Rule '%s': metric '%s' unavailable this cycle",
+                        rule_name, metric)
+            return None
+        text = str(raw or "")
         if op == "contains":
             return str(value).lower() in text.lower()
         if op == "equals":
@@ -1387,7 +1455,8 @@ def _eval_base(cond, metrics, rule_name, state):
     return fn(current, value)
 
 
-def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
+def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0,
+               specs=None):
     """Recursively evaluate a `when` node with three-valued logic.
 
     Returns True, False, or None (a referenced metric was unavailable -> the
@@ -1400,7 +1469,7 @@ def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
         return None
     if isinstance(node, dict) and ("any" in node or "all" in node):
         mode = "any" if "any" in node else "all"
-        results = [_eval_node(c, metrics, rule_name, state, now, _depth + 1)
+        results = [_eval_node(c, metrics, rule_name, state, now, _depth + 1, specs)
                    for c in node[mode]]
         if mode == "any":
             if any(r is True for r in results):
@@ -1414,19 +1483,22 @@ def _eval_node(node, metrics, rule_name, state=None, now=None, _depth=0):
             return None
         return True
     if isinstance(node, dict) and "not" in node:
-        inner = _eval_node(node["not"], metrics, rule_name, state, now, _depth + 1)
+        inner = _eval_node(node["not"], metrics, rule_name, state, now,
+                           _depth + 1, specs)
         return None if inner is None else (not inner)
-    return _eval_condition(node, metrics, rule_name, state, now)
+    return _eval_condition(node, metrics, rule_name, state, now, specs)
 
 
-def evaluate_rule(rule, metrics, state=None, now=None):
+def evaluate_rule(rule, metrics, state=None, now=None, specs=None):
     """Evaluate a rule's `when` (single condition, or a nested any/all/not
     group). Returns True, False, or None (metric(s) unavailable).
 
     `state`/`now` are needed only by the history-dependent constructs
     (`changed` operator and `for:` sustain); without them those evaluate to
-    None/unsustained, so plain rules need no engine state."""
-    return _eval_node(rule["when"], metrics, rule["name"], state, now)
+    None/unsustained, so plain rules need no engine state. `specs` is the
+    active metric catalogue (metric_catalogue(cfg)); without it dynamic text
+    metrics can't be typed and their conditions read as unavailable."""
+    return _eval_node(rule["when"], metrics, rule["name"], state, now, 0, specs)
 
 
 # Sentinel distinguishing "metric never observed" from "observed value None".
@@ -1453,7 +1525,7 @@ def _cond_key(rule_name, cond):
     stale one)."""
     return "|".join(str(x) for x in (
         rule_name, cond.get("metric"), cond.get("operator"),
-        cond.get("value"), cond.get("for")))
+        cond.get("value"), cond.get("value_metric"), cond.get("for")))
 
 
 def _apply_for(base, key, dur, state, now):
@@ -1661,14 +1733,14 @@ def apply_hysteresis(hyst, prev, desired, last_change, now):
     return desired
 
 
-def resolve_desired(rule, metrics, now_local, state=None, now=None):
+def resolve_desired(rule, metrics, now_local, state=None, now=None, specs=None):
     """The rule's desired state after the time-window gate: outside the window
     the desired state is OFF; inside it is the evaluated `when` (True/False/
     None, where None means hold)."""
     win = rule.get("window")
     if win and not in_window(win, now_local):
         return False
-    return evaluate_rule(rule, metrics, state, now)
+    return evaluate_rule(rule, metrics, state, now, specs)
 
 
 def _parse_iso(s):
@@ -1822,9 +1894,20 @@ def variable_metrics(values):
     return {VAR_PREFIX + str(k): v for k, v in (values or {}).items()}
 
 
+_AUDIT_MAX_BYTES = 5_000_000   # rotate audit.log past ~5 MB (one .1 backup kept)
+
+
 def audit(path, **event):
-    """Append one JSON event to the audit log. Best-effort: never raises."""
+    """Append one JSON event to the audit log. Best-effort: never raises.
+    Rotates the file to <path>.1 once it grows past _AUDIT_MAX_BYTES, so a
+    chatty rule can't grow it without bound over a months-long runtime."""
     try:
+        p = Path(path)
+        try:
+            if p.exists() and p.stat().st_size > _AUDIT_MAX_BYTES:
+                p.replace(str(p) + ".1")
+        except OSError:
+            pass
         event.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
         with open(path, "a") as f:
             f.write(json.dumps(event, sort_keys=True) + "\n")
@@ -1834,10 +1917,20 @@ def audit(path, **event):
 
 def read_audit(path, limit=200):
     """Return the most recent audit events (newest first), up to `limit`.
-    Robust to a missing file or unparseable lines."""
+    Robust to a missing file or unparseable lines. Reaches into the rotated
+    backup (<path>.1) when the current file alone can't fill `limit`, so the
+    Activity page doesn't go near-empty right after a rotation."""
     try:
         lines = Path(path).read_text().splitlines()
     except Exception:
+        lines = []
+    if len(lines) < limit:
+        try:
+            prev = Path(str(path) + ".1").read_text().splitlines()
+            lines = prev[-(limit - len(lines)):] + lines
+        except Exception:
+            pass
+    if not lines:
         return []
     out = []
     for ln in lines[-limit:]:
@@ -2470,13 +2563,13 @@ def main():
         # Reload config each cycle so web-UI edits to rules / thresholds /
         # interval take effect without a restart. Location & MQTT connection
         # are fixed at startup (changing those needs a restart).
-        try:
-            cfg = load_config(args.config)
-        except Exception as e:
-            LOG.error("Config reload failed, keeping previous: %s", e)
+        cfg, _cfg_ok = reload_config_or_keep(args.config, cfg)
         lookback = cfg["precipitation"]["lookback_hours"]
         interval = max(MIN_POLL_MINUTES, cfg["poll_interval_minutes"]) * 60
         rules = cfg["rules"]
+        # Full metric catalogue (built-ins + variables + mqtt/http inputs +
+        # computed) so evaluation can type dynamic metrics (esp. string ones).
+        specs = metric_catalogue(cfg)
         state_file = cfg["state_file"]
         # Manual overrides are an overlay re-read each cycle (like config), so the
         # web UI's Auto/On/Off takes effect on the next poll without a restart.
@@ -2574,7 +2667,8 @@ def main():
                 elif manual in ("on", "off"):
                     result = (manual == "on")
                 else:
-                    desired = resolve_desired(rule, m, now_local, engine_state, now_utc)
+                    desired = resolve_desired(rule, m, now_local, engine_state,
+                                              now_utc, specs)
                     if desired is None:
                         result = None
                     else:
@@ -2613,21 +2707,40 @@ def main():
                                     LOG.info("Published '%s' -> %s (rule '%s', "
                                              "match=%s)", payload, topic,
                                              rule["name"], result)
-                            if commit and prev != result:
-                                last_change[rule["name"]] = now_utc.isoformat(
-                                    timespec="seconds")
-                                audit(audit_file, device=rule["name"],
-                                      state="on" if result else "off",
-                                      source="manual" if manual in ("on", "off")
-                                      else "auto", by="monitor")
-                        # Fire extra actions on a real transition (not on an
-                        # always_publish heartbeat). Independent of the built-in
-                        # publish; best-effort.
-                        if prev != result and rule.get("actions"):
-                            fire_actions(rule, result, m, client, qos, retain,
-                                         cfg.get("slack", {}), audit_file)
+                        # A committed transition updates last_change (so
+                        # hysteresis timers measure from the real switch, even
+                        # when there is no on_clear payload to publish), is
+                        # audited, and fires the extra actions. A FAILED publish
+                        # commits nothing -- the transition (and its actions)
+                        # retries next cycle instead of firing on a directive
+                        # the PLCs never received.
+                        if commit and prev != result:
+                            last_change[rule["name"]] = now_utc.isoformat(
+                                timespec="seconds")
+                            audit(audit_file, device=rule["name"],
+                                  state="on" if result else "off",
+                                  source="manual" if manual in ("on", "off")
+                                  else "auto", by="monitor")
+                            if rule.get("actions"):
+                                fire_actions(rule, result, m, client, qos, retain,
+                                             cfg.get("slack", {}), audit_file)
                     if commit:
                         last_state[rule["name"]] = result
+                elif enabled and republish and prev is not None and client is not None:
+                    # The rule is holding (metric gap) right after a (re)connect,
+                    # but the broker may have lost its retained copy -- re-assert
+                    # the last committed directive so a PLC that reconnects sees
+                    # it. Not a transition: no last_change/audit/actions.
+                    payload = rule["on_match"] if prev else rule.get("on_clear", "")
+                    if not (payload == "" and not prev):
+                        info = client.publish(rule["topic"], payload,
+                                              qos=qos, retain=retain)
+                        if getattr(info, "rc", 0) != mqtt.MQTT_ERR_SUCCESS:
+                            LOG.warning("Re-assert publish to %s returned rc=%s",
+                                        rule["topic"], getattr(info, "rc", "?"))
+                        else:
+                            LOG.info("Re-asserted '%s' -> %s (rule '%s', holding)",
+                                     payload, rule["topic"], rule["name"])
 
                 rule_rows.append({
                     "name": rule["name"],
@@ -2659,6 +2772,10 @@ def main():
                          "value": var_values.get(n)} for n in declared_vars]
             snapshot = build_snapshot(m, rule_rows, lookback, connected, allow_manual,
                                       var_rows)
+            # Poll cadence so the dashboard can tell "live" from "stale" (a
+            # frozen snapshot that stopped updating) rather than showing an old
+            # state as current.
+            snapshot["poll_interval_minutes"] = cfg["poll_interval_minutes"]
             # Surface weather freshness so the dashboard can show "data is N min
             # old" rather than always looking current (the snapshot's `updated`
             # is just when it was built, not when the weather was last fetched).
