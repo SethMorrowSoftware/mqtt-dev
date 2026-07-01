@@ -188,6 +188,18 @@ def _validate_condition(cond, rule_name, specs=METRIC_SPECS):
         # Normalize to a real number; the engine then never compares against a
         # string (e.g. value: "5" in YAML), which would raise and hold the rule.
         cond["value"] = num
+    elif spec["type"] == "bool" and not isinstance(value, bool):
+        # Normalize a quoted YAML bool (value: "true") to a real bool; the
+        # string would otherwise compare unequal to True/False forever without
+        # any error -- a rule that silently never fires.
+        low = str(value).strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            cond["value"] = True
+        elif low in ("false", "0", "no", "off"):
+            cond["value"] = False
+        else:
+            raise ValueError(f"rule '{rule_name}': '{metric}' value {value!r} "
+                             "must be true or false")
 
 
 def _validate_between_value(value, metric, rule_name):
@@ -690,15 +702,24 @@ CURRENT_SCHEMA_VERSION = 1
 
 
 def _as_number(value, default, name):
-    """Coerce a YAML scalar to int/float, falling back to default with a warn."""
+    """Coerce a YAML scalar to int/float, falling back to default with a warn.
+    NaN/Infinity are rejected too: a sensor payload of "nan" must read as
+    unavailable (hold last state), not poison every comparison downstream."""
     if isinstance(value, bool):  # bool is a subclass of int; reject it explicitly
         LOG.warning("%s=%r is not a number; using %r", name, value, default)
+        return default
+    if isinstance(value, float) and not math.isfinite(value):
+        LOG.warning("%s=%r is not a finite number; using %r", name, value, default)
         return default
     if isinstance(value, (int, float)):
         return value
     try:
         s = str(value).strip()
-        return int(s) if s.lstrip("-").isdigit() else float(s)
+        num = int(s) if s.lstrip("-").isdigit() else float(s)
+        if isinstance(num, float) and not math.isfinite(num):
+            LOG.warning("%s=%r is not a finite number; using %r", name, value, default)
+            return default
+        return num
     except (TypeError, ValueError):
         LOG.warning("%s=%r is not a number; using %r", name, value, default)
         return default
@@ -1319,10 +1340,12 @@ def _eval_base(cond, metrics, rule_name, state, specs=None):
     if op == "changed":
         if state is None:
             return None
-        cur = metrics.get(metric)
+        # active_alert's value lives under the plural key in the metric dict.
+        key = "active_alerts" if metric == "active_alert" else metric
+        cur = metrics.get(key)
         if cur is None:
             return None
-        prev = state.prev_metrics.get(metric, _UNSET)
+        prev = state.prev_metrics.get(key, _UNSET)
         if prev is _UNSET:
             return False          # first observation -> nothing to compare to yet
         return cur != prev
@@ -1335,7 +1358,8 @@ def _eval_base(cond, metrics, rule_name, state, specs=None):
         if op == "contains":
             return any(str(value).lower() in a.lower() for a in alerts)
         if op == "equals":
-            return any(a == value for a in alerts)
+            # case-insensitive like every other text/alert comparison
+            return any(a.lower() == str(value).lower() for a in alerts)
         if op == "regex":
             return any(_regex_search(value, a) for a in alerts)
         LOG.warning("Rule '%s': unknown alert operator '%s'", rule_name, op)
@@ -1470,7 +1494,7 @@ def _cond_key(rule_name, cond):
     stale one)."""
     return "|".join(str(x) for x in (
         rule_name, cond.get("metric"), cond.get("operator"),
-        cond.get("value"), cond.get("for")))
+        cond.get("value"), cond.get("value_metric"), cond.get("for")))
 
 
 def _apply_for(base, key, dur, state, now):
@@ -2655,21 +2679,40 @@ def main():
                                     LOG.info("Published '%s' -> %s (rule '%s', "
                                              "match=%s)", payload, topic,
                                              rule["name"], result)
-                            if commit and prev != result:
-                                last_change[rule["name"]] = now_utc.isoformat(
-                                    timespec="seconds")
-                                audit(audit_file, device=rule["name"],
-                                      state="on" if result else "off",
-                                      source="manual" if manual in ("on", "off")
-                                      else "auto", by="monitor")
-                        # Fire extra actions on a real transition (not on an
-                        # always_publish heartbeat). Independent of the built-in
-                        # publish; best-effort.
-                        if prev != result and rule.get("actions"):
-                            fire_actions(rule, result, m, client, qos, retain,
-                                         cfg.get("slack", {}), audit_file)
+                        # A committed transition updates last_change (so
+                        # hysteresis timers measure from the real switch, even
+                        # when there is no on_clear payload to publish), is
+                        # audited, and fires the extra actions. A FAILED publish
+                        # commits nothing -- the transition (and its actions)
+                        # retries next cycle instead of firing on a directive
+                        # the PLCs never received.
+                        if commit and prev != result:
+                            last_change[rule["name"]] = now_utc.isoformat(
+                                timespec="seconds")
+                            audit(audit_file, device=rule["name"],
+                                  state="on" if result else "off",
+                                  source="manual" if manual in ("on", "off")
+                                  else "auto", by="monitor")
+                            if rule.get("actions"):
+                                fire_actions(rule, result, m, client, qos, retain,
+                                             cfg.get("slack", {}), audit_file)
                     if commit:
                         last_state[rule["name"]] = result
+                elif enabled and republish and prev is not None and client is not None:
+                    # The rule is holding (metric gap) right after a (re)connect,
+                    # but the broker may have lost its retained copy -- re-assert
+                    # the last committed directive so a PLC that reconnects sees
+                    # it. Not a transition: no last_change/audit/actions.
+                    payload = rule["on_match"] if prev else rule.get("on_clear", "")
+                    if not (payload == "" and not prev):
+                        info = client.publish(rule["topic"], payload,
+                                              qos=qos, retain=retain)
+                        if getattr(info, "rc", 0) != mqtt.MQTT_ERR_SUCCESS:
+                            LOG.warning("Re-assert publish to %s returned rc=%s",
+                                        rule["topic"], getattr(info, "rc", "?"))
+                        else:
+                            LOG.info("Re-asserted '%s' -> %s (rule '%s', holding)",
+                                     payload, rule["topic"], rule["name"])
 
                 rule_rows.append({
                     "name": rule["name"],

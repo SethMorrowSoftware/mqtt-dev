@@ -2375,6 +2375,64 @@ def test_mqtt_config_defaults_availability_and_tls():
     assert cfg2["mqtt"]["tls"]["enabled"] is True
 
 
+def test_as_number_rejects_nan_and_inf():
+    # A sensor payload of "nan"/"inf" must read as unavailable (hold last
+    # state), not poison every downstream comparison/computed metric.
+    assert w._as_number("nan", None, "x") is None
+    assert w._as_number("inf", None, "x") is None
+    assert w._as_number("-inf", None, "x") is None
+    assert w._as_number(float("nan"), None, "x") is None
+    assert w.coerce_payload(b"NaN", "number") is None
+    assert w._as_number("5.5", None, "x") == 5.5      # real numbers still pass
+
+
+def test_bool_condition_value_normalized():
+    # A quoted YAML bool (value: "true") must normalize to a real bool instead
+    # of silently never matching.
+    cfg = w.validate_config(_min_cfg(rules=[{
+        "name": "r", "topic": "t", "on_match": "1",
+        "when": {"metric": "is_raining", "operator": "==", "value": "true"}}]))
+    assert cfg["rules"][0]["when"]["value"] is True
+    assert w.evaluate_rule(cfg["rules"][0], {"is_raining": True}) is True
+    try:
+        w.validate_config(_min_cfg(rules=[{
+            "name": "r", "topic": "t", "on_match": "1",
+            "when": {"metric": "is_raining", "operator": "==", "value": "maybe"}}]))
+        assert False, "garbage bool value should be rejected"
+    except ValueError:
+        pass
+
+
+def test_changed_operator_on_active_alert():
+    # README documents { metric: active_alert, operator: changed }; the value
+    # lives under the plural 'active_alerts' key in the metric context.
+    st = w.EngineState()
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+    rule = {"name": "r", "topic": "t", "on_match": "1",
+            "when": {"metric": "active_alert", "operator": "changed"}}
+    m1 = {"active_alerts": []}
+    assert w.evaluate_rule(rule, m1, st, now) is False   # first observation
+    st.observe(m1)
+    m2 = {"active_alerts": ["Flood Warning"]}
+    assert w.evaluate_rule(rule, m2, st, now) is True    # alert set changed
+    st.observe(m2)
+    assert w.evaluate_rule(rule, m2, st, now) is False   # stable again
+
+
+def test_alert_equals_case_insensitive():
+    rule = {"name": "r", "topic": "t", "on_match": "1",
+            "when": {"metric": "active_alert", "operator": "equals",
+                     "value": "flood warning"}}
+    assert w.evaluate_rule(rule, {"active_alerts": ["Flood Warning"]}) is True
+    assert w.evaluate_rule(rule, {"active_alerts": ["Heat Advisory"]}) is False
+
+
+def test_cond_key_distinguishes_value_metric():
+    a = {"metric": "m", "operator": ">", "value_metric": "x", "for": "10m"}
+    b = {"metric": "m", "operator": ">", "value_metric": "y", "for": "10m"}
+    assert w._cond_key("r", a) != w._cond_key("r", b)
+
+
 def test_audit_log_rotates_and_reads_backup():
     import tempfile, os
     path = tempfile.mktemp(suffix=".log")
