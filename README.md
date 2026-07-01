@@ -258,6 +258,14 @@ protected against cross-site request forgery: a POST whose `Origin` header
 names another site is rejected outright, so a malicious page can't ride the
 browser's remembered login to flip devices or publish MQTT.
 
+On a **trusted, isolated LAN** you can skip the login entirely and still use the
+privileged controls: set `web.allow_anonymous_control: true` (Settings → Web
+interface → Anonymous control) to let **manual control** and **MQTT publishing**
+work with no username/password — the same posture as an anonymous broker. It's
+off by default (fail-closed), and the cross-site guard still applies, so a remote
+page still can't drive it. With it on, **anyone who can reach the page can drive
+MQTT**, so only use it where the network itself is the security boundary.
+
 ## Manual control (opt-in)
 
 By default the dashboard is **display-only** — it shows state but issues no

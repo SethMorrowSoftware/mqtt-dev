@@ -416,6 +416,13 @@ def test_validate_manual_control_gating_and_manual_field():
     cfg2 = w.validate_config(_min_cfg(
         web={"allow_manual_control": True, "username": "a", "password": "b"}))
     assert cfg2["web"]["allow_manual_control"] is True
+    # allow_anonymous_control keeps it on WITHOUT a login (trusted-LAN opt-in)
+    cfg_anon = w.validate_config(_min_cfg(
+        web={"allow_manual_control": True, "allow_anonymous_control": True}))
+    assert cfg_anon["web"]["allow_manual_control"] is True
+    assert cfg_anon["web"]["allow_anonymous_control"] is True
+    # default stays off/fail-closed
+    assert cfg["web"]["allow_anonymous_control"] is False
     # per-rule manual coerces/validates; defaults to auto
     assert cfg["rules"][0]["manual"] == "auto"
     cfg3 = w.validate_config(_min_cfg(rules=[{
@@ -1242,6 +1249,113 @@ def test_allow_mqtt_publish_requires_login():
     # with a login it sticks
     cfg2 = dict(cfg); cfg2["web"] = {"allow_mqtt_publish": True, "username": "a", "password": "b"}
     assert w.validate_config(cfg2)["web"]["allow_mqtt_publish"] is True
+    # allow_anonymous_control unlocks it without a login (trusted-LAN opt-in)
+    cfg3 = dict(cfg); cfg3["web"] = {"allow_mqtt_publish": True, "allow_anonymous_control": True}
+    assert w.validate_config(cfg3)["web"]["allow_mqtt_publish"] is True
+
+
+def test_webui_anonymous_control_no_login():
+    # web.allow_anonymous_control lets manual control / publish work with NO
+    # login (open UI on a trusted LAN). Publish succeeds with no auth header;
+    # turning the flag off (still no login) returns to 403.
+    try:
+        import webui
+    except Exception as e:
+        raise _skip_if_optional(e)
+    import tempfile, os, yaml
+    p = tempfile.mktemp(suffix=".yaml"); aud = tempfile.mktemp(suffix=".log")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "poll_interval_minutes": 15,
+           "precipitation": {"lookback_hours": 24},
+           "mqtt": {"host": "localhost", "port": 1883, "qos": 1, "retain": True},
+           "web": {"enabled": True, "host": "0.0.0.0", "port": 8080,
+                   "username": "", "password": "",
+                   "allow_manual_control": True, "allow_mqtt_publish": True,
+                   "allow_anonymous_control": True},
+           "audit_file": aud,
+           "rules": [{"name": "pump", "topic": "t", "on_match": "1", "on_clear": "0",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    webui.console = webui.MqttConsole()
+    c = webui.app.test_client()
+
+    class _Info:
+        rc = 0
+    class _Fake:
+        def publish(self, *a, **k): return _Info()
+    try:
+        # no auth header at all: UI open, publish + manual control allowed
+        assert c.get("/mqtt").status_code == 200
+        assert c.get("/api/mqtt").get_json()["can_publish"] is True
+        webui.console._client = _Fake(); webui.console._connected = True
+        r = c.post("/api/mqtt/publish",
+                   json={"topic": "facility/cmd", "payload": "ON", "qos": 0})
+        assert r.status_code == 200 and r.get_json()["ok"] is True
+        # manual control endpoint also works with no login
+        r2 = c.post("/api/control", json={"device": "pump", "state": "on"})
+        assert r2.status_code == 200 and w.load_overrides(
+            cfg.get("overrides_file", "overrides.json")) == {"pump": "on"}
+        # the CSRF guard still applies even in anonymous mode
+        assert c.post("/api/mqtt/publish", json={"topic": "x", "payload": "y"},
+                      headers={"Origin": "http://evil.example"}).status_code == 403
+        # turn anonymous control OFF (still no login) -> back to 403 / can_publish false
+        cfg["web"]["allow_anonymous_control"] = False
+        open(p, "w").write(yaml.safe_dump(cfg))
+        assert c.post("/api/mqtt/publish",
+                      json={"topic": "facility/cmd", "payload": "ON"}).status_code == 403
+        assert c.get("/api/mqtt").get_json()["can_publish"] is False
+        assert c.post("/api/control", json={"device": "pump", "state": "off"}).status_code == 403
+    finally:
+        webui.console = webui.MqttConsole()
+        for f in (p, aud, "overrides.json"):
+            for s in ("", ".bak", ".tmp"):
+                try: os.unlink(f + s)
+                except OSError: pass
+
+
+def test_webui_settings_saves_anonymous_control(_tmp=None):
+    # The Settings form can enable anonymous control, and that relaxes the
+    # login requirement on manual control / publish.
+    try:
+        import webui
+    except Exception as e:
+        raise _skip_if_optional(e)
+    import tempfile, os, yaml
+    p = tempfile.mktemp(suffix=".yaml")
+    cfg = {"version": 1, "location": {"latitude": 41.0, "longitude": -74.0},
+           "user_agent": "x (a@b.com)", "mqtt": {"host": "localhost", "port": 1883},
+           "web": {"enabled": True},
+           "rules": [{"name": "r", "topic": "t", "on_match": "ON",
+                      "when": {"metric": "is_raining", "operator": "==", "value": True}}]}
+    open(p, "w").write(yaml.safe_dump(cfg))
+    webui.CONFIG_PATH = p
+    webui.app.config["TESTING"] = True
+    c = webui.app.test_client()
+    form = {"latitude": "41", "longitude": "-74", "user_agent": "x (a@b.com)",
+            "poll_interval_minutes": "15", "lookback_hours": "24",
+            "mqtt_host": "localhost", "mqtt_port": "1883", "mqtt_qos": "1",
+            "mqtt_retain": "true", "web_host": "0.0.0.0", "web_port": "8080",
+            "web_username": "", "web_password": "",
+            "web_allow_manual_control": "true", "web_allow_mqtt_publish": "true",
+            "web_allow_anonymous_control": "true"}
+    try:
+        # anonymous control on -> manual/publish accepted with no login
+        r = c.post("/settings", data=form, headers={"Origin": "http://localhost"})
+        assert b"Settings saved" in r.data, r.data
+        saved = yaml.safe_load(open(p))
+        assert saved["web"]["allow_anonymous_control"] is True
+        assert saved["web"]["allow_manual_control"] is True
+        assert saved["web"]["allow_mqtt_publish"] is True
+        # without anonymous control and no login -> the save is rejected
+        form2 = dict(form, web_allow_anonymous_control="false")
+        r = c.post("/settings", data=form2, headers={"Origin": "http://localhost"})
+        assert b"needs a web login" in r.data
+    finally:
+        for s in ("", ".bak", ".tmp"):
+            try: os.unlink(p + s)
+            except OSError: pass
 
 
 def test_webui_activity_page_and_audit_api():
